@@ -1,0 +1,139 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import {
+  addCycle,
+  addDays,
+  addFocusBlock,
+  addTask,
+  elapsedMsAt,
+  emptySnapshot,
+  MAX_ELAPSED_MS,
+  focusDisplayStatus,
+  rescheduleDailyTask,
+  setFocusCommand,
+  validateSnapshot,
+  weekKey,
+  weekRange,
+  weekStart,
+  createTask,
+  deleteTask,
+} from '../src/domain'
+import type { BoardSnapshot } from '../src/types'
+
+const NOW = '2025-01-15T12:00:00.000Z'
+function board(): BoardSnapshot {
+  return { ...emptySnapshot('America/New_York') }
+}
+
+function withCycle(snapshot: BoardSnapshot): BoardSnapshot {
+  return addCycle(snapshot, 'Q1', '2025-01-01', '2025-03-31', NOW)
+}
+
+test('calendar and ISO week helpers are DST-safe and ISO-year correct', () => {
+  assert.equal(addDays('2024-03-09', 1), '2024-03-10')
+  assert.equal(addDays('2024-11-02', 1), '2024-11-03')
+  assert.equal(weekStart('2021-01-01'), '2020-12-28')
+  assert.equal(weekKey('2021-01-01'), '2020-W53')
+  assert.deepEqual(weekRange('2020-W53'), { start: '2020-12-28', end: '2021-01-03' })
+})
+
+test('linked tasks remain independent when completed', () => {
+  let snapshot = withCycle(board())
+  const cycleId = snapshot.cycles[0].id
+  const long = createTask({ domain: 'long', title: 'Direction', cycleId }, NOW)
+  snapshot = addTask(snapshot, long)
+  const weekly = createTask({ domain: 'weekly', title: 'Weekly step', weekKey: '2025-W03', upperTaskId: long.id }, NOW)
+  snapshot = addTask(snapshot, weekly)
+  const daily = createTask({ domain: 'daily', title: 'Daily step', dateKey: '2025-01-15', upperTaskId: weekly.id }, NOW)
+  snapshot = addTask(snapshot, daily)
+  assert.equal(snapshot.tasks.find((task) => task.id === long.id)?.checked, false)
+  snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === daily.id ? { ...task, checked: true } : task) }
+  validateSnapshot(snapshot)
+  assert.equal(snapshot.tasks.find((task) => task.id === daily.id)?.checked, true)
+  assert.equal(snapshot.tasks.find((task) => task.id === weekly.id)?.checked, false)
+  assert.equal(snapshot.tasks.find((task) => task.id === long.id)?.checked, false)
+})
+
+test('deleting an upper task detaches lower associations without cross-domain cascade', () => {
+  let snapshot = withCycle(board())
+  const cycleId = snapshot.cycles[0].id
+  const long = createTask({ domain: 'long', title: 'Direction', cycleId }, NOW)
+  snapshot = addTask(snapshot, long)
+  const weekly = createTask({ domain: 'weekly', title: 'Weekly step', weekKey: '2025-W03', upperTaskId: long.id }, NOW)
+  snapshot = addTask(snapshot, weekly)
+  const daily = createTask({ domain: 'daily', title: 'Daily step', dateKey: '2025-01-15', upperTaskId: weekly.id }, NOW)
+  snapshot = addTask(snapshot, daily)
+  snapshot = deleteTask(snapshot, long.id, NOW)
+  assert.equal(snapshot.tasks.some((task) => task.id === long.id), false)
+  assert.equal(snapshot.tasks.find((task) => task.id === weekly.id)?.upperTaskId, undefined)
+  assert.equal(snapshot.tasks.find((task) => task.id === daily.id)?.upperTaskId, weekly.id)
+})
+
+test('rescheduling keeps original placement history and avoids duplicate active copies', () => {
+  let snapshot = board()
+  const root = createTask({ domain: 'daily', title: 'Move me', dateKey: '2025-01-10' }, NOW)
+  const child = createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-10', parentId: root.id }, NOW)
+  snapshot = addTask(addTask(snapshot, root), child)
+  snapshot = rescheduleDailyTask(snapshot, root.id, '2025-01-16', '2025-01-15T12:00:00.000Z')
+  const active = snapshot.tasks.filter((task) => !task.archivedAt)
+  const archived = snapshot.tasks.filter((task) => task.archivedAt)
+  assert.equal(active.length, 2)
+  assert.equal(archived.length, 2)
+  assert.equal(active[0].dateKey, '2025-01-16')
+  assert.equal(active[0].history.at(-1)?.dateKey, '2025-01-10')
+  assert.equal(archived[0].rescheduledTo, active.find((task) => task.title === archived[0].title)?.id)
+  const nextRoot = active.find((task) => task.title === 'Move me')!
+  snapshot = rescheduleDailyTask(snapshot, nextRoot.id, '2025-01-18', '2025-01-16T12:00:00.000Z')
+  assert.equal(snapshot.tasks.filter((task) => !task.archivedAt).length, 2)
+  assert.equal(snapshot.tasks.filter((task) => task.archivedReason === 'rescheduled').length, 4)
+  assert.throws(() => rescheduleDailyTask(snapshot, snapshot.tasks.find((task) => !task.archivedAt && task.title === 'Move me')!.id, '2025-01-18', NOW), /different|valid target/i)
+})
+
+test('timer restoration uses timestamps and rejects a second running timer', () => {
+  let snapshot = board()
+  snapshot = addFocusBlock(snapshot, { id: 'focus-a', dateKey: '2025-01-15', title: 'A', durationMinutes: 45, status: 'running', startedAt: '2025-01-15T12:00:00.000Z', elapsedMs: 5_000, createdAt: NOW })
+  const block = snapshot.focusBlocks[0]
+  assert.equal(elapsedMsAt(block, Date.parse('2025-01-15T12:30:00.000Z')), 1_805_000)
+  assert.equal(focusDisplayStatus(block, Date.parse('2025-01-15T13:00:00.000Z')), 'complete')
+  const second = { ...block, id: 'focus-b', status: 'paused' as const, startedAt: undefined }
+  snapshot = { ...snapshot, focusBlocks: [...snapshot.focusBlocks, second] }
+  assert.throws(() => setFocusCommand(snapshot, 'focus-b', 'start', NOW), /already running/)
+  snapshot = setFocusCommand(snapshot, 'focus-a', 'finish', '2025-01-15T12:20:00.000Z')
+  assert.equal(snapshot.focusBlocks[0].status, 'finished')
+  assert.equal(snapshot.focusBlocks[0].startedAt, undefined)
+})
+
+test('invalid external state is rejected before use', () => {
+  assert.throws(() => validateSnapshot({ ...board(), settings: { timeZone: 'not/a-zone' } }), /timezone/i)
+  const running = { id: 'focus-a', dateKey: '2025-01-15', title: 'A', durationMinutes: 30, status: 'running', elapsedMs: 0, createdAt: NOW }
+  const second = { ...running, id: 'focus-b' }
+  assert.throws(() => validateSnapshot({ ...board(), focusBlocks: [running, second] }), /one focus timer|running/i)
+  const parent = createTask({ domain: 'daily', title: 'P', dateKey: '2025-01-15' }, NOW)
+  const child = createTask({ domain: 'daily', title: 'C', dateKey: '2025-01-15', parentId: parent.id }, NOW)
+  const grandchild = createTask({ domain: 'daily', title: 'G', dateKey: '2025-01-15', parentId: child.id }, NOW)
+  assert.throws(() => validateSnapshot({ ...board(), tasks: [parent, child, grandchild] }), /subtask graph/i)
+})
+
+test('a rescheduled task can still be deleted without leaving a dangling reschedule target', () => {
+  let snapshot = board()
+  const root = createTask({ domain: 'daily', title: 'Move then delete', dateKey: '2025-01-10' }, NOW)
+  snapshot = addTask(snapshot, root)
+  snapshot = rescheduleDailyTask(snapshot, root.id, '2025-01-16', NOW)
+  const active = snapshot.tasks.find((task) => !task.archivedAt && task.title === 'Move then delete')!
+  // Deleting the active successor used to fail validation because the archived entry still pointed at it.
+  snapshot = deleteTask(snapshot, active.id, NOW)
+  assert.equal(snapshot.tasks.some((task) => task.id === active.id), false)
+  const archived = snapshot.tasks.find((task) => task.archivedReason === 'rescheduled')!
+  assert.equal(archived.rescheduledTo, undefined)
+  validateSnapshot(snapshot)
+})
+
+test('a timer running far past its limit can still be paused and finished', () => {
+  let snapshot = board()
+  snapshot = addFocusBlock(snapshot, { id: 'long-run', dateKey: '2025-01-15', title: 'Forgotten timer', durationMinutes: 45, status: 'running', startedAt: '2025-01-01T00:00:00.000Z', elapsedMs: 0, createdAt: NOW })
+  const late = '2025-01-15T00:00:00.000Z'
+  snapshot = setFocusCommand(snapshot, 'long-run', 'finish', late)
+  assert.equal(snapshot.focusBlocks[0].status, 'finished')
+  assert.ok(snapshot.focusBlocks[0].elapsedMs <= MAX_ELAPSED_MS)
+  validateSnapshot(snapshot)
+})

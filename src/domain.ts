@@ -1,0 +1,599 @@
+import { BoardError } from './notices'
+import type { BoardSnapshot, Domain, FocusBlock, FocusStatus, GoalCycle, PlacementSnapshot, Task, TaskColor } from './types'
+
+export const MAX_BOARD_BYTES = 900_000
+export const MAX_TASKS = 2_000
+export const MAX_FOCUS_BLOCKS = 500
+export const MAX_TIMER_MINUTES = 24 * 60
+export const MAX_ELAPSED_MS = 86_400_000
+
+const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+export function isDateKey(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const match = DATE_RE.exec(value)
+  if (!match) return false
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12))
+  return date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() === Number(match[2]) - 1 &&
+    date.getUTCDate() === Number(match[3])
+}
+
+function dateParts(dateKey: string): [number, number, number] {
+  const match = DATE_RE.exec(dateKey)
+  if (!match) throw new Error(`Invalid date key: ${dateKey}`)
+  return [Number(match[1]), Number(match[2]), Number(match[3])]
+}
+
+/** 日历运算在 UTC noon 进行，避免本地 DST 过渡移动日期。 */
+export function addDays(dateKey: string, amount: number): string {
+  if (!isDateKey(dateKey) || !Number.isInteger(amount)) throw new Error('Invalid calendar date arithmetic')
+  const [year, month, day] = dateParts(dateKey)
+  const date = new Date(Date.UTC(year, month - 1, day, 12))
+  date.setUTCDate(date.getUTCDate() + amount)
+  return date.toISOString().slice(0, 10)
+}
+
+export function compareDateKeys(left: string, right: string): number {
+  if (!isDateKey(left) || !isDateKey(right)) throw new Error('Invalid date key comparison')
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+export function isoDay(dateKey: string): number {
+  if (!isDateKey(dateKey)) throw new Error('Invalid date key')
+  const [year, month, day] = dateParts(dateKey)
+  return new Date(Date.UTC(year, month - 1, day, 12)).getUTCDay() || 7
+}
+
+export function weekStart(dateKey: string): string {
+  return addDays(dateKey, 1 - isoDay(dateKey))
+}
+
+export function weekKey(dateKey: string): string {
+  const thursday = addDays(dateKey, 4 - isoDay(dateKey))
+  const [year] = dateParts(thursday)
+  const firstThursday = addDays(`${year}-01-04`, 4 - isoDay(`${year}-01-04`))
+  const days = Math.round((calendarNoon(thursday).getTime() - calendarNoon(firstThursday).getTime()) / 86_400_000)
+  return `${year}-W${String(Math.floor(days / 7) + 1).padStart(2, '0')}`
+}
+
+export function weekRange(key: string): { start: string; end: string } {
+  const match = /^(\d{4})-W(\d{2})$/.exec(key)
+  if (!match) throw new Error(`Invalid ISO week key: ${key}`)
+  const year = Number(match[1])
+  const week = Number(match[2])
+  if (week < 1 || week > 53) throw new Error(`Invalid ISO week key: ${key}`)
+  const firstThursday = addDays(`${year}-01-04`, 4 - isoDay(`${year}-01-04`))
+  const start = addDays(firstThursday, (week - 1) * 7 - 3)
+  if (weekKey(start) !== key) throw new Error(`Invalid ISO week key: ${key}`)
+  return { start, end: addDays(start, 6) }
+}
+
+function calendarNoon(dateKey: string): Date {
+  const [year, month, day] = dateParts(dateKey)
+  return new Date(Date.UTC(year, month - 1, day, 12))
+}
+
+export function todayInTimeZone(timeZone: string, now = new Date()): string {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+  const parts = Object.fromEntries(formatter.formatToParts(now).map((part) => [part.type, part.value]))
+  return `${parts.year}-${parts.month}-${parts.day}`
+}
+
+export function safeTimeZone(timeZone?: unknown): string {
+  const fallback = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  if (typeof timeZone !== 'string' || timeZone.length > 100) return fallback
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone }).format()
+    return timeZone
+  } catch {
+    return fallback
+  }
+}
+
+export function formatDateKey(dateKey: string, language: 'zh' | 'en', timeZone?: string): string {
+  if (!isDateKey(dateKey)) return dateKey
+  const [year, month, day] = dateParts(dateKey)
+  // 日期键已经是 board 时区的日历日期；以 UTC 格式化可避免偏移到相邻日期。
+  void timeZone
+  return new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en-US', {
+    timeZone: 'UTC',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  }).format(new Date(Date.UTC(year, month - 1, day, 12)))
+}
+
+export function elapsedMsAt(block: FocusBlock, now = Date.now()): number {
+  const started = block.startedAt ? Date.parse(block.startedAt) : NaN
+  const live = block.status === 'running' && Number.isFinite(started) ? Math.max(0, now - started) : 0
+  return Math.max(0, Math.round(block.elapsedMs) + live)
+}
+
+export function focusDisplayStatus(block: FocusBlock, now = Date.now()): FocusStatus | 'complete' {
+  if (block.status === 'finished') return 'finished'
+  return elapsedMsAt(block, now) >= block.durationMinutes * 60_000 ? 'complete' : block.status
+}
+
+export function validateDurationMinutes(value: unknown): number {
+  const duration = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(duration) || duration <= 0 || duration > MAX_TIMER_MINUTES) {
+    throw new BoardError('noticeTimerDuration', `Timer duration must be between 0 and ${MAX_TIMER_MINUTES} minutes`)
+  }
+  return Math.round(duration * 10) / 10
+}
+
+export function createId(prefix: string): string {
+  const uuid = globalThis.crypto?.randomUUID?.()
+  return `${prefix}_${uuid || `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`}`
+}
+
+export function emptySnapshot(timeZone = safeTimeZone()): BoardSnapshot {
+  return {
+    schemaVersion: 1,
+    settings: { timeZone },
+    cycles: [],
+    tasks: [],
+    focusBlocks: [],
+  }
+}
+
+function validEnum<T extends string>(value: unknown, values: readonly T[]): value is T {
+  return typeof value === 'string' && values.includes(value as T)
+}
+
+
+function validIso(value: unknown): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value))
+}
+
+function validWeekKey(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-W\d{2}$/.test(value)) return false
+  try { weekRange(value); return true } catch { return false }
+}
+
+function validId(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= 160
+}
+
+function optionalString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  if (value === undefined) return undefined
+  if (!validId(value)) throw new BoardError('noticeInvalidState', `Board ${key} is invalid`)
+  return value
+}
+
+function parseHistory(value: unknown): PlacementSnapshot[] {
+  if (!Array.isArray(value)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
+  return value.map((raw) => {
+    if (!isRecord(raw) || !validEnum(raw.domain, ['long', 'weekly', 'daily'] as const) ||
+      !validIso(raw.recordedAt)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
+    const recordedAt = raw.recordedAt
+    const cycleId = optionalString(raw, 'cycleId')
+    const week = optionalString(raw, 'weekKey')
+    const date = raw.dateKey
+    if (date !== undefined && !isDateKey(date)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
+    if (raw.domain === 'long' && (!cycleId || week !== undefined || date !== undefined)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
+    if (raw.domain === 'weekly' && (cycleId !== undefined || date !== undefined || !validWeekKey(week))) throw new BoardError('noticeInvalidState', 'Task history is invalid')
+    if (raw.domain === 'daily' && (cycleId !== undefined || week !== undefined || !isDateKey(date))) throw new BoardError('noticeInvalidState', 'Task history is invalid')
+    return {
+      domain: raw.domain,
+      ...(cycleId ? { cycleId } : {}),
+      ...(week ? { weekKey: week } : {}),
+      ...(date ? { dateKey: date } : {}),
+      recordedAt,
+    }
+  })
+}
+
+/** 所有外部快照先验证，再进入 React 或变更辅助函数。 */
+export function validateSnapshot(value: unknown): BoardSnapshot {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.settings)) {
+    throw new BoardError('noticeInvalidState', 'Board snapshot has an unsupported shape')
+  }
+  const encoded = JSON.stringify(value)
+  if (new TextEncoder().encode(encoded).byteLength > MAX_BOARD_BYTES) throw new BoardError('noticeInvalidState', 'Board snapshot is too large')
+  if (value.settings.timeZone !== safeTimeZone(value.settings.timeZone)) throw new BoardError('noticeInvalidState', 'Board timezone is invalid')
+  const timeZone = value.settings.timeZone
+  if (typeof timeZone !== 'string') throw new BoardError('noticeInvalidState', 'Board timezone is invalid')
+  if (!Array.isArray(value.cycles) || value.cycles.length > 200) throw new BoardError('noticeInvalidState', 'Board cycles are invalid')
+  if (!Array.isArray(value.tasks) || value.tasks.length > MAX_TASKS) throw new BoardError('noticeInvalidState', 'Board tasks are invalid')
+  if (!Array.isArray(value.focusBlocks) || value.focusBlocks.length > MAX_FOCUS_BLOCKS) throw new BoardError('noticeInvalidState', 'Board focus blocks are invalid')
+
+  const cycles: GoalCycle[] = []
+  const cycleIds = new Set<string>()
+  for (const raw of value.cycles) {
+    if (!isRecord(raw) || !validId(raw.id) || cycleIds.has(raw.id) ||
+      typeof raw.name !== 'string' || raw.name.trim().length === 0 || raw.name.length > 160 ||
+      !isDateKey(raw.startDate) || !isDateKey(raw.endDate) || compareDateKeys(raw.startDate, raw.endDate) > 0 ||
+      !validIso(raw.createdAt)) throw new BoardError('noticeInvalidState', 'Board cycle is invalid')
+    const id = raw.id
+    const name = raw.name
+    const startDate = raw.startDate
+    const endDate = raw.endDate
+    const createdAt = raw.createdAt
+    cycleIds.add(id)
+    cycles.push({ id, name, startDate, endDate, createdAt })
+  }
+
+  const tasks: Task[] = []
+  const taskIds = new Set<string>()
+  for (const raw of value.tasks) {
+    if (!isRecord(raw) || !validId(raw.id) || taskIds.has(raw.id) ||
+      !validEnum(raw.domain, ['long', 'weekly', 'daily'] as const) ||
+      typeof raw.title !== 'string' || raw.title.trim().length === 0 || raw.title.length > 300 ||
+      typeof raw.note !== 'string' || raw.note.length > 2_000 || typeof raw.checked !== 'boolean' ||
+      !validEnum(raw.color, ['ink', 'blue', 'orange', 'green', 'violet'] as const) ||
+      !validIso(raw.createdAt) || !validIso(raw.updatedAt)) throw new BoardError('noticeInvalidState', 'Board task is invalid')
+    const cycleId = optionalString(raw, 'cycleId')
+    const week = optionalString(raw, 'weekKey')
+    const date = raw.dateKey
+    if (date !== undefined && !isDateKey(date)) throw new BoardError('noticeInvalidState', 'Board task placement is invalid')
+    const parentId = optionalString(raw, 'parentId')
+    const upperTaskId = optionalString(raw, 'upperTaskId')
+    const history = parseHistory(raw.history)
+    if (raw.domain === 'long' && (!cycleId || !cycleIds.has(cycleId) || week !== undefined || date !== undefined)) throw new BoardError('noticeInvalidState', 'Long-term task placement is invalid')
+    if (raw.domain === 'weekly' && (cycleId !== undefined || date !== undefined || !validWeekKey(week))) throw new BoardError('noticeInvalidState', 'Weekly task placement is invalid')
+    if (raw.domain === 'daily' && (cycleId !== undefined || week !== undefined || !isDateKey(date))) throw new BoardError('noticeInvalidState', 'Daily task placement is invalid')
+    const archivedAt = raw.archivedAt
+    if (archivedAt !== undefined && !validIso(archivedAt)) throw new BoardError('noticeInvalidState', 'Archived task timestamp is invalid')
+    const archivedReason = raw.archivedReason
+    if (archivedReason !== undefined && archivedReason !== 'rescheduled') throw new BoardError('noticeInvalidState', 'Archived task reason is invalid')
+    const rescheduledTo = optionalString(raw, 'rescheduledTo')
+    if ((archivedReason !== undefined || rescheduledTo !== undefined) && archivedAt === undefined) throw new BoardError('noticeInvalidState', 'Archived task metadata is invalid')
+    const id = raw.id
+    const domain = raw.domain
+    const title = raw.title
+    const note = raw.note
+    const checked = raw.checked
+    const color = raw.color
+    const createdAt = raw.createdAt
+    const updatedAt = raw.updatedAt
+    taskIds.add(id)
+    tasks.push({
+      id, domain, title, note, checked, color,
+      createdAt, updatedAt, history,
+      ...(cycleId ? { cycleId } : {}), ...(week ? { weekKey: week } : {}), ...(date ? { dateKey: date } : {}),
+      ...(parentId ? { parentId } : {}), ...(upperTaskId ? { upperTaskId } : {}),
+      ...(archivedAt ? { archivedAt } : {}), ...(archivedReason ? { archivedReason } : {}), ...(rescheduledTo ? { rescheduledTo } : {}),
+    })
+  }
+
+  const taskById = new Map(tasks.map((task) => [task.id, task]))
+  for (const task of tasks) {
+    if (task.parentId !== undefined) {
+      const parent = taskById.get(task.parentId)
+      if (!parent || parent.domain !== task.domain || parent.parentId !== undefined || parent.id === task.id ||
+        parent.cycleId !== task.cycleId || parent.weekKey !== task.weekKey || parent.dateKey !== task.dateKey) {
+        throw new BoardError('noticeInvalidState', 'Task subtask graph is invalid')
+      }
+    }
+    if (task.upperTaskId !== undefined) {
+      if (task.parentId !== undefined) throw new BoardError('noticeInvalidState', 'Subtasks cannot cross-link')
+      const upper = taskById.get(task.upperTaskId)
+      const allowed = task.domain === 'weekly' ? upper?.domain === 'long' : task.domain === 'daily' ? upper?.domain === 'weekly' : false
+      if (!upper || upper.parentId !== undefined || !allowed || upper.id === task.id) throw new BoardError('noticeInvalidState', 'Task association is invalid')
+    }
+    if (task.rescheduledTo !== undefined && !taskById.has(task.rescheduledTo)) throw new BoardError('noticeInvalidState', 'Reschedule history target is invalid')
+  }
+
+  const focusBlocks: FocusBlock[] = []
+  const focusIds = new Set<string>()
+  let running = 0
+  for (const raw of value.focusBlocks) {
+    if (!isRecord(raw) || !validId(raw.id) || focusIds.has(raw.id) || !isDateKey(raw.dateKey) ||
+      typeof raw.title !== 'string' || raw.title.trim().length === 0 || raw.title.length > 300 ||
+      !validEnum(raw.status, ['running', 'paused', 'finished'] as const) || typeof raw.elapsedMs !== 'number' ||
+      !Number.isFinite(raw.elapsedMs) || raw.elapsedMs < 0 || raw.elapsedMs > MAX_ELAPSED_MS || !validIso(raw.createdAt)) throw new BoardError('noticeInvalidState', 'Focus block is invalid')
+    const durationMinutes = validateDurationMinutes(raw.durationMinutes)
+    const taskId = optionalString(raw, 'taskId')
+    const startedAt = raw.startedAt
+    const finishedAt = raw.finishedAt
+    if (startedAt !== undefined && !validIso(startedAt)) throw new BoardError('noticeInvalidState', 'Focus start timestamp is invalid')
+    if (finishedAt !== undefined && !validIso(finishedAt)) throw new BoardError('noticeInvalidState', 'Focus finish timestamp is invalid')
+    if (raw.status === 'running' && (startedAt === undefined || finishedAt !== undefined)) throw new BoardError('noticeInvalidState', 'Running focus timer is invalid')
+    if (raw.status === 'paused' && startedAt !== undefined) throw new BoardError('noticeInvalidState', 'Paused focus timer is invalid')
+    if (raw.status === 'finished' && (startedAt !== undefined || finishedAt === undefined)) throw new BoardError('noticeInvalidState', 'Finished focus timer is invalid')
+    if (taskId !== undefined && taskById.get(taskId)?.domain !== 'daily') throw new BoardError('noticeInvalidState', 'Focus task association is invalid')
+    const id = raw.id
+    const dateKey = raw.dateKey
+    const title = raw.title
+    const status = raw.status
+    const createdAt = raw.createdAt
+    focusIds.add(id)
+    if (raw.status === 'running') running += 1
+    focusBlocks.push({
+      id, dateKey, title, durationMinutes, status, elapsedMs: Math.round(raw.elapsedMs), createdAt,
+      ...(taskId ? { taskId } : {}), ...(startedAt ? { startedAt } : {}), ...(finishedAt ? { finishedAt } : {}),
+    })
+  }
+  if (running > 1) throw new BoardError('noticeInvalidState', 'Only one focus timer may be running')
+  return { schemaVersion: 1, settings: { timeZone }, cycles, tasks, focusBlocks }
+}
+
+export function cloneSnapshot(snapshot: BoardSnapshot): BoardSnapshot {
+  return structuredClone(snapshot)
+}
+
+export function activeTasks(snapshot: BoardSnapshot, domain?: Domain): Task[] {
+  return snapshot.tasks.filter((task) => !task.archivedAt && (!domain || task.domain === domain))
+}
+
+export function taskPlacement(task: Task): PlacementSnapshot {
+  return {
+    domain: task.domain,
+    ...(task.cycleId ? { cycleId: task.cycleId } : {}),
+    ...(task.weekKey ? { weekKey: task.weekKey } : {}),
+    ...(task.dateKey ? { dateKey: task.dateKey } : {}),
+    recordedAt: task.updatedAt,
+  }
+}
+
+export function updateTask(snapshot: BoardSnapshot, taskId: string, patch: Partial<Task>, now = new Date().toISOString()): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  const task = next.tasks.find((candidate) => candidate.id === taskId)
+  if (!task || task.archivedAt) throw new BoardError('noticeTaskMissing', 'Task no longer exists')
+  Object.assign(task, patch, { updatedAt: now })
+  validateSnapshot(next)
+  return next
+}
+
+export function deleteTask(snapshot: BoardSnapshot, taskId: string, now = new Date().toISOString()): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  const removed = new Set<string>([taskId])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const task of next.tasks) {
+      if (task.parentId && removed.has(task.parentId) && !removed.has(task.id)) {
+        removed.add(task.id)
+        changed = true
+      }
+    }
+  }
+  if (!next.tasks.some((task) => task.id === taskId && !task.archivedAt)) throw new BoardError('noticeTaskMissing', 'Task no longer exists')
+  // 删除任务只解除跨域下级关联，不在域之间级联。
+  for (const task of next.tasks) {
+    if (task.upperTaskId && removed.has(task.upperTaskId)) {
+      task.upperTaskId = undefined
+      task.updatedAt = now
+    }
+  }
+  next.tasks = next.tasks.filter((task) => !removed.has(task.id))
+  // 被删除的任务可能是别人的重排目标；清理指向它的悬空指针，否则快照校验会拒绝整个删除。
+  for (const task of next.tasks) {
+    if (task.rescheduledTo && removed.has(task.rescheduledTo)) {
+      task.rescheduledTo = undefined
+      task.updatedAt = now
+    }
+  }
+  for (const block of next.focusBlocks) {
+    if (block.taskId && removed.has(block.taskId)) block.taskId = undefined
+  }
+  validateSnapshot(next)
+  return next
+}
+
+export function linkedChainIds(snapshot: BoardSnapshot, taskId: string): Set<string> {
+  const related = new Set<string>([taskId])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const task of snapshot.tasks) {
+      if (task.archivedAt) continue
+      if ((task.upperTaskId && related.has(task.upperTaskId)) || (task.parentId && related.has(task.parentId))) {
+        if (!related.has(task.id)) {
+          related.add(task.id)
+          changed = true
+        }
+      }
+      if (related.has(task.id) && task.upperTaskId && !related.has(task.upperTaskId)) {
+        related.add(task.upperTaskId)
+        changed = true
+      }
+      if (related.has(task.id) && task.parentId && !related.has(task.parentId)) {
+        related.add(task.parentId)
+        changed = true
+      }
+    }
+  }
+  return related
+}
+
+export function reorderSibling(snapshot: BoardSnapshot, taskId: string, direction: -1 | 1): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  const index = next.tasks.findIndex((task) => task.id === taskId)
+  if (index < 0) throw new BoardError('noticeTaskMissing', 'Task no longer exists')
+  const task = next.tasks[index]
+  const siblings = next.tasks.filter((candidate) => !candidate.archivedAt && candidate.domain === task.domain &&
+    candidate.parentId === task.parentId && candidate.cycleId === task.cycleId && candidate.weekKey === task.weekKey && candidate.dateKey === task.dateKey)
+  const siblingIndex = siblings.findIndex((candidate) => candidate.id === taskId)
+  const swap = siblingIndex + direction
+  if (swap < 0 || swap >= siblings.length) return next
+  const otherIndex = next.tasks.findIndex((candidate) => candidate.id === siblings[swap].id)
+  ;[next.tasks[index], next.tasks[otherIndex]] = [next.tasks[otherIndex], next.tasks[index]]
+  return next
+}
+
+export function rescheduleDailyTask(snapshot: BoardSnapshot, taskId: string, targetDate: string, now = new Date().toISOString()): BoardSnapshot {
+  if (!isDateKey(targetDate)) throw new BoardError('noticeRescheduleInvalid', 'Choose a valid target date')
+  const next = cloneSnapshot(snapshot)
+  const root = next.tasks.find((task) => task.id === taskId && !task.archivedAt)
+  if (!root || root.domain !== 'daily') throw new BoardError('noticeRescheduleInvalid', 'Only active daily tasks can be rescheduled')
+  if (root.dateKey === targetDate) throw new BoardError('noticeRescheduleInvalid', 'Choose a different target date')
+  const subtree = next.tasks.filter((task) => task.id === root.id || task.parentId === root.id)
+  const idMap = new Map<string, string>()
+  for (const task of subtree) idMap.set(task.id, createId('task'))
+  const copies = subtree.map((task) => {
+    const copy: Task = {
+      ...task,
+      id: idMap.get(task.id) as string,
+      dateKey: targetDate,
+      parentId: task.parentId ? idMap.get(task.parentId) : undefined,
+      history: [...task.history, taskPlacement(task)],
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: undefined,
+      archivedReason: undefined,
+      rescheduledTo: undefined,
+    }
+    return copy
+  })
+  for (const task of subtree) {
+    task.archivedAt = now
+    task.archivedReason = 'rescheduled'
+    task.rescheduledTo = idMap.get(task.id)
+    task.updatedAt = now
+  }
+  next.tasks.push(...copies)
+  validateSnapshot(next)
+  return next
+}
+
+export function createTask(input: {
+  domain: Domain
+  title: string
+  note?: string
+  color?: TaskColor
+  cycleId?: string
+  weekKey?: string
+  dateKey?: string
+  upperTaskId?: string
+  parentId?: string
+}, now = new Date().toISOString()): Task {
+  const task: Task = {
+    id: createId('task'),
+    domain: input.domain,
+    title: input.title.trim(),
+    note: input.note?.trim() || '',
+    checked: false,
+    color: input.color || 'ink',
+    createdAt: now,
+    updatedAt: now,
+    cycleId: input.cycleId,
+    weekKey: input.weekKey,
+    dateKey: input.dateKey,
+    upperTaskId: input.upperTaskId,
+    parentId: input.parentId,
+    history: [],
+  }
+  return task
+}
+
+export function setFocusCommand(snapshot: BoardSnapshot, blockId: string, command: 'start' | 'pause' | 'resume' | 'finish', now = new Date().toISOString()): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  const block = next.focusBlocks.find((candidate) => candidate.id === blockId)
+  if (!block) throw new BoardError('noticeTimerMissing', 'Focus block no longer exists')
+  const nowMs = Date.parse(now)
+  if (!Number.isFinite(nowMs)) throw new BoardError('noticeTimerMissing', 'Invalid timer timestamp')
+  if ((command === 'start' || command === 'resume') && next.focusBlocks.some((candidate) => candidate.id !== blockId && candidate.status === 'running')) {
+    throw new BoardError('noticeTimerBusy', 'Another focus timer is already running')
+  }
+  if (command === 'start' || command === 'resume') {
+    if (block.status === 'finished') throw new BoardError('noticeTimerFinished', 'Finished focus blocks cannot be restarted')
+    block.status = 'running'
+    block.startedAt = now
+  } else {
+    if (block.status === 'running' && block.startedAt) {
+      // 上限截断：运行超过上限（例如忘了关）时，不截断会导致后续 finish 永远被校验拒绝。
+      block.elapsedMs = Math.min(elapsedMsAt(block, nowMs), MAX_ELAPSED_MS)
+    }
+    block.startedAt = undefined
+    if (command === 'pause') block.status = 'paused'
+    if (command === 'finish') {
+      block.status = 'finished'
+      block.finishedAt = now
+    }
+  }
+  validateSnapshot(next)
+  return next
+}
+
+export function addCycle(snapshot: BoardSnapshot, name: string, startDate: string, endDate: string, now = new Date().toISOString()): BoardSnapshot {
+  if (!name.trim() || !isDateKey(startDate) || !isDateKey(endDate) || compareDateKeys(startDate, endDate) > 0) {
+    throw new BoardError('noticeCycleInvalid', 'Cycle name and date range are required')
+  }
+  const next = cloneSnapshot(snapshot)
+  next.cycles.push({ id: createId('cycle'), name: name.trim(), startDate, endDate, createdAt: now })
+  validateSnapshot(next)
+  return next
+}
+
+
+
+export function validateStoredBoard(value: unknown): StoredBoardLike {
+  if (!isRecord(value) || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0) {
+    throw new BoardError('noticeInvalidState', 'Stored board revision is invalid')
+  }
+  return { revision: value.revision as number, snapshot: validateSnapshot(value.snapshot) }
+}
+
+export interface StoredBoardLike {
+  revision: number
+  snapshot: BoardSnapshot
+}
+
+export function createFocusBlock(input: {
+  dateKey: string
+  title: string
+  taskId?: string
+  durationMinutes?: number
+}, now = new Date().toISOString()): FocusBlock {
+  if (!isDateKey(input.dateKey) || !input.title.trim()) throw new BoardError('noticeFocusSaveFailed', 'Focus date and title are required')
+  return {
+    id: createId('focus'),
+    dateKey: input.dateKey,
+    title: input.title.trim(),
+    taskId: input.taskId,
+    durationMinutes: validateDurationMinutes(input.durationMinutes ?? 45),
+    status: 'paused',
+    elapsedMs: 0,
+    createdAt: now,
+  }
+}
+
+export function addTask(snapshot: BoardSnapshot, task: Task): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  next.tasks.push(task)
+  validateSnapshot(next)
+  return next
+}
+
+export function addFocusBlock(snapshot: BoardSnapshot, block: FocusBlock): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  next.focusBlocks.push(block)
+  validateSnapshot(next)
+  return next
+}
+
+export function updateFocusBlock(snapshot: BoardSnapshot, blockId: string, patch: Partial<FocusBlock>): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  const block = next.focusBlocks.find((candidate) => candidate.id === blockId)
+  if (!block) throw new BoardError('noticeTimerMissing', 'Focus block no longer exists')
+  if (block.status !== 'paused' || block.elapsedMs > 0) {
+    if (patch.durationMinutes !== undefined && patch.durationMinutes !== block.durationMinutes) {
+      throw new BoardError('noticeTimerLocked', 'Focus duration can only be changed before the first start')
+    }
+  }
+  Object.assign(block, patch)
+  validateSnapshot(next)
+  return next
+}
+
+export function deleteFocusBlock(snapshot: BoardSnapshot, blockId: string): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  const index = next.focusBlocks.findIndex((block) => block.id === blockId)
+  if (index < 0) throw new BoardError('noticeTimerMissing', 'Focus block no longer exists')
+  next.focusBlocks.splice(index, 1)
+  validateSnapshot(next)
+  return next
+}
