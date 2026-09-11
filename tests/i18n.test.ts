@@ -162,3 +162,12 @@ test('automatic refresh must refuse to run while unsaved work exists', async () 
   // and the explicit "discard draft" action must NOT be automatic, so the user can still discard
   assert.match(source, /onClick=\{\(\) => void reloadLatest\(false\)\}/, 'the discard action must stay user-initiated')
 })
+
+test('no debug instrumentation is left in the shipped source', async () => {
+  // Temporary probes were once committed by accident; keep them out of the app.
+  const { readFile } = await import('node:fs/promises')
+  for (const file of ['../src/App.tsx', '../src/storage.ts', '../src/domain.ts']) {
+    const source = await readFile(new URL(file, import.meta.url), 'utf8')
+    assert.doesNotMatch(source, /__tbLog|__mergeDebug|__casDebug|__stateRev|__refRev|debugger/, `${file} contains debug instrumentation`)
+  }
+})
