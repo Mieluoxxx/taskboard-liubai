@@ -4,6 +4,12 @@
 
 [MIT 许可](LICENSE)。
 
+**线上地址**：https://taskboard-liubai.vercel.app （Vercel，静态前端 + Supabase 后端）
+
+- 后端：Supabase Free 项目，数据库对象见 `supabase/migrations/001_private_board.sql`
+- 部署：Vercel 导入本仓库，环境变量 `VITE_SUPABASE_URL` 与 `VITE_SUPABASE_PUBLISHABLE_KEY`（两者都是浏览器可见的公开值，真正的访问控制由 RLS 与 owner 策略承担）
+- 推送 `main` 即自动重新部署
+
 ## 本地运行
 
 要求 Node 24 与 pnpm（本仓库用 pnpm 12 验证；lockfile 为 v9，可由较新的 pnpm 读取）。
