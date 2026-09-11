@@ -70,6 +70,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .rail-item span { font-size: 11px; line-height: 1.2; font-weight: 500; }
 .rail-item small { font: 10px/1.2 ui-monospace, monospace; color: var(--faint); }
 .rail-item.selected small { color: #929993; }
+/* 本周/本日：与“选中”（用户当前查看）是两种含义，因此用独立的圆点 + 底色 + 加粗区分。 */
+.rail-item.is-current { color: var(--ink); background: rgba(223,135,94,.07); }
+.rail-item.is-current span { font-weight: 650; }
+.rail-item.is-current small { color: #a4705a; }
+.rail-item.is-current.selected { background: rgba(223,135,94,.12); }
+.current-mark { display: inline-block; width: 5px; height: 5px; margin-left: 5px; border-radius: 50%; background: var(--orange); vertical-align: 1px; }
 .rail-edit { margin-left: -37px; min-width: 32px; min-height: 40px; padding: 8px; border: 0; background: transparent; color: var(--faint); }
 .rail-edit:hover { color: var(--ink); }
 .rail-edit .icon { width: 13px; height: 13px; }
