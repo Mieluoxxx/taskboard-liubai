@@ -148,3 +148,17 @@ test('no source file throws a bare sentence that reaches the UI', async () => {
     assert.ok(/date|week|calendar/i.test(message), `domain.ts has a user-facing sentence without a notice code: ${message}`)
   }
 })
+
+test('automatic refresh must refuse to run while unsaved work exists', async () => {
+  // Regression guard for a silent data-loss bug: the focus/online auto-refresh used to call
+  // reloadLatest(false), which cleared failedJobRef/pendingJobRef and set the UI to "saved",
+  // dropping a just-failed change and its draft without any notice.
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
+  assert.match(source, /if \(automatic && \(saveInFlightRef\.current \|\| pendingJobRef\.current \|\| failedJobRef\.current\)\) return false/, 'reloadLatest must refuse automatic refreshes while unsaved work exists')
+  // the automatic callers must be marked automatic
+  const automaticCalls = [...source.matchAll(/reloadLatest\((false|true),\s*true\)/g)]
+  assert.ok(automaticCalls.length >= 2, `focus/online refresh must pass automatic=true, saw ${automaticCalls.length}`)
+  // and the explicit "discard draft" action must NOT be automatic, so the user can still discard
+  assert.match(source, /onClick=\{\(\) => void reloadLatest\(false\)\}/, 'the discard action must stay user-initiated')
+})

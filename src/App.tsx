@@ -373,7 +373,10 @@ export default function App() {
   }, [])
 
   // 返回是否成功换上了新的板（false = 仍在旧板/被取代/失败）。调用方据此决定是否继续依赖它。
-  const reloadLatest = useCallback(async (keepDraft = true): Promise<boolean> => {
+  // automatic=true 表示这是焦点/联网触发的自动刷新：只要还有未保存改动（在途、排队、失败保留），
+  // 就直接放弃刷新。否则自动刷新会把刚失败的改动连同草稿一起丢掉，界面还会显示「已保存」。
+  const reloadLatest = useCallback(async (keepDraft = true, automatic = false): Promise<boolean> => {
+    if (automatic && (saveInFlightRef.current || pendingJobRef.current || failedJobRef.current)) return false
     const currentAdapter = adapterRef.current
     if (!currentAdapter) return false
     if (saveInFlightRef.current) {
@@ -431,19 +434,16 @@ export default function App() {
   useEffect(() => {
     const becameOnline = !previousOnlineRef.current && online
     previousOnlineRef.current = online
-    if (screen !== 'workspace' || !becameOnline || adapter?.mode !== 'cloud' || draftLabel || pendingJobRef.current || saveInFlightRef.current) return
-    void reloadLatest(false)
-  }, [adapter, draftLabel, online, reloadLatest, screen])
+    if (screen !== 'workspace' || !becameOnline || adapter?.mode !== 'cloud') return
+    void reloadLatest(false, true)
+  }, [adapter, online, reloadLatest, screen])
 
   useEffect(() => {
     if (screen !== 'workspace' || adapter?.mode !== 'cloud') return
-    const refreshOnFocus = () => {
-      if (draftLabel || pendingJobRef.current || saveInFlightRef.current) return
-      void reloadLatest(false)
-    }
+    const refreshOnFocus = () => { void reloadLatest(false, true) }
     window.addEventListener('focus', refreshOnFocus)
     return () => window.removeEventListener('focus', refreshOnFocus)
-  }, [adapter, draftLabel, reloadLatest, screen])
+  }, [adapter, reloadLatest, screen])
 
   // 冲突后只保留输入值：先刷新到最新 revision，再打开编辑器让用户重新确认，
   // 绝不用旧整板快照覆盖其他设备的新改动（那会静默丢失对方数据）。
