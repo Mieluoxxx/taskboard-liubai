@@ -415,6 +415,18 @@ export function linkedChainIds(snapshot: BoardSnapshot, taskId: string): Set<str
   return related
 }
 
+// 顺序变更也是用户改动，需要能被「重新打开编辑器」重放：返回本次移动的领域与方向，
+// 恢复时对同一任务再执行一次同样的移动即可（而不是把旧整板写回去）。
+export function reorderOrigin(task: Task, direction: -1 | 1): { kind: 'reorder'; taskId: string; direction: -1 | 1; domain: Domain } {
+  return { kind: 'reorder', taskId: task.id, direction, domain: task.domain }
+}
+
+/** 恢复一次「上移/下移」：尽力而为——目标任务若已不存在（被他端删除）则原样返回。 */
+export function reapplyReorder(snapshot: BoardSnapshot, taskId: string, direction: -1 | 1): BoardSnapshot {
+  if (!snapshot.tasks.some((task) => task.id === taskId && !task.archivedAt)) return snapshot
+  return reorderSibling(snapshot, taskId, direction)
+}
+
 export function reorderSibling(snapshot: BoardSnapshot, taskId: string, direction: -1 | 1): BoardSnapshot {
   const next = cloneSnapshot(snapshot)
   const index = next.tasks.findIndex((task) => task.id === taskId)
@@ -637,7 +649,10 @@ export function mergeSnapshots(base: BoardSnapshot, local: BoardSnapshot, remote
       }
       const localJson = JSON.stringify(localItem)
       if (baseJson === localJson) { result.push(remoteItem); continue } // 本地没改，用云端
-      if (baseJson === remoteJson || baseJson === undefined) { result.push(localItem); continue } // 只有本地改了
+      if (baseJson === remoteJson) { result.push(localItem); continue } // 只有本地改了
+      // base 里没有这个 id，但两侧都有且内容不同：base 落后（例如上次保存已落库但客户端没收到成功响应），
+      // 无法判断谁更新，不能当作「本地新增」直接覆盖云端 —— 记为冲突交给用户。
+      if (baseJson === undefined) { conflicts.push(id); result.push(remoteItem); continue }
       if (localJson === remoteJson) { result.push(remoteItem); continue } // 改成了同样的结果
       conflicts.push(id)
       result.push(remoteItem)
@@ -659,16 +674,21 @@ export function mergeSnapshots(base: BoardSnapshot, local: BoardSnapshot, remote
   // 只比较「两侧都存在的 id」的相对次序：本地改过顺序就用本地顺序重排合并结果，
   // 双方都改过顺序则记为冲突（不猜测谁对）。
   const applyOrder = <T extends { id: string }>(mergedList: T[], baseList: T[], localList: T[], remoteList: T[]): void => {
-    const common = (list: T[]) => list.map((item) => item.id).filter((id) => localList.some((l) => l.id === id) && remoteList.some((r) => r.id === id))
-    const baseOrder = common(baseList).join('\u0000')
-    const localOrder = common(localList).join('\u0000')
-    const remoteOrder = common(remoteList).join('\u0000')
+    // 只按「base 与 local 都有」的 id 判断本地是否动过顺序：两边新增/删除的项不该制造假顺序变化。
+    const localIds = new Set(localList.map((item) => item.id))
+    const comparable = (list: T[]) => list.map((item) => item.id).filter((id) => localIds.has(id))
+    const baseOrder = comparable(baseList).join('\u0000')
+    const localOrder = comparable(localList).join('\u0000')
+    const remoteOrder = comparable(remoteList).join('\u0000')
     if (localOrder === baseOrder) return // 本地没动顺序，保持云端顺序
+    // 双方改成了同一个顺序，或本地顺序与云端结果一致：直接采用，不算冲突。
+    if (localOrder === remoteOrder) return
     if (remoteOrder !== baseOrder) { conflicts.push('__order__'); return }
     const localIndex = new Map(localList.map((item, index) => [item.id, index]))
     mergedList.sort((left, right) => {
       const a = localIndex.get(left.id)
       const b = localIndex.get(right.id)
+      // 本地新增项按它在本地列表里的位置排；云端新增项（本地没有）保持相对顺序排在末尾。
       if (a === undefined && b === undefined) return 0
       if (a === undefined) return 1
       if (b === undefined) return -1

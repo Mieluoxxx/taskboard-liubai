@@ -7,6 +7,8 @@ import {
   addDays,
   cloneSnapshot,
   mergeSnapshots,
+  reapplyReorder,
+  reorderOrigin,
   compareDateKeys,
   createFocusBlock,
   createTask,
@@ -59,6 +61,7 @@ type FocusInput = { title: string; durationMinutes: string; taskId?: string }
 // 失败变更除了快照，还要记住它来自哪个表单与输入值：
 // 冲突后绝不整板回写（会覆盖其他设备的新改动），而是让用户在新版本上重新编辑同一份输入。
 type DraftOrigin =
+  | { kind: 'reorder'; taskId: string; direction: -1 | 1; domain: Domain }
   | { kind: 'task'; input: TaskInput; taskId?: string; domain: Domain; parentId?: string }
   | { kind: 'cycle'; input: { name: string; startDate: string; endDate: string }; cycleId?: string }
   | { kind: 'focus'; input: FocusInput; blockId?: string }
@@ -452,6 +455,17 @@ export default function App() {
     if (!reloaded) return
     const board = storedRef.current?.snapshot
     if (!board) return
+    if (origin.kind === 'reorder') {
+      // 顺序改动没有表单可打开：直接把这次移动重放到最新版本，再作为一次新的受保护变更提交。
+      if (!board.tasks.some((task) => task.id === origin.taskId && !task.archivedAt)) {
+        setFlash(copy[language].draftTargetMissing)
+        return
+      }
+      const next = reapplyReorder(board, origin.taskId, origin.direction)
+      const applied = commitSnapshot(next, `${t('title')}: ${board.tasks.find((task) => task.id === origin.taskId)?.title || ''}`, origin)
+      if (applied) setFlash(copy[language].reorderReapplied)
+      return
+    }
     if (origin.kind === 'task') {
       const existing = origin.taskId ? board.tasks.find((task) => task.id === origin.taskId) : undefined
       // 目标已被删除时不再静默改成「新建」：那会悄悄产生一个重复任务，改为明确告知并保留输入。
@@ -714,7 +728,8 @@ export default function App() {
   }
 
   function reorderTask(task: Task, direction: -1 | 1) {
-    updateSnapshot((current) => reorderSibling(current, task.id, direction), `${t('title')}: ${task.title}`)
+    // 带上来源，冲突时「重新打开编辑器」才能把这次移动重放到最新版本上。
+    updateSnapshot((current) => reorderSibling(current, task.id, direction), `${t('title')}: ${task.title}`, reorderOrigin(task, direction))
   }
 
   function deleteFocusWithConfirm(block: FocusBlock) {

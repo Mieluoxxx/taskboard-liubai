@@ -11,6 +11,8 @@ import {
   focusDisplayStatus,
   cloneSnapshot,
   mergeSnapshots,
+  reapplyReorder,
+  reorderOrigin,
   rescheduleDailyTask,
   safeTimeZone,
   setFocusCommand,
@@ -286,4 +288,77 @@ test('mergeSnapshots reports a conflict when both sides reordered differently', 
 
   const merged = mergeSnapshots(base, local, remote)
   assert.ok(merged.conflicts.includes('__order__'), `expected an order conflict, saw ${JSON.stringify(merged.conflicts)}`)
+})
+
+test('mergeSnapshots treats both sides making the same reorder as agreement, not a conflict', () => {
+  let base = board()
+  const a = createTask({ domain: 'daily', title: 'a', dateKey: '2025-01-15' }, NOW)
+  const b = createTask({ domain: 'daily', title: 'b', dateKey: '2025-01-15' }, NOW)
+  base = addTask(addTask(base, a), b)
+
+  const swapped = (snapshot: BoardSnapshot) => {
+    const next = cloneSnapshot(snapshot)
+    next.tasks = [next.tasks[1], next.tasks[0]]
+    return next
+  }
+  const merged = mergeSnapshots(base, swapped(base), swapped(base))
+  assert.deepEqual(merged.conflicts, [], 'identical reorders must not be reported as a conflict')
+  assert.deepEqual(merged.snapshot.tasks.map((task) => task.id), [b.id, a.id])
+})
+
+test('mergeSnapshots keeps the local position of a locally created task when the order changed', () => {
+  let base = board()
+  const a = createTask({ domain: 'daily', title: 'a', dateKey: '2025-01-15' }, NOW)
+  const b = createTask({ domain: 'daily', title: 'b', dateKey: '2025-01-15' }, NOW)
+  base = addTask(addTask(base, a), b)
+
+  const local = cloneSnapshot(base)
+  const fresh = createTask({ domain: 'daily', title: 'n', dateKey: '2025-01-15' }, NOW)
+  local.tasks = [fresh, ...local.tasks] // N first, ahead of everything
+
+  const merged = mergeSnapshots(base, local, cloneSnapshot(base))
+  assert.deepEqual(merged.conflicts, [])
+  assert.equal(merged.snapshot.tasks[0]?.id, fresh.id, 'a locally created task keeps its local position')
+  assert.deepEqual(merged.snapshot.tasks.map((task) => task.id), [fresh.id, a.id, b.id])
+})
+
+test('mergeSnapshots reports a conflict when the base is behind and both sides hold different data', () => {
+  // This is the dropped-response case: a save committed server-side but the client never saw the
+  // acknowledgement, so base lacks an entity that both local and remote now have with different data.
+  let base = board()
+  const stable = createTask({ domain: 'daily', title: 'stable', dateKey: '2025-01-15' }, NOW)
+  base = addTask(base, stable)
+
+  const remote = cloneSnapshot(base)
+  const shared = createTask({ domain: 'daily', title: 'from-server', dateKey: '2025-01-15' }, NOW)
+  remote.tasks.push(shared)
+  const local = cloneSnapshot(base)
+  local.tasks.push({ ...shared, title: 'from-client' })
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.deepEqual(merged.conflicts, [shared.id], 'a base-behind divergence must not silently overwrite the remote value')
+  assert.equal(merged.snapshot.tasks.find((task) => task.id === shared.id)?.title, 'from-server')
+})
+
+test('a reorder can be replayed onto a newer board, and is skipped when the target is gone', () => {
+  let base = board()
+  const a = createTask({ domain: 'daily', title: 'a', dateKey: '2025-01-15' }, NOW)
+  const b = createTask({ domain: 'daily', title: 'b', dateKey: '2025-01-15' }, NOW)
+  base = addTask(addTask(base, a), b)
+
+  const origin = reorderOrigin(b, -1)
+  assert.deepEqual(origin, { kind: 'reorder', taskId: b.id, direction: -1, domain: 'daily' })
+
+  // replay onto a newer board that also has an extra task: the move must land
+  const newer = cloneSnapshot(base)
+  newer.tasks.push(createTask({ domain: 'daily', title: 'c', dateKey: '2025-01-15' }, NOW))
+  const replayed = reapplyReorder(newer, origin.taskId, origin.direction)
+  assert.deepEqual(replayed.tasks.map((task) => task.title), ['b', 'a', 'c'])
+  validateSnapshot(replayed)
+
+  // if the target was deleted elsewhere, replay is a no-op instead of throwing
+  const withoutTarget = cloneSnapshot(base)
+  withoutTarget.tasks = withoutTarget.tasks.filter((task) => task.id !== b.id)
+  const skipped = reapplyReorder(withoutTarget, origin.taskId, origin.direction)
+  assert.deepEqual(skipped.tasks.map((task) => task.title), ['a'])
 })

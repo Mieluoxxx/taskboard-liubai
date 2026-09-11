@@ -488,6 +488,21 @@ test('RLS exposes the owner row only to the configured owner, not to every authe
     await db.exec('rollback to savepoint claim')
     assert.equal(inserted, 0, 'another authenticated user must not insert a board row')
     assert.match(rejection, /row-level security|row level security/i, `expected a policy rejection, saw: ${rejection}`)
+
+    // INSERT-as-OTHER is rejected because OTHER is not the configured owner, which is true for two
+    // different policy mistakes. Pin the specific rule with an UPDATE aimed at the OWNER's row:
+    // a policy that only compared candidate-to-config-owner would match it and change a row.
+    await db.exec('savepoint claim2')
+    await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
+    let updated = -1
+    try {
+      const result = await db.query('update private.personal_boards set revision = revision + 1 where owner_uuid = $1', [OWNER])
+      updated = result.affectedRows ?? 0
+    } catch {
+      updated = 0
+    }
+    await db.exec('rollback to savepoint claim2')
+    assert.equal(updated, 0, 'another authenticated user must not be able to update the owner row')
     await db.exec('rollback')
     // Outside that grant, the private tables are not reachable by clients at all: all access goes
     // through the SECURITY DEFINER RPCs.
@@ -515,6 +530,30 @@ test('every time zone the client accepts is one the database also accepts', asyn
     for (const zone of ['+08:00', '-05:00', 'GMT+8']) {
       assert.notEqual(safeTimeZone(zone), zone, `${zone} must not pass the client check`)
     }
+  } finally {
+    await db.close()
+  }
+})
+
+test('the private SECURITY DEFINER helpers are unreachable from client roles', async () => {
+  // `grant usage on schema private` is needed so the RLS policy can resolve its helper. That also
+  // makes PUBLIC's default EXECUTE meaningful, so the definer helpers must be revoked explicitly.
+  const db = await database()
+  try {
+    for (const role of ['authenticated', 'anon']) {
+      for (const call of ['select private.assert_board_owner()', "select private.validate_board_snapshot('{}'::jsonb)"]) {
+        await db.exec(`set role ${role}`)
+        await assert.rejects(db.query(call), /permission denied for function|permission denied for schema/i, `${role} must not call ${call}`)
+        await db.exec('reset role')
+      }
+    }
+    // the owner-facing RPCs still work, because they invoke those helpers as the definer
+    await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OWNER}', false)`)
+    const loaded = await db.query<{ revision: number }>('select revision from public.get_private_board()')
+    assert.equal(Number(loaded.rows[0].revision), 0)
+    const saved = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(emptySnapshot('UTC'))])
+    assert.equal(Number(saved.rows[0].revision), 1)
+    await db.exec('reset role')
   } finally {
     await db.close()
   }
