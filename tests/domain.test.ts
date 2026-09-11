@@ -253,3 +253,37 @@ test('mergeSnapshots does not resurrect an entity the local side deleted and the
   assert.deepEqual(merged.conflicts, [])
   assert.equal(merged.snapshot.tasks.length, 0, 'a local deletion must be honoured')
 })
+
+test('mergeSnapshots keeps a local sibling reorder that changes only array order', () => {
+  let base = board()
+  const first = createTask({ domain: 'daily', title: 'first', dateKey: '2025-01-15' }, NOW)
+  const second = createTask({ domain: 'daily', title: 'second', dateKey: '2025-01-15' }, NOW)
+  base = addTask(addTask(base, first), second)
+
+  // A reorder swaps positions without touching updatedAt, so per-entity comparison cannot see it.
+  const local = cloneSnapshot(base)
+  local.tasks = [local.tasks[1], local.tasks[0]]
+  const remote = cloneSnapshot(base)
+  remote.tasks.find((task) => task.id === second.id)!.checked = true
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.deepEqual(merged.conflicts, [])
+  assert.deepEqual(merged.snapshot.tasks.map((task) => task.id), [second.id, first.id], 'the local order must survive')
+  assert.equal(merged.snapshot.tasks.find((task) => task.id === second.id)?.checked, true, 'the remote edit must survive')
+})
+
+test('mergeSnapshots reports a conflict when both sides reordered differently', () => {
+  let base = board()
+  const a = createTask({ domain: 'daily', title: 'a', dateKey: '2025-01-15' }, NOW)
+  const b = createTask({ domain: 'daily', title: 'b', dateKey: '2025-01-15' }, NOW)
+  const c = createTask({ domain: 'daily', title: 'c', dateKey: '2025-01-15' }, NOW)
+  base = addTask(addTask(addTask(base, a), b), c)
+
+  const local = cloneSnapshot(base)
+  local.tasks = [local.tasks[1], local.tasks[0], local.tasks[2]] // b, a, c
+  const remote = cloneSnapshot(base)
+  remote.tasks = [remote.tasks[0], remote.tasks[2], remote.tasks[1]] // a, c, b
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.ok(merged.conflicts.includes('__order__'), `expected an order conflict, saw ${JSON.stringify(merged.conflicts)}`)
+})

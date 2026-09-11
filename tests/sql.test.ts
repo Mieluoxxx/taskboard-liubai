@@ -471,21 +471,23 @@ test('RLS exposes the owner row only to the configured owner, not to every authe
       )
     }
 
-    // The other user must not be able to write or claim the owner's row either. A policy violation
-    // aborts the enclosing transaction, so isolate the expected failure in a savepoint and undo it
-    // with `rollback to savepoint` (which, unlike `reset role`, works on an aborted transaction).
+    // The other user must not be able to write a row of their own either: the policy's WITH CHECK
+    // ties the row to the configured owner. The write goes to OTHER (not OWNER) so a rejection can
+    // only come from the policy — inserting OWNER would also fail on the existing primary key.
+    // A policy violation aborts the transaction, so isolate it in a savepoint and undo it.
     await db.exec('savepoint claim')
     await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
     let inserted = 0
-    let writeBlocked = false
+    let rejection = ''
     try {
-      const result = await db.query("insert into private.personal_boards(owner_uuid, revision, snapshot) values ($1, 9, '{}'::jsonb) returning owner_uuid", [OWNER])
+      const result = await db.query("insert into private.personal_boards(owner_uuid, revision, snapshot) values ($1, 9, '{}'::jsonb) returning owner_uuid", [OTHER])
       inserted = result.rows.length
-    } catch {
-      writeBlocked = true
+    } catch (caught) {
+      rejection = caught instanceof Error ? caught.message : String(caught)
     }
     await db.exec('rollback to savepoint claim')
-    assert.equal(inserted === 0 || writeBlocked, true, 'another authenticated user must not write the owner row')
+    assert.equal(inserted, 0, 'another authenticated user must not insert a board row')
+    assert.match(rejection, /row-level security|row level security/i, `expected a policy rejection, saw: ${rejection}`)
     await db.exec('rollback')
     // Outside that grant, the private tables are not reachable by clients at all: all access goes
     // through the SECURITY DEFINER RPCs.

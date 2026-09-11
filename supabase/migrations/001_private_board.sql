@@ -378,6 +378,11 @@ $$;
 revoke all on function private.is_configured_board_owner(uuid) from public, anon;
 grant execute on function private.is_configured_board_owner(uuid) to authenticated;
 
+-- schema USAGE 之后，PUBLIC 的默认 EXECUTE 会让任何已认证用户直接调用这些 SECURITY DEFINER 函数。
+-- 它们只被 RPC（以 definer 身份）调用，因此撤销 PUBLIC/anon 执行权限、不单独授予客户端。
+revoke all on function private.assert_board_owner() from public, anon, authenticated;
+revoke all on function private.validate_board_snapshot(jsonb) from public, anon, authenticated;
+
 drop policy if exists personal_boards_owner_access on private.personal_boards;
 create policy personal_boards_owner_access on private.personal_boards
   for all to authenticated

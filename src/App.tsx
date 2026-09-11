@@ -281,6 +281,10 @@ export default function App() {
       const current = storedRef.current
       const pending = pendingJobRef.current as PendingJob | null
       if (pending && current) {
+        // 这次保存已经落库，base 必须前进到「刚提交的那份快照」，而不是停在更早的版本：
+        // base 落后会把「后端已有、base 里还没有」的实体误判成本地新增，
+        // 从而在之后的合并里覆盖另一台设备对这些实体的改动。
+        baselineRef.current = cloneSnapshot(result.value.snapshot)
         const merged: StoredBoard = { revision: result.value.revision, snapshot: current.snapshot }
         const nextPending: PendingJob = { ...pending, expectedRevision: result.value.revision }
         pendingJobRef.current = nextPending

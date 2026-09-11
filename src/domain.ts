@@ -655,9 +655,36 @@ export function mergeSnapshots(base: BoardSnapshot, local: BoardSnapshot, remote
     return result
   }
 
-  merged.cycles = mergeList<GoalCycle>(base.cycles, local.cycles, remote.cycles)
-  merged.tasks = mergeList<Task>(base.tasks, local.tasks, remote.tasks)
-  merged.focusBlocks = mergeList<FocusBlock>(base.focusBlocks, local.focusBlocks, remote.focusBlocks)
+  // 顺序也是用户改动：上移/下移只交换数组位置而不改实体本身，逐条比较看不到它。
+  // 只比较「两侧都存在的 id」的相对次序：本地改过顺序就用本地顺序重排合并结果，
+  // 双方都改过顺序则记为冲突（不猜测谁对）。
+  const applyOrder = <T extends { id: string }>(mergedList: T[], baseList: T[], localList: T[], remoteList: T[]): void => {
+    const common = (list: T[]) => list.map((item) => item.id).filter((id) => localList.some((l) => l.id === id) && remoteList.some((r) => r.id === id))
+    const baseOrder = common(baseList).join('\u0000')
+    const localOrder = common(localList).join('\u0000')
+    const remoteOrder = common(remoteList).join('\u0000')
+    if (localOrder === baseOrder) return // 本地没动顺序，保持云端顺序
+    if (remoteOrder !== baseOrder) { conflicts.push('__order__'); return }
+    const localIndex = new Map(localList.map((item, index) => [item.id, index]))
+    mergedList.sort((left, right) => {
+      const a = localIndex.get(left.id)
+      const b = localIndex.get(right.id)
+      if (a === undefined && b === undefined) return 0
+      if (a === undefined) return 1
+      if (b === undefined) return -1
+      return a - b
+    })
+  }
+
+  const mergedCycles = mergeList<GoalCycle>(base.cycles, local.cycles, remote.cycles)
+  const mergedTasks = mergeList<Task>(base.tasks, local.tasks, remote.tasks)
+  const mergedFocusBlocks = mergeList<FocusBlock>(base.focusBlocks, local.focusBlocks, remote.focusBlocks)
+  applyOrder(mergedCycles, base.cycles, local.cycles, remote.cycles)
+  applyOrder(mergedTasks, base.tasks, local.tasks, remote.tasks)
+  applyOrder(mergedFocusBlocks, base.focusBlocks, local.focusBlocks, remote.focusBlocks)
+  merged.cycles = mergedCycles
+  merged.tasks = mergedTasks
+  merged.focusBlocks = mergedFocusBlocks
 
   // 合并结果必须自身合法；不合法就当作未能自动合并（例如某实体引用了被删除的对象）。
   try {
