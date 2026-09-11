@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFile } from 'node:fs/promises'
 import { PGlite } from '@electric-sql/pglite'
-import { addCycle, addFocusBlock, addTask, createTask, emptySnapshot, rescheduleDailyTask, validateSnapshot } from '../src/domain'
+import { addCycle, addFocusBlock, addTask, createTask, emptySnapshot, rescheduleDailyTask, safeTimeZone, validateSnapshot } from '../src/domain'
 
 const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
@@ -259,7 +259,9 @@ test('the database requires the same JSON types the client requires, not just ma
   const base = { schemaVersion: 1, settings: { timeZone: 'UTC' }, cycles: [], tasks: [], focusBlocks: [] }
   const task = (extra: Record<string, unknown>) => ({ id: 't1', domain: 'daily', title: 'x', note: '', checked: false, color: 'ink', dateKey: '2025-01-15', history: [], createdAt: now, updatedAt: now, ...extra })
   const block = (extra: Record<string, unknown>) => ({ id: 'f1', dateKey: '2025-01-15', title: 'x', status: 'paused', durationMinutes: 45, elapsedMs: 0, createdAt: now, ...extra })
-  // A text comparison would accept "true" / "0"; the client rejects them, so the DB must too.
+  // A text comparison would accept "true" / "0". The client rejects a string `checked`/`elapsedMs`
+  // outright, so the database must too. (`durationMinutes` is the exception: the client coerces it
+  // with Number(), so the DB is deliberately stricter there and this test asserts no client behaviour.)
   const cases: Array<[string, unknown]> = [
     ['checked as the string "true"', { ...base, tasks: [task({ checked: 'true' })] }],
     ['durationMinutes as the string "45"', { ...base, focusBlocks: [block({ durationMinutes: '45' })] }],
@@ -431,6 +433,86 @@ test('SQL matches JS trim() and String.length semantics, not btrim and character
     validateSnapshot(boundary)
     const saved = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(boundary)])
     assert.equal(Number(saved.rows[0].revision), 1)
+  } finally {
+    await db.close()
+  }
+})
+
+test('RLS exposes the owner row only to the configured owner, not to every authenticated user', async () => {
+  const db = await database()
+  try {
+    await db.query('select * from public.get_private_board()')
+    // Grant table privileges INSIDE a transaction that is rolled back, so the POLICY (not a missing
+    // GRANT) is what decides access. Without this the test would pass even if the policy were open.
+    await db.exec('begin')
+    await db.exec('grant select, insert, update, delete on private.personal_boards to authenticated')
+
+    const contexts: Array<[string, string | null, boolean]> = [
+      ['the configured owner', OWNER, true],
+      ['another authenticated user', OTHER, false],
+      ['an anonymous session', null, false],
+    ]
+    for (const [label, subject, shouldSee] of contexts) {
+      await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', ${subject === null ? 'null' : `'${subject}'`}, false)`)
+      let rows = 0
+      let blocked = false
+      try {
+        const result = await db.query('select owner_uuid from private.personal_boards')
+        rows = result.rows.length
+      } catch {
+        blocked = true
+      } finally {
+        await db.exec('reset role')
+      }
+      assert.equal(
+        rows > 0 && !blocked,
+        shouldSee,
+        `RLS decision for ${label}: saw ${rows} row(s), blocked=${blocked}`,
+      )
+    }
+
+    // The other user must not be able to write or claim the owner's row either. A policy violation
+    // aborts the enclosing transaction, so isolate the expected failure in a savepoint and undo it
+    // with `rollback to savepoint` (which, unlike `reset role`, works on an aborted transaction).
+    await db.exec('savepoint claim')
+    await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
+    let inserted = 0
+    let writeBlocked = false
+    try {
+      const result = await db.query("insert into private.personal_boards(owner_uuid, revision, snapshot) values ($1, 9, '{}'::jsonb) returning owner_uuid", [OWNER])
+      inserted = result.rows.length
+    } catch {
+      writeBlocked = true
+    }
+    await db.exec('rollback to savepoint claim')
+    assert.equal(inserted === 0 || writeBlocked, true, 'another authenticated user must not write the owner row')
+    await db.exec('rollback')
+    // Outside that grant, the private tables are not reachable by clients at all: all access goes
+    // through the SECURITY DEFINER RPCs.
+    await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OWNER}', false)`)
+    await assert.rejects(db.query('select owner_uuid from private.personal_boards'), /permission denied/i)
+    await db.exec('reset role')
+  } finally {
+    await db.close()
+  }
+})
+
+test('every time zone the client accepts is one the database also accepts', async () => {
+  // The reverse direction matters: if the client accepted a zone Postgres does not know, a settings
+  // change would save locally but be rejected by the RPC in cloud mode.
+  const accepted = ['UTC', 'Asia/Shanghai', 'America/New_York', 'Europe/London', 'Etc/GMT-8', 'Pacific/Kiritimati']
+  const db = await database()
+  try {
+    const zones = await db.query<{ name: string }>('select name from pg_timezone_names')
+    const known = new Set(zones.rows.map((row) => row.name))
+    for (const zone of accepted) {
+      assert.equal(safeTimeZone(zone), zone, `${zone} should be accepted by the client`)
+      assert.equal(known.has(zone), true, `${zone} must also exist in pg_timezone_names`)
+    }
+    // and the client rejects what Postgres would reject
+    for (const zone of ['+08:00', '-05:00', 'GMT+8']) {
+      assert.notEqual(safeTimeZone(zone), zone, `${zone} must not pass the client check`)
+    }
   } finally {
     await db.close()
   }

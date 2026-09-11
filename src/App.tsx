@@ -6,6 +6,7 @@ import {
   addTask,
   addDays,
   cloneSnapshot,
+  mergeSnapshots,
   compareDateKeys,
   createFocusBlock,
   createTask,
@@ -113,6 +114,8 @@ export default function App() {
   const [authError, setAuthError] = useState('')
   const [stored, setStored] = useState<StoredBoard | null>(null)
   const storedRef = useRef<StoredBoard | null>(null)
+  // 最近一次与后端一致的快照（成功加载/保存后的版本），三方合并的 base。
+  const baselineRef = useRef<BoardSnapshot | null>(null)
   const [boardLoadToken, setBoardLoadToken] = useState(0)
   const [saveState, setSaveState] = useState<SaveState>('saved')
   const [saveMessage, setSaveMessage] = useState('')
@@ -171,6 +174,7 @@ export default function App() {
     failedJobRef.current = null
     saveInFlightRef.current = false
     storedRef.current = null
+    baselineRef.current = null
     setStored(null)
     setSelectedTaskId(null)
     setDraftLabel(null)
@@ -209,6 +213,7 @@ export default function App() {
       }
       const safeBoard: StoredBoard = { revision: result.value.revision, snapshot: loadedSnapshot }
       storedRef.current = safeBoard
+      baselineRef.current = cloneSnapshot(loadedSnapshot)
       setStored(safeBoard)
       setBoardLoadToken((value) => value + 1)
       setScreen('workspace')
@@ -288,6 +293,7 @@ export default function App() {
         queueMicrotask(() => { void drainRef.current?.() })
       } else {
         storedRef.current = result.value
+        baselineRef.current = cloneSnapshot(result.value.snapshot)
         setStored(result.value)
         setSaveState('saved')
         setSaveMessage('')
@@ -302,6 +308,31 @@ export default function App() {
       // 保留更新的快照用于重试，但若更新的那次来自直接操作（没有表单来源），
       // 仍保留失败表单的 origin，使“重新打开编辑器”仍有可重放的输入。
       const retained: PendingJob = newer ? { ...newer, origin: newer.origin ?? job.origin } : job
+      // 冲突时先做三方合并：本地排队改动与云端改动各自独立时，两者都应保留。
+      // 合并成功即用新 revision 以 CAS 再推一次；真有同实体冲突才交给用户。
+      if (result.kind === 'conflict') {
+        const base = baselineRef.current
+        const remoteBoard = await currentAdapter.load()
+        if (epoch === saveEpochRef.current && adapterRef.current === currentAdapter && remoteBoard.ok) {
+          const remoteSnapshot = remoteBoard.value.snapshot
+          const merged = base ? mergeSnapshots(base, retained.snapshot, remoteSnapshot) : { snapshot: remoteSnapshot, conflicts: ['__no_base__'] }
+          if (merged.conflicts.length === 0) {
+            baselineRef.current = cloneSnapshot(remoteSnapshot)
+            storedRef.current = { revision: remoteBoard.value.revision, snapshot: merged.snapshot }
+            setStored(storedRef.current)
+            const mergeJob: PendingJob = { expectedRevision: remoteBoard.value.revision, snapshot: merged.snapshot, draft: retained.draft, origin: retained.origin }
+            pendingJobRef.current = mergeJob
+            failedJobRef.current = null
+            setSaveState('pending')
+            setSaveMessage('')
+            setFailureKind(null)
+            queueMicrotask(() => { void drainRef.current?.() })
+            return
+          }
+          // 无法自动合并：如实告知哪些改动需要人工决定，并保留草稿。
+          setFlash(copy[language].mergeConflicts)
+        }
+      }
       failedJobRef.current = retained
       setSaveState(result.kind === 'offline' ? 'offline' : 'error')
       if (result.message) console.warn('[taskboard]', result.message)
@@ -334,22 +365,23 @@ export default function App() {
     return true
   }, [])
 
-  const reloadLatest = useCallback(async (keepDraft = true) => {
+  // 返回是否成功换上了新的板（false = 仍在旧板/被取代/失败）。调用方据此决定是否继续依赖它。
+  const reloadLatest = useCallback(async (keepDraft = true): Promise<boolean> => {
     const currentAdapter = adapterRef.current
-    if (!currentAdapter) return
+    if (!currentAdapter) return false
     if (saveInFlightRef.current) {
       setSaveMessage('noticeSaveInProgress')
-      return
+      return false
     }
     const epoch = ++saveEpochRef.current
     const result = await currentAdapter.load()
-    if (epoch !== saveEpochRef.current || adapterRef.current !== currentAdapter) return
+    if (epoch !== saveEpochRef.current || adapterRef.current !== currentAdapter) return false
     if (!result.ok) {
-      if (result.kind === 'auth') { clearPrivateState('auth'); return }
+      if (result.kind === 'auth') { clearPrivateState('auth'); return false }
       setSaveState(result.kind === 'offline' ? 'offline' : 'error')
       if (result.message) console.warn('[taskboard]', result.message)
       setSaveMessage(noticeText(result, 'noticeCloudError'))
-      return
+      return false
     }
     const existingDraft = draftLabel
     let safeBoard: StoredBoard
@@ -360,19 +392,21 @@ export default function App() {
     } catch (caught) {
       setSaveState('error')
       setSaveMessage(errorNotice(caught, 'noticeInvalidState'))
-      return
+      return false
     }
     // 冲突时用户若选择“保留草稿”，失败的那次快照要留着，否则草稿只剩一个标题字符串，改动等于丢失。
     const retained = keepDraft ? (failedJobRef.current || pendingJobRef.current) : null
     pendingJobRef.current = null
     failedJobRef.current = retained
     storedRef.current = safeBoard
+    baselineRef.current = cloneSnapshot(safeBoard.snapshot)
     setStored(safeBoard)
     setSaveState(retained ? 'error' : 'saved')
     setSaveMessage(retained ? 'noticeReapplyDraft' : '')
     setFailureKind(retained ? 'conflict' : null)
     if (!keepDraft) setDraftLabel(null)
     else setDraftLabel(existingDraft)
+    return true
   }, [clearPrivateState, draftLabel, language])
 
   const retrySave = useCallback(() => {
@@ -409,15 +443,23 @@ export default function App() {
   const reopenDraft = useCallback(async () => {
     const origin = failedJobRef.current?.origin
     if (!origin) { setFlash(copy[language].noRetainedInput); return }
-    await reloadLatest(true)
+    // 只有真正换上新板才继续：刷新失败（离线/错误）或会话已变时中止，避免在过期版本上继续编辑。
+    const reloaded = await reloadLatest(true)
+    if (!reloaded) return
+    const board = storedRef.current?.snapshot
+    if (!board) return
     if (origin.kind === 'task') {
-      const existing = origin.taskId ? storedRef.current?.snapshot.tasks.find((task) => task.id === origin.taskId) : undefined
+      const existing = origin.taskId ? board.tasks.find((task) => task.id === origin.taskId) : undefined
+      // 目标已被删除时不再静默改成「新建」：那会悄悄产生一个重复任务，改为明确告知并保留输入。
+      if (origin.taskId && !existing) { setFlash(copy[language].draftTargetMissing); return }
       setDialog({ kind: 'task', task: existing, domain: origin.domain, parentId: origin.parentId, initial: origin.input })
     } else if (origin.kind === 'cycle') {
-      const existing = origin.cycleId ? storedRef.current?.snapshot.cycles.find((cycle) => cycle.id === origin.cycleId) : undefined
+      const existing = origin.cycleId ? board.cycles.find((cycle) => cycle.id === origin.cycleId) : undefined
+      if (origin.cycleId && !existing) { setFlash(copy[language].draftTargetMissing); return }
       setDialog({ kind: 'cycle', cycle: existing, initial: origin.input })
     } else {
-      const existing = origin.blockId ? storedRef.current?.snapshot.focusBlocks.find((block) => block.id === origin.blockId) : undefined
+      const existing = origin.blockId ? board.focusBlocks.find((block) => block.id === origin.blockId) : undefined
+      if (origin.blockId && !existing) { setFlash(copy[language].draftTargetMissing); return }
       setDialog({ kind: 'focus', block: existing, initial: origin.input })
     }
   }, [language, reloadLatest])

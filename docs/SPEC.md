@@ -30,13 +30,15 @@ Liubai 是一个个人规划看板：长期目标、周计划、日计划和专�
 - 单个私有 owner board JSONB 行，带单调递增 `revision`。每次变更（含计时器）都在同一条受保护路径中以客户端加载的 revision 做 compare-and-swap；禁止无条件 overwrite/upsert。
 - 数据库验证 schema、大小、任务图、日期/时长、运行计时器数量。存入 React 前客户端也验证外部状态。
 - CAS 被拒绝时返回清晰冲突，并保留该次变更的**表单输入**（`DraftOrigin`）与编辑器草稿标签。只有用户明确点击“加载最新（保留草稿）”后才刷新；恢复在线或瞬时错误可手动重试。
-- 冲突后**不提供整板回写**：旧全量快照会覆盖其他设备的新改动。界面提供“重新打开编辑器”，它先刷新到最新 `revision`，再用保留的输入重新打开同一个表单，用户确认后作为一次新的受保护变更提交。离线时拒绝提交并保留输入。
+- 冲突后先做**三方合并**（base = 最近一次与后端一致的快照，local = 含排队改动的本地快照，remote = 最新云端快照）：按实体逐条比较，本地改动叠加到云端结果上，云端不相关的改动全部保留；只要没有同实体冲突，就自动以新 `revision` 再次 CAS 提交，用户无需操作（两台设备都从空板开始、id 完全不同时也不会丢新增项）。
+- 同一实体双方都改动且结果不同时**不猜测**：保留云端值，把本地意图作为草稿保留，并明确告知需要人工确认。绝不整板覆盖，也绝不静默丢弃用户改动。
+- 冲突后**不做整板回写**。界面提供“重新打开编辑器”：它先在事务式刷新中换到最新 `revision`，刷新失败或会话变化就中止；目标已被删除时不静默改成新建，而是保留草稿并告知。离线时拒绝提交并保留输入。
 - 这是小型个人应用的单行快照上限（`ponytail: 单 owner JSONB/CAS；若数据量或协作增长，升级为按实体的规范化 mutation`）。
 
 ## 身份、安全和部署
 
 - 真实模式只使用 Supabase 邮箱/密码登录，不提供公开注册、OAuth 或重置 UI。缺少 Vite Supabase 配置时显示诚实的设置页，用户必须显式点击 LOCAL DEMO；云错误不会静默切 demo。
-- SQL 将 owner UUID 放在受保护配置表中，RLS 仅允许该 owner；客户端不能读取、写入或认领 owner。所有 SECURITY DEFINER 函数固定 `search_path`，检查 `auth.uid()`，撤销 `PUBLIC/anon` 执行权限。
+- SQL 将 owner UUID 放在受保护配置表中，RLS 策略要求 `auth.uid() = candidate = 配置的 owner`（只比较 candidate 会放行任何已认证用户）；客户端不能读取、写入或认领 owner。私有表不授予客户端任何权限，读写只能经由 SECURITY DEFINER RPC，`tests/sql.test.ts` 在可回滚事务中用受控授权分别验证 owner / 其他已认证用户 / 匿名三种身份。所有 SECURITY DEFINER 函数固定 `search_path`，检查 `auth.uid()`，撤销 `PUBLIC/anon` 执行权限。
 - Demo 数据只使用 demo 专用 localStorage key，永不上传。
 
 ## 写入保护

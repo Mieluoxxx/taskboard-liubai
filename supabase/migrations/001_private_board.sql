@@ -25,7 +25,11 @@ create table if not exists private.personal_boards (
 alter table private.owner_config enable row level security;
 alter table private.personal_boards enable row level security;
 
-revoke all on schema private from public, anon, authenticated;
+-- 需要 schema 使用权，RLS 策略才能解析 private.is_configured_board_owner。
+-- 表本身的权限仍不授予客户端：所有读写只能经由下方 SECURITY DEFINER RPC，
+-- 这样即便将来有人授予表权限，策略依然强制「只有配置的 owner」可访问。
+revoke all on schema private from public, anon;
+grant usage on schema private to authenticated;
 revoke all on private.owner_config from public, anon, authenticated;
 revoke all on private.personal_boards from public, anon, authenticated;
 
@@ -363,7 +367,11 @@ stable
 security definer
 set search_path = pg_catalog, private, public
 as $$
+  -- 三个条件都必须成立：有登录身份、请求者就是 candidate、candidate 是配置的 owner。
+  -- 只比较 candidate 与配置 owner 会让任何已认证用户都能读写 owner 的那一行。
   select auth.uid() is not null
+    and candidate is not null
+    and auth.uid() = candidate
     and candidate = (select owner_uuid from private.owner_config where singleton = true);
 $$;
 

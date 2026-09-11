@@ -89,9 +89,15 @@ export function todayInTimeZone(timeZone: string, now = new Date()): string {
   return `${parts.year}-${parts.month}-${parts.day}`
 }
 
+// 与数据库 private.validate_board_snapshot 的 pg_timezone_names 成员校验对齐：
+// Intl 还接受 "+08:00" 这类偏移时区，而 Postgres 时区表里没有，云端保存会被拒绝，
+// 因此这里只接受 IANA 形状的名称，避免界面接受一个存不进去的值。
+const IANA_ZONE_RE = /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+)*$/
+
 export function safeTimeZone(timeZone?: unknown): string {
   const fallback = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
   if (typeof timeZone !== 'string' || timeZone.length > 100) return fallback
+  if (!IANA_ZONE_RE.test(timeZone)) return fallback
   try {
     new Intl.DateTimeFormat('en-US', { timeZone }).format()
     return timeZone
@@ -596,4 +602,68 @@ export function deleteFocusBlock(snapshot: BoardSnapshot, blockId: string): Boar
   next.focusBlocks.splice(index, 1)
   validateSnapshot(next)
   return next
+}
+
+/**
+ * 三方合并：base 是本次编辑所基于的版本，local 是本地（含排队改动）的版本，remote 是最新云端版本。
+ * 按实体逐条合并，绝不整板覆盖：本地改动叠加到云端结果上，云端不相关的改动全部保留。
+ * 同一实体双方都改且结果不同时不算合并成功，而是记入 conflicts 交给用户决定（不猜测、不静默丢）。
+ */
+export function mergeSnapshots(base: BoardSnapshot, local: BoardSnapshot, remote: BoardSnapshot): { snapshot: BoardSnapshot; conflicts: string[] } {
+  const conflicts: string[] = []
+  const merged = cloneSnapshot(remote)
+
+  // 时区：本地相对 base 改过就用本地，否则跟随云端。
+  merged.settings.timeZone = local.settings.timeZone !== base.settings.timeZone ? local.settings.timeZone : remote.settings.timeZone
+
+  const mergeList = <T extends { id: string }>(baseList: T[], localList: T[], remoteList: T[]): T[] => {
+    const baseItems = new Map(baseList.map((item) => [item.id, JSON.stringify(item)]))
+    const localItems = new Map(localList.map((item) => [item.id, item]))
+    const remoteItems = new Map(remoteList.map((item) => [item.id, item]))
+    const result: T[] = []
+
+    // 保持云端顺序；云端已删除但本地改过的实体视为冲突。
+    for (const remoteItem of remoteList) {
+      const id = remoteItem.id
+      const baseJson = baseItems.get(id)
+      const localItem = localItems.get(id)
+      const remoteJson = JSON.stringify(remoteItem)
+      if (!localItem) {
+        // base 里没有 → 这是云端新增的，必须保留（两台设备都从空板开始时 id 完全不同，之前的写法会丢掉它）。
+        if (baseJson === undefined) { result.push(remoteItem); continue }
+        // base 里有 → 本地删除了它；云端若同时改过就是真冲突，交给用户。
+        if (baseJson !== remoteJson) { conflicts.push(id); result.push(remoteItem) }
+        continue
+      }
+      const localJson = JSON.stringify(localItem)
+      if (baseJson === localJson) { result.push(remoteItem); continue } // 本地没改，用云端
+      if (baseJson === remoteJson || baseJson === undefined) { result.push(localItem); continue } // 只有本地改了
+      if (localJson === remoteJson) { result.push(remoteItem); continue } // 改成了同样的结果
+      conflicts.push(id)
+      result.push(remoteItem)
+    }
+
+    // 云端没有的实体：base 里也没有 → 本地新增，加入；base 里有 → 云端删除了它。
+    for (const localItem of localList) {
+      const id = localItem.id
+      if (remoteItems.has(id)) continue
+      const baseJson = baseItems.get(id)
+      if (baseJson === undefined) { result.push(localItem); continue }
+      // 云端已删除：本地未改动则服从删除，本地改过则是真冲突，交给用户。
+      if (baseJson !== JSON.stringify(localItem)) conflicts.push(id)
+    }
+    return result
+  }
+
+  merged.cycles = mergeList<GoalCycle>(base.cycles, local.cycles, remote.cycles)
+  merged.tasks = mergeList<Task>(base.tasks, local.tasks, remote.tasks)
+  merged.focusBlocks = mergeList<FocusBlock>(base.focusBlocks, local.focusBlocks, remote.focusBlocks)
+
+  // 合并结果必须自身合法；不合法就当作未能自动合并（例如某实体引用了被删除的对象）。
+  try {
+    validateSnapshot(merged)
+    return { snapshot: merged, conflicts }
+  } catch {
+    return { snapshot: remote, conflicts: conflicts.length ? conflicts : ['__invalid_merge__'] }
+  }
 }

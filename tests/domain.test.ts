@@ -9,7 +9,10 @@ import {
   emptySnapshot,
   MAX_ELAPSED_MS,
   focusDisplayStatus,
+  cloneSnapshot,
+  mergeSnapshots,
   rescheduleDailyTask,
+  safeTimeZone,
   setFocusCommand,
   validateSnapshot,
   weekKey,
@@ -136,4 +139,117 @@ test('a timer running far past its limit can still be paused and finished', () =
   assert.equal(snapshot.focusBlocks[0].status, 'finished')
   assert.ok(snapshot.focusBlocks[0].elapsedMs <= MAX_ELAPSED_MS)
   validateSnapshot(snapshot)
+})
+
+test('safeTimeZone only accepts names Postgres also knows, so a settings change cannot be silently dropped', () => {
+  // Intl additionally accepts offset zones such as "+08:00"; pg_timezone_names does not contain them,
+  // so accepting one here would make the cloud RPC reject the whole snapshot.
+  assert.equal(safeTimeZone('+08:00'), safeTimeZone(undefined))
+  assert.equal(safeTimeZone('-05:00'), safeTimeZone(undefined))
+  assert.equal(safeTimeZone('GMT+8'), safeTimeZone(undefined))
+  assert.equal(safeTimeZone('   '), safeTimeZone(undefined))
+  assert.equal(safeTimeZone('x'.repeat(101)), safeTimeZone(undefined))
+  // IANA-shaped names survive unchanged
+  for (const zone of ['UTC', 'Asia/Shanghai', 'America/New_York', 'Etc/GMT-8', 'Europe/London']) {
+    assert.equal(safeTimeZone(zone), zone)
+  }
+})
+
+test('mergeSnapshots keeps the local change and the remote change when they touch different entities', () => {
+  let base = board()
+  base = addCycle(base, 'Q1', '2025-01-01', '2025-03-31', NOW)
+  const goal = createTask({ domain: 'long', title: 'Goal', cycleId: base.cycles[0].id }, NOW)
+  base = addTask(base, goal)
+  const dailyA = createTask({ domain: 'daily', title: 'A', dateKey: '2025-01-15' }, NOW)
+  const dailyB = createTask({ domain: 'daily', title: 'B', dateKey: '2025-01-15' }, NOW)
+  base = addTask(addTask(base, dailyA), dailyB)
+
+  // remote checked the goal; local checked A and added a new task — no overlap
+  const remote = cloneSnapshot(base)
+  remote.tasks.find((task) => task.id === goal.id)!.checked = true
+  const local = cloneSnapshot(base)
+  local.tasks.find((task) => task.id === dailyA.id)!.checked = true
+  local.tasks.push(createTask({ domain: 'daily', title: 'C', dateKey: '2025-01-15' }, NOW))
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.deepEqual(merged.conflicts, [])
+  assert.equal(merged.snapshot.tasks.find((task) => task.id === goal.id)?.checked, true, 'remote change preserved')
+  assert.equal(merged.snapshot.tasks.find((task) => task.id === dailyA.id)?.checked, true, 'local change preserved')
+  assert.equal(merged.snapshot.tasks.some((task) => task.title === 'C'), true, 'local addition preserved')
+  validateSnapshot(merged.snapshot)
+})
+
+test('mergeSnapshots reports a real conflict instead of guessing when both sides changed the same entity', () => {
+  let base = board()
+  const task = createTask({ domain: 'daily', title: 'Same', dateKey: '2025-01-15' }, NOW)
+  base = addTask(base, task)
+  const remote = cloneSnapshot(base)
+  remote.tasks[0].title = 'remote title'
+  const local = cloneSnapshot(base)
+  local.tasks[0].title = 'local title'
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.deepEqual(merged.conflicts, [task.id])
+  // the remote value is what stays on the board; the local intent is reported, never silently applied
+  assert.equal(merged.snapshot.tasks[0].title, 'remote title')
+})
+
+test('mergeSnapshots honours a local deletion and a remote deletion', () => {
+  let base = board()
+  const kept = createTask({ domain: 'daily', title: 'kept', dateKey: '2025-01-15' }, NOW)
+  const removedLocally = createTask({ domain: 'daily', title: 'removed-locally', dateKey: '2025-01-15' }, NOW)
+  const removedRemotely = createTask({ domain: 'daily', title: 'removed-remotely', dateKey: '2025-01-15' }, NOW)
+  base = addTask(addTask(addTask(base, kept), removedLocally), removedRemotely)
+
+  const local = cloneSnapshot(base)
+  local.tasks = local.tasks.filter((task) => task.id !== removedLocally.id)
+  const remote = cloneSnapshot(base)
+  remote.tasks = remote.tasks.filter((task) => task.id !== removedRemotely.id)
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.deepEqual(merged.conflicts, [])
+  assert.equal(merged.snapshot.tasks.some((task) => task.id === removedLocally.id), false)
+  assert.equal(merged.snapshot.tasks.some((task) => task.id === removedRemotely.id), false)
+  assert.equal(merged.snapshot.tasks.some((task) => task.id === kept.id), true)
+})
+
+test('mergeSnapshots flags a local edit to an entity the remote already deleted', () => {
+  let base = board()
+  const task = createTask({ domain: 'daily', title: 'gone', dateKey: '2025-01-15' }, NOW)
+  base = addTask(base, task)
+  const local = cloneSnapshot(base)
+  local.tasks[0].checked = true
+  const remote = cloneSnapshot(base)
+  remote.tasks = []
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.deepEqual(merged.conflicts, [task.id])
+  assert.equal(merged.snapshot.tasks.some((candidate) => candidate.id === task.id), false)
+})
+
+test('mergeSnapshots keeps both sides when two devices start from an empty board with disjoint ids', () => {
+  // Two devices both start at revision 0, so each creates its own first task with its own id.
+  // Neither id exists in the other board; neither may be dropped.
+  const base = board()
+  const remote = cloneSnapshot(base)
+  remote.tasks.push(createTask({ domain: 'daily', title: 'device-1 task', dateKey: '2025-01-15' }, NOW))
+  const local = cloneSnapshot(base)
+  local.tasks.push(createTask({ domain: 'daily', title: 'device-2 task', dateKey: '2025-01-15' }, NOW))
+
+  const merged = mergeSnapshots(base, local, remote)
+  assert.deepEqual(merged.conflicts, [])
+  assert.equal(merged.snapshot.tasks.some((task) => task.title === 'device-1 task'), true, 'the remote addition must be kept')
+  assert.equal(merged.snapshot.tasks.some((task) => task.title === 'device-2 task'), true, 'the local addition must be kept')
+  validateSnapshot(merged.snapshot)
+})
+
+test('mergeSnapshots does not resurrect an entity the local side deleted and the remote never touched', () => {
+  let base = board()
+  const doomed = createTask({ domain: 'daily', title: 'doomed', dateKey: '2025-01-15' }, NOW)
+  base = addTask(base, doomed)
+  const local = cloneSnapshot(base)
+  local.tasks = []
+  const merged = mergeSnapshots(base, local, cloneSnapshot(base))
+  assert.deepEqual(merged.conflicts, [])
+  assert.equal(merged.snapshot.tasks.length, 0, 'a local deletion must be honoured')
 })

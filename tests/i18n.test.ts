@@ -109,9 +109,11 @@ test('user-visible strings come from the dictionary, not from inline language br
 
   // A bare `new Error('sentence')` surfaces verbatim through noticeLabel, so it can never be localized.
   // User-facing failures must be BoardError with a notice code; Error is only for internal invariants.
-  const bareErrors = [...source.matchAll(/new Error\('([^']+)'/g)].map(([, message]) => message)
+  // The repo-wide scan below covers App.tsx and storage.ts for every quote style.
+  const quoted = /new Error\(\s*['"`]([^'"`]+)/g
+  const bareErrors = [...source.matchAll(quoted)].map(([, message]) => message)
   assert.deepEqual(bareErrors, [], `App.tsx throws untranslatable user-facing errors: ${bareErrors.join(' | ')}`)
-  const flashLiterals = [...source.matchAll(/setFlash\('([^']+)'/g)].map(([, message]) => message)
+  const flashLiterals = [...source.matchAll(/setFlash\(\s*['"`]([^'"`]+)/g)].map(([, message]) => message)
   assert.deepEqual(flashLiterals, [], `App.tsx flashes untranslatable text: ${flashLiterals.join(' | ')}`)
 })
 
