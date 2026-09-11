@@ -10,6 +10,25 @@
 - 部署：Vercel 导入本仓库，环境变量 `VITE_SUPABASE_URL` 与 `VITE_SUPABASE_PUBLISHABLE_KEY`（两者都是浏览器可见的公开值，真正的访问控制由 RLS 与 owner 策略承担）
 - 推送 `main` 即自动重新部署
 
+## 字体
+
+界面使用 **Maple Mono NF CN**（[subframe7536/maple-font](https://github.com/subframe7536/maple-font)，SIL OFL 1.1），本地自托管、不请求任何第三方 CDN。
+
+完整字体包是 156 MB / 16 个字重，直接使用会让首屏无法接受，因此按用途切成四片、用 `unicode-range` 让浏览器只下载真正用到的部分：
+
+| 分片 | 内容 | 体积（每字重） | 何时下载 |
+|---|---|---|---|
+| `core` | 拉丁、数字、标点、**界面自身的全部中文** | ~0.25 MB | **首屏预加载**（两个字重共约 0.5 MB） |
+| `common` | 字频前 3000 的中文（覆盖约 99% 正文） | ~0.6 MB | 出现中文内容时 |
+| `tail` | 其余生僻字、兼容表意等兜底 | ~4.8 MB | 真的用到时 |
+| `nerd` | Nerd Font 图标（U+E000–F8FF） | ~0.5 MB | 使用图标时 |
+
+- 关键部分在 `src/fonts.css`（仅 core，压缩后约 3 KB，阻塞渲染必须小）；其余在 `public/fonts/maple-mono-cn/fonts-lazy.css`，由 `index.html` 以 `media="print"` 技巧异步加载。
+- 四个分片码点互不重叠，因此无需关心声明顺序；界面用到的字符已固化进 `core`，不会闪回系统字体。
+- 许可文本随字体分发：`public/fonts/LICENSE-maple-mono.txt`。
+- 升级字体版本或调整分片：`python3 scripts/build-fonts.py`（脚本内含所需外部数据说明）。
+- `vercel.json` 为 `/fonts/*` 与 `/assets/*` 设置一年不可变缓存（文件名带版本或内容哈希）。
+
 ## 本地运行
 
 要求 Node 24 与 pnpm（本仓库用 pnpm 12 验证；lockfile 为 v9，可由较新的 pnpm 读取）。

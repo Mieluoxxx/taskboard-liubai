@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="留白">
+  <title>留白 · 个人规划</title>
+  <!-- 深墨方牌：与界面主色一致 -->
+  <rect width="32" height="32" rx="7.5" fill="#2c302e" />
+  <!-- 三根递降的白柱（底边对齐）：长期目标 → 周 → 日 -->
+  <rect x="6.6" y="6.8" width="4" height="16.4" rx="2" fill="#ffffff" />
+  <rect x="12.7" y="10.4" width="4" height="12.8" rx="2" fill="#ffffff" opacity="0.8" />
+  <rect x="18.8" y="14" width="4" height="9.2" rx="2" fill="#ffffff" opacity="0.6" />
+  <!-- 暖橙点：今天 / 此刻专注的那一步；与界面中“当前”标记同色 -->
+  <circle cx="24.8" cy="21.6" r="2.5" fill="#df875e" />
+</svg>

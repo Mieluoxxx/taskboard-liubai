@@ -36,3 +36,65 @@ test('the current-week and current-day markers are styled and announced accessib
   assert.match(source, /aria-label=\{isToday \? `\$\{label\} \$\{date\.slice\(8\)\} · \$\{t\('currentDay'\)\}`/, 'today must be announced')
   assert.match(source, /aria-label=\{isCurrent \? `\$\{key\.slice\(5\)\} · \$\{t\('currentWeek'\)\}`/, 'the current week must be announced')
 })
+
+test('the logo is a single inline SVG mark reused in the page and as the favicon', async () => {
+  const source = await appSource()
+  // 品牌标记必须是内联 SVG（可随尺寸缩放、无额外请求），且对屏幕阅读器隐藏（品牌名由文字承担）
+  assert.match(source, /function BrandMark\(\)/, 'a BrandMark component must exist')
+  assert.match(source, /className="brand-mark"[\s\S]{0,200}aria-hidden="true"/, 'the mark must be decorative for assistive tech')
+  assert.match(source, /viewBox="0 0 32 32"/, 'the mark must be scalable')
+  // 旧的字母占位符不应再出现
+  assert.doesNotMatch(source, /<span className="brand-mark">l<\/span>/, 'the letter placeholder must be gone')
+  // 三根递降柱 + 一个暖橙点，与 favicon.svg 同形
+  const svg = await readFile(new URL('../public/favicon.svg', import.meta.url), 'utf8')
+  for (const shape of ['<rect', '<circle']) assert.ok(svg.includes(shape), `favicon must draw ${shape}`)
+  assert.equal((svg.match(/<rect/g) || []).length, 4, 'favicon = background + three bars')
+  assert.equal((svg.match(/<circle/g) || []).length, 1, 'favicon = exactly one focus dot')
+  // favicon 必须被 index.html 引用，否则浏览器标签页没有图标
+  const html = await readFile(new URL('../index.html', import.meta.url), 'utf8')
+  assert.match(html, /<link rel="icon" href="\/favicon\.svg" type="image\/svg\+xml"/, 'index.html must link the favicon')
+})
+
+test('fonts are self-hosted Maple Mono CN, preloaded in core-only size and lazily tiered', async () => {
+  const html = await readFile(new URL('../index.html', import.meta.url), 'utf8')
+  const critical = await readFile(new URL('../src/fonts.css', import.meta.url), 'utf8')
+  const lazy = await readFile(new URL('../public/fonts/maple-mono-cn/fonts-lazy.css', import.meta.url), 'utf8')
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8')
+
+  // 自托管：不请求任何第三方字体 CDN
+  assert.doesNotMatch(html + critical + lazy + styles, /fonts\.googleapis|fonts\.gstatic|cdn\.jsdelivr|unpkg\.com/, 'fonts must be self-hosted')
+
+  // 只有 core（界面必需）被预加载，且字体预加载必须带 crossorigin（否则会被丢弃并重复请求）
+  const preloads = [...html.matchAll(/<link rel="preload"[^>]*as="font"[^>]*>/g)].map(([tag]) => tag)
+  assert.equal(preloads.length, 2, 'exactly the two core faces should be preloaded')
+  for (const tag of preloads) {
+    assert.match(tag, /core-\d00\.woff2/, `only core faces may be preloaded, saw ${tag}`)
+    assert.match(tag, /crossorigin/, `font preload needs crossorigin: ${tag}`)
+  }
+  assert.doesNotMatch(html, /preload[^>]*(common|tail|nerd)-/, 'large tiers must not be preloaded')
+
+  // 大分片走异步样式表，不阻塞渲染
+  assert.match(html, /<link rel="stylesheet" href="\/fonts\/maple-mono-cn\/fonts-lazy\.css" media="print" onload="this\.media='all'"/, 'lazy tiers must load asynchronously')
+  assert.match(html, /<noscript><link rel="stylesheet" href="\/fonts\/maple-mono-cn\/fonts-lazy\.css" \/><\/noscript>/, 'lazy tiers need a noscript fallback')
+
+  // 关键 CSS 只包含 core，体积必须保持很小（它是阻塞渲染的）
+  assert.ok(critical.length < 20_000, `critical font CSS must stay small, got ${critical.length} bytes`)
+  assert.doesNotMatch(critical, /(common|tail|nerd)-\d00\.woff2/, 'critical CSS must only reference core faces')
+  for (const tier of ['common', 'tail', 'nerd']) {
+    assert.match(lazy, new RegExp(`${tier}-400\\.woff2`), `${tier} tier must be declared lazily`)
+    assert.match(lazy, new RegExp(`${tier}-600\\.woff2`), `${tier} tier must cover the 600 weight too`)
+  }
+
+  // 每个 @font-face 都必须带 unicode-range，否则浏览器会整片无条件下载
+  for (const css of [critical, lazy]) {
+    const faces = css.split('@font-face').slice(1)
+    assert.ok(faces.length > 0, 'expected @font-face blocks')
+    for (const block of faces) assert.match(block, /unicode-range:/, 'every face needs unicode-range')
+  }
+
+  // 界面本身必须使用该字体族
+  assert.match(styles, /font-family: "Maple Mono CN"/, 'the app must actually use the font')
+  assert.match(styles, /font: \d+ \d+px[^;]*"Maple Mono CN"/, 'shorthand font declarations must use it too')
+  // 且必须声明许可（OFL 要求随字体分发许可文本）
+  await readFile(new URL('../public/fonts/LICENSE-maple-mono.txt', import.meta.url), 'utf8')
+})

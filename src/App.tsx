@@ -35,6 +35,7 @@ import { copy, type CopyKey } from './i18n'
 import { BoardError, isNoticeCode, type NoticeCode } from './notices'
 import { createDemoBoardAdapter, createSupabaseBoardAdapter, getSupabaseConfig, type SupabaseBoardAdapter } from './storage'
 import type { BoardAdapter, BoardSnapshot, Domain, FocusBlock, GoalCycle, Language, StoredBoard, Task, TaskColor } from './types'
+import './fonts.css'
 import './styles.css'
 
 const LANGUAGE_KEY = 'liubai-taskboard:language:v1'
@@ -776,7 +777,7 @@ export default function App() {
 function SetupScreen({ language, setLanguage, t, onDemo }: { language: Language; setLanguage: (language: Language) => void; t: (key: CopyKey) => string; onDemo: () => void }) {
   return <div className="center-screen">
     <div className="setup-card">
-      <div className="brand-lockup"><span className="brand-mark">l</span><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div>
+      <div className="brand-lockup"><BrandMark /><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div>
       <div className="eyebrow">{t('connectionMissing')}</div>
       <h1>{t('setupTitle')}</h1>
       <p>{t('setupBody')}</p>
@@ -790,7 +791,7 @@ function AuthScreen({ language, setLanguage, t, email, password, setEmail, setPa
   language: Language; setLanguage: (language: Language) => void; t: (key: CopyKey) => string; email: string; password: string; setEmail: (value: string) => void; setPassword: (value: string) => void; busy: boolean; error: string; onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
 }) {
   return <div className="center-screen"><div className="setup-card auth-card">
-    <div className="brand-lockup"><span className="brand-mark">l</span><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div>
+    <div className="brand-lockup"><BrandMark /><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div>
     <div className="eyebrow">{t('cloud')}</div><h1>{t('authTitle')}</h1><p>{t('authBody')}</p>
     <form onSubmit={onSubmit} className="auth-form" noValidate>
       <label>{t('email')}<input autoFocus type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
@@ -803,7 +804,7 @@ function AuthScreen({ language, setLanguage, t, email, password, setEmail, setPa
 }
 
 function LoadingScreen({ language, t }: { language: Language; t: (key: CopyKey) => string }) {
-  return <div className="center-screen"><div className="loading-mark"><span className="brand-mark">l</span><p>{t('loading')}</p><div className="loading-line" /></div><div className="language-switch loading-language"><button className={language === 'zh' ? 'active' : ''}>{t('chinese')}</button><button className={language === 'en' ? 'active' : ''}>{t('english')}</button></div></div>
+  return <div className="center-screen"><div className="loading-mark"><BrandMark /><p>{t('loading')}</p><div className="loading-line" /></div><div className="language-switch loading-language"><button className={language === 'zh' ? 'active' : ''}>{t('chinese')}</button><button className={language === 'en' ? 'active' : ''}>{t('english')}</button></div></div>
 }
 
 function Header({ language, setLanguage, t, mode, email, saveState, saveMessage, online, onSettings, onRefresh, onLogout }: {
@@ -812,7 +813,7 @@ function Header({ language, setLanguage, t, mode, email, saveState, saveMessage,
   // 离线优先判断：否则 saveState 仍是 'saved' 时会错误地显示“已保存”。
   const statusKey = !online || saveState === 'offline' ? 'offline' : saveState === 'error' ? 'error' : saveState === 'saving' ? 'saving' : saveState === 'pending' ? 'pending' : 'saved'
   return <header className="top-header">
-    <div className="header-left"><div className="header-year">{new Date().getFullYear()}</div><div className="crumb-slash">/</div><div className="brand-lockup compact"><span className="brand-mark">l</span><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div></div>
+    <div className="header-left"><div className="header-year">{new Date().getFullYear()}</div><div className="crumb-slash">/</div><div className="brand-lockup compact"><BrandMark /><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div></div>
     <div className="header-right"><span className={`mode-pill ${mode}`}>{mode === 'demo' ? t('demo') : t('cloud')}</span><span className={`save-indicator ${online ? saveState : 'offline'}`}><span className="status-dot" />{t(statusKey)}</span>
       <button className="icon-button" aria-label={t('settings')} title={t('settings')} onClick={onSettings}><Icon name="sliders" /></button>
       <button className="icon-button" aria-label={t('refresh')} title={t('refresh')} onClick={onRefresh}><Icon name="refresh" /></button>
@@ -880,7 +881,7 @@ function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selec
 function FocusPanel({ blocks, allTasks, selectedDate, language, t, now, rail, onAdd, onEdit, onDelete, onCommand, panelRef }: {
   blocks: FocusBlock[]; allTasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; now: number; rail: React.ReactNode; onAdd: () => void; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void; panelRef?: (element: HTMLElement | null) => void
 }) {
-  return <section className="panel-shell focus-shell" ref={panelRef} aria-labelledby="panel-focus">{rail}<div className="focus-panel"><div className="panel-top"><div><div className="eyebrow">{`04 · ${t('timeLabel')}`}</div><h2 id="panel-focus">{t('focus')}</h2><p>{t('focusHint')}</p></div><button className="add-button light" onClick={onAdd}><Icon name="plus" />{t('add')}</button></div><div className="focus-date-label">{formatDateKey(selectedDate, language)} <span>{selectedDate}</span></div>{blocks.length ? <div className="focus-list">{blocks.map((block) => <FocusCard key={block.id} block={block} allTasks={allTasks} language={language} t={t} now={now} onEdit={onEdit} onDelete={onDelete} onCommand={onCommand} />)}</div> : <div className="focus-empty"><div className="empty-glyph">◷</div><p>{t('emptyFocus')}</p><button className="text-button light-text" onClick={onAdd}>{t('add')}</button></div>}<div className="focus-space" /></div></section>
+  return <section className="panel-shell focus-shell" ref={panelRef} aria-labelledby="panel-focus">{rail}<div className="focus-panel"><div className="panel-top"><div><div className="eyebrow">{`04 · ${t('timeLabel')}`}</div><h2 id="panel-focus">{t('focus')}</h2><p>{t('focusHint')}</p></div><button className="add-button light" onClick={onAdd}><Icon name="plus" />{t('add')}</button></div><div className="focus-date-label">{formatDateKey(selectedDate, language)} <span>{selectedDate}</span></div>{blocks.length ? <div className="focus-list">{blocks.map((block) => <FocusCard key={block.id} block={block} allTasks={allTasks} language={language} t={t} now={now} onEdit={onEdit} onDelete={onDelete} onCommand={onCommand} />)}</div> : <div className="focus-empty"><div className="empty-glyph">◯</div><p>{t('emptyFocus')}</p><button className="text-button light-text" onClick={onAdd}>{t('add')}</button></div>}<div className="focus-space" /></div></section>
 }
 
 function FocusCard({ block, allTasks, language, t, now, onEdit, onDelete, onCommand }: { block: FocusBlock; allTasks: Task[]; language: Language; t: (key: CopyKey) => string; now: number; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void }) {
@@ -1038,6 +1039,21 @@ function Dialog({ title, closeLabel, children, onClose, initialFocus }: { title:
     return () => dialog.removeEventListener('keydown', onKeyDown)
   }, [initialFocus, onClose])
   return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title"><div className="dialog-header"><h2 id="dialog-title">{title}</h2><button type="button" className="dialog-close" aria-label={closeLabel} onClick={onClose}><Icon name="close" /></button></div>{children}</div></div>
+}
+
+/**
+ * 品牌标记：与 public/favicon.svg 同一造型（三根递降柱 = 目标→周→日，橙点 = 此刻专注的一步）。
+ * 内联 SVG 而非 <img>，以便跟随字号、任意尺寸清晰，并避免额外请求。
+ * 图标本身 aria-hidden，品牌名由紧邻的文字承担，屏幕阅读器不会重复朗读。
+ */
+function BrandMark() {
+  return <svg className="brand-mark" width="27" height="27" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+    <rect width="32" height="32" rx="7.5" fill="#2c302e" />
+    <rect x="6.6" y="6.8" width="4" height="16.4" rx="2" fill="#ffffff" />
+    <rect x="12.7" y="10.4" width="4" height="12.8" rx="2" fill="#ffffff" opacity="0.8" />
+    <rect x="18.8" y="14" width="4" height="9.2" rx="2" fill="#ffffff" opacity="0.6" />
+    <circle cx="24.8" cy="21.6" r="2.5" fill="#df875e" />
+  </svg>
 }
 
 function Icon({ name }: { name: 'plus' | 'edit' | 'trash' | 'up' | 'down' | 'subtask' | 'link' | 'sliders' | 'refresh' | 'close' }) {

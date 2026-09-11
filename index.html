@@ -4,6 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f2f3f2" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/favicon.svg" />
+    <meta name="description" content="留白 · 个人规划工作区：长期目标、周计划、日计划与专注块。" />
+    <!--
+      字体策略（见 src/fonts.css 与 public/fonts/maple-mono-cn/fonts-lazy.css）：
+      1. core（拉丁/数字/标点/界面中文，两个字重共约 0.5 MB）在这里预加载，
+         让首屏的界面文字立刻用上 Maple Mono CN，避免先闪一下系统字体。
+         字体预加载必须带 crossorigin，否则会被丢弃并重复请求一次。
+      2. common（字频前 3000 中文）、tail（生僻字兜底）与 nerd（Nerd 图标）体积大且
+         多数场景用不到，因此用 media="print" 的技巧改成不阻塞渲染地加载。
+    -->
+    <link rel="preload" href="/fonts/maple-mono-cn/v7.9/core-400.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/maple-mono-cn/v7.9/core-600.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/fonts/maple-mono-cn/fonts-lazy.css" media="print" onload="this.media='all'" />
+    <noscript><link rel="stylesheet" href="/fonts/maple-mono-cn/fonts-lazy.css" /></noscript>
     <!-- 默认语言为中文；React 挂载后会按当前语言改写 title 与 lang。 -->
     <title>留白 · 个人规划</title>
   </head>
