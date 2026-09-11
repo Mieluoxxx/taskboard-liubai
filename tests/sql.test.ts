@@ -558,3 +558,38 @@ test('the private SECURITY DEFINER helpers are unreachable from client roles', a
     await db.close()
   }
 })
+
+test('a revision conflict uses a non-retryable SQLSTATE and returns promptly', async () => {
+  // Regression guard: the conflict used to raise 40001 (serialization_failure). Platforms treat
+  // that as retryable, so every routine conflict was retried until the edge timed out (~125s) and
+  // the client sat in "saving" while connections piled up. PT409 maps to HTTP 409 and is not retried.
+  const db = await database()
+  try {
+    await db.query('select * from public.get_private_board()')
+    const def = await db.query<{ def: string }>("select pg_get_functiondef('public.cas_save_private_board(bigint,jsonb)'::regprocedure) as def")
+    assert.match(def.rows[0].def, /Board revision conflict' using errcode = 'PT409'/, 'the conflict must raise PT409')
+    // only the raise itself matters; the surrounding comment intentionally mentions 40001
+    assert.doesNotMatch(def.rows[0].def, /Board revision conflict' using errcode = '40001'/, 'the conflict must not use the retryable 40001 code')
+
+    // bump the revision once so that a save at revision 0 is genuinely stale
+    const first = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(emptySnapshot('UTC'))])
+    assert.equal(Number(first.rows[0].revision), 1)
+
+    // and the conflict really carries a non-retryable code
+    const started = Date.now()
+    let caught: { code?: string } | null = null
+    try {
+      await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(emptySnapshot('UTC'))])
+    } catch (error) {
+      caught = error as { code?: string }
+    } finally {
+      // the stale call must fail fast; a retry loop would show up as a large elapsed time here
+      assert.ok(Date.now() - started < 2000, 'the conflict must fail immediately, not after a retry loop')
+    }
+    assert.ok(caught, 'a stale revision must be rejected')
+    // PT409 is a non-numeric SQLSTATE, which is what keeps platforms from auto-retrying it
+    assert.equal(String(caught?.code), 'PT409', `expected the PT409 code, saw ${caught?.code}`)
+  } finally {
+    await db.close()
+  }
+})

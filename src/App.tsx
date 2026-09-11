@@ -120,7 +120,8 @@ export default function App() {
   // 最近一次与后端一致的快照（成功加载/保存后的版本），三方合并的 base。
   const baselineRef = useRef<BoardSnapshot | null>(null)
   const [boardLoadToken, setBoardLoadToken] = useState(0)
-  const [saveState, setSaveState] = useState<SaveState>('saved')
+  const [saveState, setSaveStateRaw] = useState<SaveState>('saved')
+  const setSaveState = (next: SaveState) => { ((globalThis as Record<string, unknown>).__tbLog as string[] | undefined)?.push(`state=${next}`); setSaveStateRaw(next) }
   const [saveMessage, setSaveMessage] = useState('')
   // 失败种类单独记录，避免用提示文本反推冲突（提示文本会随语言变化）。
   const [failureKind, setFailureKind] = useState<'conflict' | null>(null)
@@ -276,7 +277,22 @@ export default function App() {
     pendingJobRef.current = null
     saveInFlightRef.current = true
     setSaveState('saving')
-    const result = await currentAdapter.save(job.expectedRevision, job.snapshot)
+    const L = (globalThis as Record<string, unknown>).__tbLog as string[] | undefined
+    L?.push(`save: rev=${job.expectedRevision} tasks=${job.snapshot.tasks.length} draft=${job.draft ?? '-'}`)
+    let result
+    try {
+      result = await currentAdapter.save(job.expectedRevision, job.snapshot)
+    } catch (thrown) {
+      L?.push(`  -> THREW ${thrown instanceof Error ? thrown.message : String(thrown)}`)
+      saveInFlightRef.current = false
+      failedJobRef.current = job
+      setSaveState('error')
+      setSaveMessage('noticeCloudError')
+      setFailureKind(null)
+      setDraftLabel(job.draft)
+      return
+    }
+    L?.push(`  -> ${result.ok ? 'ok rev=' + result.value.revision : 'FAIL ' + result.kind + '/' + (result.code ?? '-')}`)
     saveInFlightRef.current = false
     if (epoch !== saveEpochRef.current || adapterRef.current !== currentAdapter) return
     if (result.ok) {
@@ -318,11 +334,13 @@ export default function App() {
       // 冲突时先做三方合并：本地排队改动与云端改动各自独立时，两者都应保留。
       // 合并成功即用新 revision 以 CAS 再推一次；真有同实体冲突才交给用户。
       if (result.kind === 'conflict') {
+        ;(globalThis as Record<string, unknown>).__tbLog && ((globalThis as Record<string, unknown>).__tbLog as string[]).push(`conflict path: pending=${Boolean(pendingJobRef.current)} retained=${retained.snapshot.tasks.length}`)
         const base = baselineRef.current
         const remoteBoard = await currentAdapter.load()
         if (epoch === saveEpochRef.current && adapterRef.current === currentAdapter && remoteBoard.ok) {
           const remoteSnapshot = remoteBoard.value.snapshot
           const merged = base ? mergeSnapshots(base, retained.snapshot, remoteSnapshot) : { snapshot: remoteSnapshot, conflicts: ['__no_base__'] }
+          ;(globalThis as Record<string, unknown>).__tbLog && ((globalThis as Record<string, unknown>).__tbLog as string[]).push(`merge conflicts=${JSON.stringify(merged.conflicts)} remoteRev=${remoteBoard.value.revision}`)
           if (merged.conflicts.length === 0) {
             baselineRef.current = cloneSnapshot(remoteSnapshot)
             storedRef.current = { revision: remoteBoard.value.revision, snapshot: merged.snapshot }
@@ -376,6 +394,7 @@ export default function App() {
   // automatic=true 表示这是焦点/联网触发的自动刷新：只要还有未保存改动（在途、排队、失败保留），
   // 就直接放弃刷新。否则自动刷新会把刚失败的改动连同草稿一起丢掉，界面还会显示「已保存」。
   const reloadLatest = useCallback(async (keepDraft = true, automatic = false): Promise<boolean> => {
+    ;(globalThis as Record<string, unknown>).__tbLog && ((globalThis as Record<string, unknown>).__tbLog as string[]).push(`reloadLatest(keep=${keepDraft}, auto=${automatic}) unsaved=${Boolean(saveInFlightRef.current || pendingJobRef.current || failedJobRef.current)}`)
     if (automatic && (saveInFlightRef.current || pendingJobRef.current || failedJobRef.current)) return false
     const currentAdapter = adapterRef.current
     if (!currentAdapter) return false

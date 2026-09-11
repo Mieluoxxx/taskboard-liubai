@@ -43,7 +43,8 @@ function parseStoredBoard(value: unknown): StoredBoard {
 
 function adapterError(error: { message?: string; code?: string } | null | undefined): AdapterResult<never> {
   const message = error?.message || 'Cloud request failed'
-  if (error?.code === '40001' || /revision conflict|conflict|stale/i.test(message)) {
+  // PT409 是数据库端用于“版本冲突”的自定义状态（HTTP 409）；40001 只是历史写法，一并识别。
+  if (error?.code === 'PT409' || error?.code === '40001' || error?.code === '409' || /revision conflict|conflict|stale/i.test(message)) {
     return { ok: false, kind: 'conflict', code: 'noticeConflictCloud', message: 'Cloud board revision conflict' }
   }
   if (error?.code === '42501' || /not authorized|permission denied|owner|jwt|session expired|unauthorized/i.test(message)) {

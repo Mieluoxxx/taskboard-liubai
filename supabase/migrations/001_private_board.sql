@@ -419,20 +419,33 @@ set search_path = pg_catalog, private, public
 as $$
 declare
   owner_id uuid;
+  next_revision bigint;
+  next_snapshot jsonb;
 begin
   owner_id := private.assert_board_owner();
   if p_expected_revision is null or p_expected_revision < 0 then
     raise exception 'Expected board revision is invalid' using errcode = '22023';
   end if;
   perform private.validate_board_snapshot(p_snapshot);
-  return query
-    update private.personal_boards b
-    set revision = b.revision + 1, snapshot = p_snapshot, updated_at = now()
-    where b.owner_uuid = owner_id and b.revision = p_expected_revision
-    returning b.revision, b.snapshot;
+
+  -- 先做 UPDATE ... INTO，再判断 FOUND 并抛错；顺序不能颠倒，也绝不能使用可重试的错误码。
+  -- 如果先 RETURN QUERY（它会打开游标开始流式返回）之后才 RAISE，
+  -- PostgREST 的流式路径会一直等到超时（实测约 125 秒）才把错误交给客户端，
+  -- 期间客户端一直停在“保存中”，并发写入的正确性体验会被彻底拖垮。
+  update private.personal_boards b
+  set revision = b.revision + 1, snapshot = p_snapshot, updated_at = now()
+  where b.owner_uuid = owner_id and b.revision = p_expected_revision
+  returning b.revision, b.snapshot into next_revision, next_snapshot;
+
   if not found then
-    raise exception 'Board revision conflict' using errcode = '40001';
+    -- 必须使用 PT409（PostgREST 的“自定义 HTTP 状态”约定，映射为 409 Conflict）。
+    -- 不能用 40001：那是 serialization_failure，平台会把它当成可重试错误自动重试，
+    -- 于是每一次正常冲突都会被反复重试直到边缘超时（实测约 125 秒后 504），
+    -- 期间客户端一直停在“保存中”，并发请求还会把连接池耗尽。
+    raise exception 'Board revision conflict' using errcode = 'PT409';
   end if;
+
+  return query select next_revision, next_snapshot;
 end;
 $$;
 
