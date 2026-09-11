@@ -24,7 +24,9 @@
 | `nerd` | Nerd Font 图标（U+E000–F8FF） | ~0.5 MB | 使用图标时 |
 
 - 关键部分在 `src/fonts.css`（仅 core，压缩后约 3 KB，阻塞渲染必须小）；其余在 `public/fonts/maple-mono-cn/fonts-lazy.css`，由 `index.html` 以 `media="print"` 技巧异步加载。
-- 四个分片码点互不重叠，因此无需关心声明顺序；界面用到的字符已固化进 `core`，不会闪回系统字体。
+- 四个分片码点互不重叠，因此无需关心声明顺序。
+- `core` 里除了源码中的界面文案，还包含**运行时由 Intl 生成的日期与星期**（`2026年9月12日`、`周五`）；这类文字源码里没有字面量，容易漏，`scripts/build-fonts.py` 里显式列了出来。
+- 因此应用外壳（登录页、空板、周期轨道、日期）全程只用 `core`：实测首次进入只需 core 两个字重（约 0.5 MB），不会为了界面装饰去下载 common。只有出现用户自己的中文内容时才加载 `common`（约 0.6 MB，之后一年不可变缓存）。
 - 许可文本随字体分发：`public/fonts/LICENSE-maple-mono.txt`。
 - 升级字体版本或调整分片：`python3 scripts/build-fonts.py`（脚本内含所需外部数据说明）。
 - `vercel.json` 为 `/fonts/*` 与 `/assets/*` 设置一年不可变缓存（文件名带版本或内容哈希）。

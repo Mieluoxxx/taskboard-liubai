@@ -71,7 +71,7 @@ Liubai 是一个个人规划看板：长期目标、周计划、日计划和专�
 
 - 全站（含标题与等宽数字）使用自托管的 Maple Mono NF CN，单一字体族，不再混用衬线/系统等宽，保证等宽网格对齐。
 - 完整字体按用途切成 core / common / tail / nerd 四片，用 `unicode-range` 按需下载；只有 core（界面必需，约 0.5 MB）预加载，其余异步加载，不阻塞首屏。
-- 四片码点互不重叠；界面字符已固化进 core，避免首屏字体闪烁（FOUT 后跳到另一字体）。
+- 四片码点互不重叠；界面字符（含 Intl 运行时生成的日期与星期）已固化进 core，因此应用外壳只用 core，既不闪烁也不为首屏装饰下载大分片。
 - 字体许可为 SIL OFL 1.1，许可文本随字体分发（`public/fonts/LICENSE-maple-mono.txt`），`tests/ui.test.ts` 锁定自托管、仅 core 预加载、每片都带 `unicode-range` 等契约。
 
 ## 周期轨道的“当前”标记

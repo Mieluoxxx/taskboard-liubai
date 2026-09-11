@@ -40,12 +40,15 @@ for line in (SRC_DIR / 'SUBTLEX-CH-CHR_converted_to_unicode.txt').read_text(enco
 cmap = TTFont(SRC_DIR / WEIGHTS['400'], lazy=True).getBestCmap()
 is_pua = lambda c: 0xE000 <= c <= 0xF900
 
-# 界面自身用到的字符，必须永远留在 core 里（否则界面文字会闪回系统字体）
+# 界面自身用到的字符，必须永远留在 core 里（否则界面文字会闪回系统字体）。
 ui_cps = set()
 for path in list((ROOT / 'src').glob('*.ts')) + list((ROOT / 'src').glob('*.tsx')) + [ROOT / 'index.html']:
     for ch in path.read_text(encoding='utf-8'):
         if ord(ch) > 0x3400 and not is_pua(ord(ch)):
             ui_cps.add(ord(ch))
+# 还有一类字符源码里看不到：界面用 Intl 在运行时生成的日期与星期（例如“2026年9月12日”“周五”）。
+# 它们出现在每一屏的周期轨道与专注卡片上，必须算作界面字符，否则首屏就会为它们下载 common。
+ui_cps |= {ord(c) for c in '年月日星期周一二三四五六'}
 
 core = {c for c in cmap if c < 0x3400 and not is_pua(c)} | {c for c in ui_cps if c in cmap}
 nerd = {c for c in cmap if is_pua(c)}
