@@ -152,6 +152,27 @@ test('direct mutations do not flash a form-draft banner during a normal save', a
   assert.match(source, /const cycleDraftDiscarded = !keepDraft && \(failedJobRef\.current\?\.origin\?\.kind === 'cycle'/, 'discarding a failed cycle edit must force selection normalization')
 })
 
+test('task association uses an in-app listbox instead of the native select popup', async () => {
+  const source = await appSource()
+  const css = await cssSource()
+  assert.match(source, /function TaskChoice\(/, 'task choices need an application component')
+  assert.match(source, /role="listbox"/, 'task choices need an accessible listbox')
+  assert.match(source, /role="option"/, 'task choices need accessible options')
+  assert.match(source, /<TaskChoice id="task-association"/, 'association must use the in-app choice component')
+  assert.doesNotMatch(source, /<select value=\{upperTaskId\}/, 'association must not use the native select popup')
+  assert.match(css, /\.choice-menu\s*\{/, 'the listbox needs application styling')
+  assert.match(css, /\.choice-option\.selected\s*\{/, 'the selected option needs application styling')
+})
+
+test('dialog initial focus runs once while the keyboard handler tracks the latest close callback', async () => {
+  const source = await appSource()
+  assert.match(source, /const onCloseRef = useRef\(onClose\)/, 'dialog close handling needs a stable callback ref')
+  assert.match(source, /const previousFocus = document\.activeElement/, 'dialog must remember the opener for focus restoration')
+  assert.match(source, /return \(\) => \{ if \(previousFocus\?\.isConnected\) previousFocus\.focus\(\) \}/, 'dialog must restore focus on close')
+  assert.match(source, /\}, \[\]\)\n  const onKeyDown/, 'initial focus must not rerun on parent rerenders')
+  assert.match(source, /onKeyDown=\{onKeyDown\}/, 'keyboard handling must stay on the dialog')
+})
+
 
 test('cycle duration scopes the week and day rails', async () => {
   const source = await appSource()

@@ -3,7 +3,7 @@
 //   ego-browser nodejs < scripts/verify-workspace.mjs
 // 只操作 LOCAL DEMO；不读取或移动项目 .env.local。
 
-const task = await taskSpace(2)
+const task = await taskSpace("verify workspace task picker");
 const page = task.page('p1')
 const storageKey = 'liubai-taskboard:demo-board:v1'
 
@@ -88,7 +88,37 @@ async function bring(selector) {
   await page.waitForTimeout(100)
 }
 
+async function verifyAssociationPicker() {
+  await bootDemo()
+  await page.click('.panel-shell.domain-weekly .add-button')
+  await page.waitForSelector('#task-association', {state: 'visible'})
+  await page.evaluate(() => document.querySelector('#task-association')?.focus())
+  await page.click('#task-association')
+  await page.waitForSelector('[role="listbox"]', {state: 'visible'})
+  const focusedBefore = await page.evaluate(() => ({id: document.activeElement?.id || null, role: document.activeElement?.getAttribute('role') || null}))
+  await page.waitForTimeout(3200)
+  const focusedAfter = await page.evaluate(() => ({id: document.activeElement?.id || null, role: document.activeElement?.getAttribute('role') || null}))
+  await page.keyboard.press('ArrowDown')
+  await page.keyboard.press('Enter')
+  const choice = await page.evaluate(() => ({
+    hasNativeAssociationSelect: Boolean(document.querySelector('select')),
+    label: document.querySelector('#task-association')?.textContent?.trim() || null,
+  }))
+  await page.fill('#task-title', '关联测试任务')
+  await page.click('.dialog button[type="submit"]')
+  await page.waitForSelector('.dialog-form', {state: 'hidden'})
+  await page.waitForTimeout(700)
+  const saved = await page.evaluate(() => {
+    const board = JSON.parse(localStorage.getItem('liubai-taskboard:demo-board:v1') || '{}')
+    const task = board.snapshot?.tasks?.find((item) => item.title === '关联测试任务')
+    return {upperTaskId: task?.upperTaskId || null}
+  })
+  return {focusedBefore, focusedAfter, choice, saved}
+}
+
 await page.cdp('Emulation.setDeviceMetricsOverride', {width: 1262, height: 894, deviceScaleFactor: 1, mobile: false})
+
+const associationPicker = await verifyAssociationPicker()
 
 // 删除正常保存：只有固定高度的保存状态，不出现草稿条。
 await bootDemo()
@@ -185,9 +215,12 @@ const conflictDiscarded = await page.evaluate(() => ({
   notice: Boolean(document.querySelector('.save-notice')),
 }))
 
-console.log(JSON.stringify({deleteDuringSave, deleteAfter, initial, top, bottom, longRange, longTop, longBottom, failedRange, restoredRange, selectedDuringSave, selectedAfterSave, conflict, conflictKept, conflictDiscarded}, null, 1))
+console.log(JSON.stringify({associationPicker, deleteDuringSave, deleteAfter, initial, top, bottom, longRange, longTop, longBottom, failedRange, restoredRange, selectedDuringSave, selectedAfterSave, conflict, conflictKept, conflictDiscarded}, null, 1))
 
 const checks = {
+  associationPickerKeepsFocus: associationPicker.focusedBefore.role === 'option' && associationPicker.focusedAfter.role === 'option' && associationPicker.focusedAfter.id !== 'task-title',
+  associationPickerIsInApp: !associationPicker.choice.hasNativeAssociationSelect,
+  associationPickerPersists: Boolean(associationPicker.saved.upperTaskId),
   deleteNoDraftDuringSave: !deleteDuringSave.draft,
   deleteNoDraftAfterSave: !deleteAfter.draft,
   initialShortWindow: initial.weeks === 5 && initial.days < 31,

@@ -1145,6 +1145,78 @@ function ConnectorLayer({ stage, snapshot, rowRefs, selectedChain }: { stage: HT
   return <svg className="connector-layer" width="100%" height="100%" viewBox={`0 0 ${geometry.width} ${geometry.height}`} aria-hidden="true">{geometry.paths.map((path) => <path key={path.id} d={path.d} className={path.active ? 'connector active' : 'connector'} />)}</svg>
 }
 
+function TaskChoice({ id, label, value, noneLabel, options, onChange }: { id: string; label: string; value: string; noneLabel: string; options: Array<{ value: string; label: string }>; onChange: (value: string) => void }) {
+  const choices = [{ value: '', label: noneLabel }, ...options]
+  const selectedIndex = Math.max(0, choices.findIndex((choice) => choice.value === value))
+  const selected = choices[selectedIndex]
+  const [open, setOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(selectedIndex)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const triggerRef = useRef<HTMLButtonElement | null>(null)
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([])
+
+  useEffect(() => {
+    if (!open) return
+    setActiveIndex(selectedIndex)
+    optionRefs.current[selectedIndex]?.focus()
+    const onPointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onPointerDown)
+    return () => document.removeEventListener('mousedown', onPointerDown)
+  }, [open, selectedIndex])
+
+  const choose = (next: string) => {
+    onChange(next)
+    setOpen(false)
+    requestAnimationFrame(() => triggerRef.current?.focus())
+  }
+
+  const move = (direction: -1 | 1) => {
+    const next = (activeIndex + direction + choices.length) % choices.length
+    setActiveIndex(next)
+    optionRefs.current[next]?.focus()
+  }
+
+  const onTriggerKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      setOpen(true)
+    } else if (event.key === 'Escape' && open) {
+      event.preventDefault()
+      setOpen(false)
+    }
+  }
+
+  const onListKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'ArrowDown') { event.preventDefault(); move(1) }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); move(-1) }
+    else if (event.key === 'Home') { event.preventDefault(); setActiveIndex(0); optionRefs.current[0]?.focus() }
+    else if (event.key === 'End') { event.preventDefault(); const last = choices.length - 1; setActiveIndex(last); optionRefs.current[last]?.focus() }
+    else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); choose(choices[activeIndex].value) }
+    else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setOpen(false); triggerRef.current?.focus() }
+    else if (event.key === 'Tab') {
+      event.preventDefault()
+      event.stopPropagation()
+      setOpen(false)
+      requestAnimationFrame(() => {
+        const dialog = rootRef.current?.closest('[role="dialog"]')
+        const focusable = dialog ? [...dialog.querySelectorAll<HTMLElement>('button,input,select,textarea,[href]')].filter((candidate) => !candidate.hasAttribute('disabled') && !candidate.closest('[role="listbox"]')) : []
+        const index = triggerRef.current ? focusable.indexOf(triggerRef.current) : -1
+        focusable[index + (event.shiftKey ? -1 : 1)]?.focus()
+      })
+    }
+  }
+
+  return <div className="choice-field" ref={rootRef}>
+    <span className="choice-label" id={`${id}-label`}>{label}</span>
+    <button type="button" id={id} ref={triggerRef} className="choice-trigger" aria-haspopup="listbox" aria-expanded={open} aria-controls={`${id}-listbox`} aria-labelledby={`${id}-label`} onClick={() => setOpen((value) => !value)} onKeyDown={onTriggerKeyDown}>
+      <span>{selected.label}</span><span className="choice-chevron" aria-hidden="true">⌄</span>
+    </button>
+    {open ? <div id={`${id}-listbox`} className="choice-menu" role="listbox" aria-labelledby={`${id}-label`} onKeyDown={onListKeyDown}>{choices.map((choice, index) => <button type="button" role="option" aria-selected={choice.value === value} className={`choice-option ${choice.value === value ? 'selected' : ''}`} ref={(element) => { optionRefs.current[index] = element }} key={choice.value || 'none'} onClick={() => choose(choice.value)}>{choice.label}</button>)}</div> : null}
+  </div>
+}
+
 function TaskDialog({ task, domain, parentId, initial, placement, tasks, language, t, onClose, onSubmit }: { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement: { cycleId?: string; weekKey?: string; dateKey?: string }; tasks: Task[]; language: Language; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: TaskInput) => void }) {
   const [title, setTitle] = useState(initial?.title || task?.title || '')
   const [note, setNote] = useState(initial?.note ?? task?.note ?? '')
@@ -1176,8 +1248,8 @@ function TaskDialog({ task, domain, parentId, initial, placement, tasks, languag
       <label>{t('title')}<input id="task-title" autoFocus value={title} onChange={(event) => setTitle(event.target.value)} maxLength={300} required /></label>
       <label>{t('note')}<textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={2000} rows={3} /></label>
       <fieldset className="color-field"><legend>{t('color')}</legend><div className="color-picker">{([['ink', 'colorInk'], ['blue', 'colorBlue'], ['orange', 'colorOrange'], ['green', 'colorGreen'], ['violet', 'colorViolet']] as const).map(([value, label]) => <label className={`color-choice color-${value}`} key={value} title={t(label)}><input type="radio" name="task-color" value={value} checked={color === value} onChange={() => setColor(value)} /><span className="color-swatch" aria-hidden="true" /><span className="sr-only">{t(label)}</span></label>)}</div></fieldset>
-      {!parentId && domain !== 'long' ? <label>{t('association')}<select value={upperTaskId} onChange={(event) => { setUpperTaskId(event.target.value); if (event.target.value) setSelectedParent('') }}><option value="">{t('none')}</option>{upperOptions.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.title}</option>)}</select></label> : null}
-      {!task && !parentId ? <label>{t('parentTask')}<select value={selectedParent} onChange={(event) => { setSelectedParent(event.target.value); if (event.target.value) setUpperTaskId('') }}><option value="">{t('none')}</option>{parentOptions.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.title}</option>)}</select></label> : null}
+      {!parentId && domain !== 'long' ? <TaskChoice id="task-association" label={t('association')} value={upperTaskId} noneLabel={t('none')} options={upperOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setUpperTaskId(value); if (value) setSelectedParent('') }} /> : null}
+      {!task && !parentId ? <TaskChoice id="task-parent" label={t('parentTask')} value={selectedParent} noneLabel={t('none')} options={parentOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setSelectedParent(value); if (value) setUpperTaskId('') }} /> : null}
       {task?.history.length ? <div className="history-box"><strong>{t('history')}</strong>{task.history.map((item, index) => <div key={`${item.recordedAt}:${index}`}><span>{item.dateKey || item.weekKey || item.cycleId || item.domain}</span><small>{new Date(item.recordedAt).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</small></div>)}</div> : task ? <div className="history-box muted-box"><strong>{t('history')}</strong><span>{t('noHistory')}</span></div> : null}
       <div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div>
     </form>
@@ -1216,25 +1288,30 @@ function RescheduleDialog({ task, language, t, zone, onClose, onSubmit }: { task
 
 function Dialog({ title, closeLabel, children, onClose, initialFocus }: { title: string; closeLabel: string; children: React.ReactNode; onClose: () => void; initialFocus?: string }) {
   const dialogRef = useRef<HTMLDivElement | null>(null)
+  const onCloseRef = useRef(onClose)
+  const initialFocusRef = useRef(initialFocus)
+  onCloseRef.current = onClose
   useEffect(() => {
     const dialog = dialogRef.current
     if (!dialog) return
-    const element = initialFocus ? document.getElementById(initialFocus) : dialog.querySelector<HTMLElement>('input,button,select,textarea')
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const element = initialFocusRef.current ? document.getElementById(initialFocusRef.current) : dialog.querySelector<HTMLElement>('input,button,select,textarea')
     element?.focus()
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.preventDefault(); onClose(); return }
-      if (event.key !== 'Tab') return
-      const focusable = [...dialog.querySelectorAll<HTMLElement>('button,input,select,textarea,[href]')].filter((candidate) => !candidate.hasAttribute('disabled'))
-      if (!focusable.length) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
-    }
-    dialog.addEventListener('keydown', onKeyDown)
-    return () => dialog.removeEventListener('keydown', onKeyDown)
-  }, [initialFocus, onClose])
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title"><div className="dialog-header"><h2 id="dialog-title">{title}</h2><button type="button" className="dialog-close" aria-label={closeLabel} onClick={onClose}><Icon name="close" /></button></div>{children}</div></div>
+    return () => { if (previousFocus?.isConnected) previousFocus.focus() }
+  }, [])
+  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Escape') { event.preventDefault(); onCloseRef.current(); return }
+    if (event.key !== 'Tab') return
+    const dialog = dialogRef.current
+    if (!dialog) return
+    const focusable = [...dialog.querySelectorAll<HTMLElement>('button,input,select,textarea,[href]')].filter((candidate) => !candidate.hasAttribute('disabled'))
+    if (!focusable.length) return
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+  }
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onCloseRef.current() }}><div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title" onKeyDown={onKeyDown}><div className="dialog-header"><h2 id="dialog-title">{title}</h2><button type="button" className="dialog-close" aria-label={closeLabel} onClick={() => onCloseRef.current()}><Icon name="close" /></button></div>{children}</div></div>
 }
 
 /**
