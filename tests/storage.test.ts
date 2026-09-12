@@ -41,6 +41,38 @@ test('a board request is bound to its user and cannot send after the session swi
   assert.equal(requests.length, 1)
 })
 
+test('a board request keeps its captured token after sending and accepts a refreshed token for the same user', async () => {
+  let session: { userId: string; accessToken: string } | null = { userId: 'user-a', accessToken: 'token-a' }
+  let release: (() => void) | undefined
+  let started!: () => void
+  const requestStarted = new Promise<void>((resolve) => { started = resolve })
+  const requests: RequestInit[] = []
+  const delayed = createSessionBoundFetch(
+    { userId: 'user-a', getSession: async () => session },
+    async (_input, init) => {
+      requests.push(init || {})
+      started()
+      await new Promise<void>((resolve) => { release = resolve })
+      return new Response(null, { status: 204 })
+    },
+  )
+
+  const pending = delayed('https://example.test/rpc')
+  await requestStarted
+  session = { userId: 'user-b', accessToken: 'token-b' }
+  release?.()
+  await pending
+  assert.equal(new Headers(requests[0].headers).get('authorization'), 'Bearer token-a')
+
+  session = { userId: 'user-a', accessToken: 'token-a-refreshed' }
+  const refreshed = createSessionBoundFetch({ userId: 'user-a', getSession: async () => session }, async (_input, init) => {
+    requests.push(init || {})
+    return new Response(null, { status: 204 })
+  })
+  await refreshed('https://example.test/rpc')
+  assert.equal(new Headers(requests[1].headers).get('authorization'), 'Bearer token-a-refreshed')
+})
+
 test('demo adapter uses compare-and-swap and rejects stale whole-board writes', async () => {
   const storage = new MemoryStorage()
   Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true })

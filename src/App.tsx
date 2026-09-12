@@ -149,6 +149,9 @@ export default function App() {
   const [adapter, setAdapter] = useState<BoardAdapter | null>(null)
   const adapterRef = useRef<BoardAdapter | null>(null)
   const cloudRef = useRef<SupabaseBoardAdapter | null>(null)
+  const authGenerationRef = useRef(0)
+  const authAttemptRef = useRef(0)
+  const authLoadGenerationRef = useRef<number | null>(null)
   const [user, setUser] = useState<{ id: string; email?: string } | null>(null)
   const userRef = useRef<{ id: string; email?: string } | null>(null)
   const [authEmail, setAuthEmail] = useState('')
@@ -237,6 +240,7 @@ export default function App() {
     setSelectedDate(resetDate)
     setSelectedWeek(weekKey(resetDate))
     setDraftLabel(null)
+    setAuthBusy(false)
     setAuthError('')
     setSaveMessage('')
     setFailureKind(null)
@@ -245,7 +249,7 @@ export default function App() {
     setScreen(nextScreen)
   }, [])
 
-  const openBoard = useCallback(async (nextAdapter: BoardAdapter, nextScreen: Screen = 'workspace') => {
+  const openBoard = useCallback(async (nextAdapter: BoardAdapter, nextScreen: Screen = 'workspace', expectedAuthGeneration = authGenerationRef.current) => {
     const token = ++loadTokenRef.current
     saveEpochRef.current += 1
     setAdapter(nextAdapter)
@@ -257,7 +261,7 @@ export default function App() {
     failedJobRef.current = null
     setDraftLabel(null)
     const result = await nextAdapter.load()
-    if (token !== loadTokenRef.current) return
+    if (token !== loadTokenRef.current || expectedAuthGeneration !== authGenerationRef.current) return
     if (!result.ok) {
       setSaveState(result.kind === 'offline' ? 'offline' : 'error')
       if (result.message) console.warn('[taskboard]', result.message)
@@ -285,17 +289,19 @@ export default function App() {
     }
   }, [clearPrivateState])
 
-  const openSessionBoard = useCallback(async (cloud: SupabaseBoardAdapter, expectedUserId: string) => {
-    if (userRef.current?.id !== expectedUserId) return
+  const openSessionBoard = useCallback(async (cloud: SupabaseBoardAdapter, expectedUserId: string, expectedAuthGeneration = authGenerationRef.current) => {
+    if (userRef.current?.id !== expectedUserId || expectedAuthGeneration !== authGenerationRef.current) return
+    if (authLoadGenerationRef.current === expectedAuthGeneration) return
+    authLoadGenerationRef.current = expectedAuthGeneration
     const board = await cloud.getBoardAdapterForCurrentSession(expectedUserId)
-    if (userRef.current?.id !== expectedUserId) return
+    if (userRef.current?.id !== expectedUserId || expectedAuthGeneration !== authGenerationRef.current) return
     if (!board) {
       clearPrivateState('auth')
       setSaveState('error')
       setSaveMessage('noticeSessionExpired')
       return
     }
-    await openBoard(board)
+    await openBoard(board, 'workspace', expectedAuthGeneration)
   }, [clearPrivateState, openBoard])
 
   useEffect(() => {
@@ -305,24 +311,26 @@ export default function App() {
     let alive = true
     // 初始 session 查询可能晚于 auth 事件返回；用 epoch 保证过期的初始结果不会覆盖更新的登录状态。
     let sessionEpoch = 0
+    const initialGeneration = authGenerationRef.current
     void cloud.getSessionUser().then((nextUser) => {
-      if (!alive || sessionEpoch !== 0) return
+      if (!alive || sessionEpoch !== 0 || initialGeneration !== authGenerationRef.current) return
       userRef.current = nextUser
       setUser(nextUser)
-      if (nextUser) void openSessionBoard(cloud, nextUser.id)
+      if (nextUser) void openSessionBoard(cloud, nextUser.id, initialGeneration)
       else setScreen('auth')
     })
     const subscription = cloud.onAuthStateChange((nextUser) => {
       if (!alive) return
       sessionEpoch += 1
       const changed = nextUser?.id !== userRef.current?.id
+      const generation = changed ? ++authGenerationRef.current : authGenerationRef.current
       userRef.current = nextUser
       setUser(nextUser)
       if (!nextUser) {
         clearPrivateState('auth')
       } else if (changed) {
         clearPrivateState('loading')
-        void openSessionBoard(cloud, nextUser.id)
+        void openSessionBoard(cloud, nextUser.id, generation)
       }
     })
     return () => { alive = false; subscription.unsubscribe() }
@@ -351,8 +359,8 @@ export default function App() {
       // 适配器理论上自行捕获异常，但网络层抛错时不能让这次保存悬空：
       // 否则 saveInFlightRef 永远为 true，界面卡在“保存中”且后续保存全部被跳过。
       if (thrown instanceof Error) console.warn('[taskboard]', thrown.message)
-      saveInFlightRef.current = false
       if (epoch !== saveEpochRef.current || adapterRef.current !== currentAdapter) return
+      saveInFlightRef.current = false
       failedJobRef.current = job
       setSaveState('error')
       setSaveMessage('noticeCloudError')
@@ -360,8 +368,8 @@ export default function App() {
       setDraftLabel(job.draft)
       return
     }
-    saveInFlightRef.current = false
     if (epoch !== saveEpochRef.current || adapterRef.current !== currentAdapter) return
+    saveInFlightRef.current = false
     if (result.ok) {
       failedJobRef.current = null
       const current = storedRef.current
@@ -586,25 +594,32 @@ export default function App() {
     event.preventDefault()
     const cloud = cloudRef.current
     if (!cloud || !authEmail.trim() || !authPassword) return
+    const generation = ++authGenerationRef.current
+    const attempt = ++authAttemptRef.current
     setAuthBusy(true)
     setAuthError('')
     const result = await cloud.signIn(authEmail.trim(), authPassword)
+    if (attempt !== authAttemptRef.current || generation !== authGenerationRef.current) return
     setAuthBusy(false)
     if (!result.ok) {
       setAuthError(result.code ? t(result.code) : result.message || t('invalidCredentials'))
       return
     }
     const changed = result.value.id !== userRef.current?.id
+    const shouldLoad = changed || screen !== 'workspace' || !storedRef.current
     if (changed) clearPrivateState('loading')
     userRef.current = result.value
     setUser(result.value)
     setAuthPassword('')
-    if (changed) await openSessionBoard(cloud, result.value.id)
+    if (shouldLoad) await openSessionBoard(cloud, result.value.id, generation)
   }
 
   const signOut = async () => {
     const cloud = cloudRef.current
+    const generation = ++authGenerationRef.current
+    authAttemptRef.current += 1
     if (cloud) await cloud.signOut()
+    if (generation !== authGenerationRef.current) return
     userRef.current = null
     setUser(null)
     clearPrivateState(config ? 'auth' : 'setup')

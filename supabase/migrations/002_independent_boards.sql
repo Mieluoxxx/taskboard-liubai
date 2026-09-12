@@ -2,6 +2,8 @@
 -- 旧 owner_config 只用于单 owner 模式；本迁移保留 personal_boards 中已有数据，
 -- 改为按 auth.uid() 幂等创建和读写，不复制、不转移任何旧账号数据。
 
+begin;
+
 drop policy if exists personal_boards_owner_access on private.personal_boards;
 drop function if exists private.is_configured_board_owner(uuid);
 drop function if exists private.assert_board_owner();
@@ -92,3 +94,5 @@ grant execute on function public.get_private_board() to authenticated;
 grant execute on function public.cas_save_private_board(bigint, jsonb) to authenticated;
 
 comment on table private.personal_boards is 'One private JSONB board per authenticated user, written only through CAS RPC.';
+
+commit;

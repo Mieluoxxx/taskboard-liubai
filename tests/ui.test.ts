@@ -154,8 +154,9 @@ test('direct mutations do not flash a form-draft banner during a normal save', a
 
 test('switching accounts clears the old board before loading the new personal board', async () => {
   const source = await appSource()
-  assert.match(source, /else if \(changed\) \{\s*clearPrivateState\('loading'\)\s*void openSessionBoard\(cloud, nextUser\.id\)/, 'auth changes must clear old private state before loading the new user')
-  assert.match(source, /const changed = result\.value\.id !== userRef\.current\?\.id[\s\S]{0,180}if \(changed\) clearPrivateState\('loading'\)[\s\S]{0,160}if \(changed\) await openSessionBoard\(cloud, result\.value\.id\)/, 'manual sign-in must use the same account-switch boundary')
+  assert.match(source, /else if \(changed\) \{[\s\S]{0,240}clearPrivateState\('loading'\)[\s\S]{0,240}void openSessionBoard\(cloud, nextUser\.id(?:, generation)?\)/, 'auth changes must clear old private state before loading the new user')
+  assert.match(source, /const generation = \+\+authGenerationRef\.current/, 'manual sign-in must advance the auth generation')
+  assert.match(source, /if \(shouldLoad\) await openSessionBoard\(cloud, result\.value\.id, generation\)/, 'manual sign-in must load the current account board')
   assert.match(source, /if \(epoch !== saveEpochRef\.current \|\| adapterRef\.current !== currentAdapter\) return/, 'late save responses must not update a newer account')
 })
 

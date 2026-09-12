@@ -512,9 +512,11 @@ test('RLS exposes each personal board only to its own authenticated user', async
       await db.exec(`set role ${subject === null ? 'anon' : 'authenticated'}; select set_config('request.jwt.claim.sub', ${subject === null ? 'null' : `'${subject}'`}, false)`)
       let rows = 0
       let blocked = false
+      let ownerUuid = ''
       try {
-        const result = await db.query('select owner_uuid from private.personal_boards')
+        const result = await db.query<{ owner_uuid: string }>('select owner_uuid from private.personal_boards')
         rows = result.rows.length
+        ownerUuid = result.rows[0]?.owner_uuid || ''
       } catch {
         blocked = true
       } finally {
@@ -525,13 +527,30 @@ test('RLS exposes each personal board only to its own authenticated user', async
         shouldSee,
         `RLS decision for ${label}: saw ${rows} row(s), blocked=${blocked}`,
       )
-      if (shouldSee) assert.equal(rows, 1, `${label} must see exactly one personal board`)
+      if (shouldSee) {
+        assert.equal(rows, 1, `${label} must see exactly one personal board`)
+        assert.equal(ownerUuid, subject, `${label} must see its own board`)
+      }
     }
 
     // The second user may update their own row.
     await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
     const ownUpdate = await db.query('update private.personal_boards set revision = revision + 1 where owner_uuid = $1 returning owner_uuid', [OTHER])
     assert.equal(ownUpdate.rows.length, 1, 'a user must be able to update their own board')
+
+    const otherDelete = await db.query('delete from private.personal_boards where owner_uuid = $1 returning owner_uuid', [OWNER])
+    assert.equal(otherDelete.rows.length, 0, 'a user must not delete another personal board')
+
+    // WITH CHECK also prevents a user from reassigning their board to another Auth identity.
+    await db.exec('savepoint reassign')
+    let reassignRejection = ''
+    try {
+      await db.query('update private.personal_boards set owner_uuid = $1 where owner_uuid = $2 returning owner_uuid', [THIRD, OTHER])
+    } catch (caught) {
+      reassignRejection = caught instanceof Error ? caught.message : String(caught)
+    }
+    await db.exec('rollback to savepoint reassign')
+    assert.match(reassignRejection, /row-level security|row level security/i, 'changing board ownership must be rejected')
 
     // A user cannot claim a third Auth identity's row. A policy violation aborts the transaction,
     // so isolate it in a savepoint and undo it.
