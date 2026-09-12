@@ -41,14 +41,17 @@ function parseStoredBoard(value: unknown): StoredBoard {
   return { revision: record.revision as number, snapshot: validateSnapshot(record.snapshot) }
 }
 
-function adapterError(error: { message?: string; code?: string } | null | undefined): AdapterResult<never> {
+export function adapterError(error: { message?: string; code?: string } | null | undefined, status?: number): AdapterResult<never> {
   const message = error?.message || 'Cloud request failed'
   // PT409 是数据库端用于“版本冲突”的自定义状态（HTTP 409）；40001 只是历史写法，一并识别。
   if (error?.code === 'PT409' || error?.code === '40001' || error?.code === '409' || /revision conflict|conflict|stale/i.test(message)) {
     return { ok: false, kind: 'conflict', code: 'noticeConflictCloud', message: 'Cloud board revision conflict' }
   }
-  if (error?.code === '42501' || /not authorized|permission denied|owner|jwt|session expired|unauthorized/i.test(message)) {
+  if (error?.code === '42501' && /board owner is not authorized/i.test(message)) {
     return { ok: false, kind: 'auth', code: 'noticeWrongOwner', message: 'Current account is not the configured board owner' }
+  }
+  if (status === 401 || error?.code === 'PGRST301' || /authentication required|session expired|jwt.*expired|expired.*jwt|invalid jwt|invalid token/i.test(message)) {
+    return { ok: false, kind: 'auth', code: 'noticeSessionExpired', message: 'Cloud session expired' }
   }
   return { ok: false, kind: 'error', code: 'noticeCloudError', message }
 }
@@ -59,8 +62,8 @@ export class SupabaseBoardAdapter implements BoardAdapter {
   constructor(readonly client: SupabaseClient) {}
 
   async load(): Promise<AdapterResult<StoredBoard>> {
-    const { data, error } = await this.client.rpc('get_private_board')
-    if (error) return adapterError(error)
+    const { data, error, status } = await this.client.rpc('get_private_board')
+    if (error) return adapterError(error, status)
     try {
       return { ok: true, value: parseStoredBoard(data) }
     } catch (caught) {
@@ -77,11 +80,11 @@ export class SupabaseBoardAdapter implements BoardAdapter {
     } catch (caught) {
       return { ok: false, kind: 'error', code: 'noticeInvalidState', message: caught instanceof Error ? caught.message : 'Board is invalid' }
     }
-    const { data, error } = await this.client.rpc('cas_save_private_board', {
+    const { data, error, status } = await this.client.rpc('cas_save_private_board', {
       p_expected_revision: expectedRevision,
       p_snapshot: snapshot,
     })
-    if (error) return adapterError(error)
+    if (error) return adapterError(error, status)
     try {
       return { ok: true, value: parseStoredBoard(data) }
     } catch (caught) {

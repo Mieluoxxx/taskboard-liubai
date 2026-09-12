@@ -60,7 +60,7 @@ pnpm build
 ## Supabase 配置
 
 1. 在 Supabase 项目中关闭 Auth 的新用户注册（Disable sign ups）；本应用不提供 signup、OAuth 或 reset UI。
-2. 在 Auth 用户页用管理员方式创建唯一 owner 邮箱/密码，复制该用户 UUID；不要把密码写入仓库或 `.env`。
+2. 在 Auth 用户页用管理员方式创建唯一 owner 邮箱/密码，复制该用户 UUID；不要把密码写入仓库或 `.env`。注意：创建 Auth 用户只提供登录身份，不会自动成为看板 owner。
 3. 在 SQL Editor 中完整执行 `supabase/migrations/001_private_board.sql` 的 DDL。然后将文件顶部注释里的 `REPLACE_WITH_OWNER_UUID` 替换成第 2 步 UUID，单独执行那条 `insert into private.owner_config...`。这会把 owner 写入受保护配置；migration 和 provisioning 尚未在任何项目执行，也没有创建云资源。
 4. 只把 `VITE_SUPABASE_URL` 与 publishable key（旧项目可用 anon key）写入 `.env.local`，重启 Vite。登录后会校验 owner UUID；其他账号会被拒绝。
 5. 手动密码重置请由项目管理员在 Supabase Auth 用户管理处完成；应用不会伪造不存在的 dashboard 功能。
@@ -80,7 +80,7 @@ pnpm build
 ## 故障排查
 
 - **显示设置页**：检查 `.env.local` 是否存在且变量拼写正确，重启 dev server；也可使用 LOCAL DEMO。
-- **登录失败/被拒绝**：确认 Auth 用户已创建、邮箱密码正确且用户 UUID 与 SQL 中的 owner UUID 一致。过期 session 需要重新登录。
+- **登录失败/被拒绝**：确认 Auth 用户已创建、邮箱密码正确；能登录但被拒绝时，检查 `auth.users.id` 是否与 `private.owner_config.owner_uuid` 完全一致。创建第二个 Auth 用户不会自动获得这个单 owner 看板的权限。过期 session 需要重新登录。
 - **冲突**：另一设备保存后，当前编辑内容不会被覆盖。应用会先做三方合并：你的改动与另一台设备的改动各自独立时，两边都会保留并自动重试保存，无需手工处理。
 - **真冲突**：只有同一项双方都改且结果不同时才需要你决定——云端值保留在板上，你的输入作为草稿保留，点击“重新打开编辑器”刷新到最新版本后用这份输入重新提交。也可以“加载最新（保留草稿）”或“丢弃草稿”。
 - **不会整板回写**：冲突后不会用旧快照覆盖最新数据，因此另一台设备的改动不会被静默丢弃。

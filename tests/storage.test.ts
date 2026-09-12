@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createDemoBoardAdapter } from '../src/storage'
+import { adapterError, createDemoBoardAdapter } from '../src/storage'
 import { cloneSnapshot } from '../src/domain'
 
 class MemoryStorage {
@@ -12,6 +12,16 @@ class MemoryStorage {
   removeItem(key: string) { this.values.delete(key) }
   setItem(key: string, value: string) { this.values.set(key, String(value)) }
 }
+
+test('cloud errors distinguish owner denial from expired sessions and generic permission errors', () => {
+  const codeOf = (result: ReturnType<typeof adapterError>) => result.ok ? undefined : result.code
+  assert.equal(codeOf(adapterError({ code: '42501', message: 'Board owner is not authorized' })), 'noticeWrongOwner')
+  assert.equal(codeOf(adapterError({ code: 'PGRST301', message: 'JWT expired' })), 'noticeSessionExpired')
+  assert.equal(codeOf(adapterError({ message: 'JWT is expired' })), 'noticeSessionExpired')
+  assert.equal(codeOf(adapterError({ message: 'Authentication required' })), 'noticeSessionExpired')
+  assert.equal(codeOf(adapterError({ message: 'Unauthorized' }, 401)), 'noticeSessionExpired')
+  assert.equal(codeOf(adapterError({ code: '42501', message: 'permission denied for schema private' })), 'noticeCloudError')
+})
 
 test('demo adapter uses compare-and-swap and rejects stale whole-board writes', async () => {
   const storage = new MemoryStorage()
