@@ -44,9 +44,13 @@ test('calendar and ISO week helpers are DST-safe and ISO-year correct', () => {
 
 test('cycle ranges produce inclusive dates and every intersecting ISO week', async () => {
   const { dateKeysInRange, weekKeysInRange } = await import('../src/domain')
+  assert.deepEqual(dateKeysInRange('2024-02-29', '2024-02-29'), ['2024-02-29'])
   assert.deepEqual(dateKeysInRange('2025-01-30', '2025-02-02'), ['2025-01-30', '2025-01-31', '2025-02-01', '2025-02-02'])
+  assert.deepEqual(dateKeysInRange('2020-12-31', '2021-01-01'), ['2020-12-31', '2021-01-01'])
   assert.deepEqual(weekKeysInRange('2025-01-01', '2025-01-12'), ['2025-W01', '2025-W02'])
   assert.deepEqual(weekKeysInRange('2020-12-31', '2021-01-02'), ['2020-W53'])
+  assert.deepEqual(dateKeysInRange('9999-12-31', '9999-12-31'), ['9999-12-31'])
+  assert.deepEqual(weekKeysInRange('9999-12-31', '9999-12-31'), [weekKey('9999-12-31')])
 })
 
 test('linked tasks remain independent when completed', () => {

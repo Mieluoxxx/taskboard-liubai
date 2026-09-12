@@ -125,6 +125,20 @@ function dateForWeek(key: string, cycle: GoalCycle | undefined, preferredDate: s
   return dateInRange(preferredDate, start, end) ? preferredDate : start
 }
 
+function selectionForSnapshot(snapshot: BoardSnapshot, preferredCycleId: string | null, preferredDate: string): { cycleId: string | null; date: string; week: string } {
+  const cycle = snapshot.cycles.find((candidate) => candidate.id === preferredCycleId) || snapshot.cycles[0]
+  const date = cycle ? dateForCycleSelection(preferredDate, cycle, todayInTimeZone(snapshot.settings.timeZone)) : preferredDate
+  return { cycleId: cycle?.id || null, date, week: weekKey(date) }
+}
+
+function cycleRangesDiffer(left: BoardSnapshot | null, right: BoardSnapshot): boolean {
+  if (!left || left.cycles.length !== right.cycles.length) return true
+  return left.cycles.some((cycle, index) => {
+    const other = right.cycles[index]
+    return !other || cycle.id !== other.id || cycle.startDate !== other.startDate || cycle.endDate !== other.endDate
+  })
+}
+
 
 export default function App() {
   const config = useMemo(() => getSupabaseConfig(), [])
@@ -171,6 +185,12 @@ export default function App() {
   const t = useCallback((key: CopyKey) => copy[language][key], [language])
   // 保存提示可能是 notice code（可本地化），也可能是无 code 的诊断文本。
   const noticeLabel = useCallback((value: string) => (isNoticeCode(value) ? copy[language][value] : value), [language])
+  const reconcileSelection = useCallback((nextSnapshot: BoardSnapshot, preferredCycleId: string | null, preferredDate: string) => {
+    const selection = selectionForSnapshot(nextSnapshot, preferredCycleId, preferredDate)
+    setSelectedCycleId(selection.cycleId)
+    setSelectedDate(selection.date)
+    setSelectedWeek(selection.week)
+  }, [])
 
   useEffect(() => { persistLanguage(language) }, [language])
   useEffect(() => {
@@ -283,15 +303,10 @@ export default function App() {
 
   useEffect(() => {
     if (!stored || !boardLoadToken) return
-    const zone = stored.snapshot.settings.timeZone
-    const current = todayInTimeZone(zone)
-    const firstCycle = stored.snapshot.cycles[0]
-    const date = firstCycle ? clampDate(current, firstCycle.startDate, firstCycle.endDate) : current
-    setSelectedDate(date)
-    setSelectedWeek(weekKey(date))
-    setSelectedCycleId(firstCycle?.id || null)
+    const current = todayInTimeZone(stored.snapshot.settings.timeZone)
+    reconcileSelection(stored.snapshot, stored.snapshot.cycles[0]?.id || null, current)
     setSelectedTaskId(null)
-  }, [boardLoadToken]) // 仅显式加载会改变 boardLoadToken，普通保存不会重置当前周期。
+  }, [boardLoadToken, reconcileSelection]) // 仅显式加载会改变 boardLoadToken，普通保存不会重置当前周期。
 
   const drainSave = useCallback(async () => {
     if (saveInFlightRef.current || !adapterRef.current) return
@@ -323,6 +338,7 @@ export default function App() {
       failedJobRef.current = null
       const current = storedRef.current
       const pending = pendingJobRef.current as PendingJob | null
+      const cycleRangesChanged = cycleRangesDiffer(baselineRef.current, result.value.snapshot)
       if (pending && current) {
         // 这次保存已经落库，base 必须前进到「刚提交的那份快照」，而不是停在更早的版本：
         // base 落后会把「后端已有、base 里还没有」的实体误判成本地新增，
@@ -333,6 +349,7 @@ export default function App() {
         pendingJobRef.current = nextPending
         storedRef.current = merged
         setStored(merged)
+        if (cycleRangesChanged) reconcileSelection(current.snapshot, selectedCycleId, selectedDate)
         setSaveState('pending')
         setSaveMessage('')
         setFailureKind(null)
@@ -342,6 +359,7 @@ export default function App() {
         storedRef.current = result.value
         baselineRef.current = cloneSnapshot(result.value.snapshot)
         setStored(result.value)
+        if (cycleRangesChanged) reconcileSelection(result.value.snapshot, selectedCycleId, selectedDate)
         setSaveState('saved')
         setSaveMessage('')
         setFailureKind(null)
@@ -364,9 +382,11 @@ export default function App() {
           const remoteSnapshot = remoteBoard.value.snapshot
           const merged = base ? mergeSnapshots(base, retained.snapshot, remoteSnapshot) : { snapshot: remoteSnapshot, conflicts: ['__no_base__'] }
           if (merged.conflicts.length === 0) {
+            const cycleRangesChanged = cycleRangesDiffer(base, merged.snapshot)
             baselineRef.current = cloneSnapshot(remoteSnapshot)
             storedRef.current = { revision: remoteBoard.value.revision, snapshot: merged.snapshot }
             setStored(storedRef.current)
+            if (cycleRangesChanged) reconcileSelection(merged.snapshot, selectedCycleId, selectedDate)
             const mergeJob: PendingJob = { expectedRevision: remoteBoard.value.revision, snapshot: merged.snapshot, draft: retained.draft, origin: retained.origin }
             pendingJobRef.current = mergeJob
             failedJobRef.current = null
@@ -387,7 +407,7 @@ export default function App() {
       setFailureKind(result.kind === 'conflict' ? 'conflict' : null)
       setDraftLabel(retained.draft)
     }
-  }, [clearPrivateState])
+  }, [clearPrivateState, language, reconcileSelection, selectedCycleId, selectedDate])
   drainRef.current = drainSave
 
   const commitSnapshot = useCallback((next: BoardSnapshot, draft: string | null = null, origin?: DraftOrigin): boolean => {
@@ -446,18 +466,20 @@ export default function App() {
     }
     // 冲突时用户若选择“保留草稿”，失败的那次快照要留着，否则草稿只剩一个标题字符串，改动等于丢失。
     const retained = keepDraft ? (failedJobRef.current || pendingJobRef.current) : null
+    const cycleRangesChanged = cycleRangesDiffer(baselineRef.current, safeBoard.snapshot) || !safeBoard.snapshot.cycles.some((cycle) => cycle.id === selectedCycleId)
     pendingJobRef.current = null
     failedJobRef.current = retained
     storedRef.current = safeBoard
     baselineRef.current = cloneSnapshot(safeBoard.snapshot)
     setStored(safeBoard)
+    if (cycleRangesChanged) reconcileSelection(safeBoard.snapshot, selectedCycleId, selectedDate)
     setSaveState(retained ? 'error' : 'saved')
     setSaveMessage(retained ? 'noticeReapplyDraft' : '')
     setFailureKind(retained ? 'conflict' : null)
     if (!keepDraft) setDraftLabel(null)
     else setDraftLabel(existingDraft)
     return true
-  }, [clearPrivateState, draftLabel, language])
+  }, [clearPrivateState, draftLabel, language, reconcileSelection, selectedCycleId, selectedDate])
 
   const retrySave = useCallback(() => {
     // 若已有更新的待保存变更，保留它；重试只补上失败的那次，不能用旧快照覆盖新改动。
@@ -469,6 +491,10 @@ export default function App() {
     setFailureKind(null)
     void drainRef.current?.()
   }, [])
+
+  const discardDirectConflict = useCallback(() => {
+    if (window.confirm(t('confirmDiscardDirect'))) void reloadLatest(false)
+  }, [reloadLatest, t])
 
   const previousOnlineRef = useRef(online)
   useEffect(() => {
@@ -594,6 +620,10 @@ export default function App() {
     const current = storedRef.current
     if (!current) return
     const targetDomain = domain || existing?.domain || 'daily'
+    if (!existing && targetDomain !== 'long' && selectedCycle && !dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)) {
+      setFlash(t('selectionOutsideCycle'))
+      return
+    }
     const draft = `${t('title')}: ${input.title.trim()}`
     try {
       const next = existing
@@ -634,13 +664,7 @@ export default function App() {
       if (commitSnapshot(next, `${t('cycle')}: ${input.name}`, { kind: 'cycle', input, cycleId: existing?.id })) {
         const created = next.cycles.find((cycle) => !existing && cycle.name === input.name.trim())
         const nextCycleId = existing?.id || created?.id || selectedCycleId
-        const nextCycle = next.cycles.find((cycle) => cycle.id === nextCycleId)
-        setSelectedCycleId(nextCycleId)
-        if (nextCycle) {
-          const date = dateForCycleSelection(selectedDate, nextCycle, todayInTimeZone(current.snapshot.settings.timeZone))
-          setSelectedDate(date)
-          setSelectedWeek(weekKey(date))
-        }
+        reconcileSelection(next, nextCycleId, selectedDate)
         setDialog(null)
       }
     } catch (caught) {
@@ -651,6 +675,10 @@ export default function App() {
   const submitFocus = (input: FocusInput, existing?: FocusBlock) => {
     const current = storedRef.current
     if (!current) return
+    if (!existing && selectedCycle && !dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)) {
+      setFlash(t('selectionOutsideCycle'))
+      return
+    }
     const draft = `${t('focusTitle')}: ${input.title.trim()}`
     try {
       const duration = validateDurationMinutes(input.durationMinutes)
@@ -684,20 +712,17 @@ export default function App() {
 
   const snapshot = stored.snapshot
   const selectedCycle = snapshot.cycles.find((cycle) => cycle.id === selectedCycleId) || snapshot.cycles[0]
-  const selectCycle = (cycleId: string) => {
-    const cycle = snapshot.cycles.find((candidate) => candidate.id === cycleId)
-    if (!cycle) return
-    const date = dateForCycleSelection(selectedDate, cycle, todayKey)
-    setSelectedCycleId(cycleId)
-    setSelectedDate(date)
-    setSelectedWeek(weekKey(date))
-  }
+  const selectCycle = (cycleId: string) => reconcileSelection(snapshot, cycleId, selectedDate)
   const selectWeek = (key: string) => {
     const date = dateForWeek(key, selectedCycle, selectedDate)
     setSelectedWeek(key)
     setSelectedDate(date)
   }
-  const setDate = (date: string) => { setSelectedDate(date); setSelectedWeek(weekKey(date)) }
+  const setDate = (date: string, allowOutsideCycle = false) => {
+    const nextDate = !allowOutsideCycle && selectedCycle ? clampDate(date, selectedCycle.startDate, selectedCycle.endDate) : date
+    setSelectedDate(nextDate)
+    setSelectedWeek(weekKey(nextDate))
+  }
   const panelRef = (index: number) => (element: HTMLElement | null) => { panelRefs.current[index] = element }
   const registerRow = (id: string) => (element: HTMLElement | null) => {
     if (element) rowRefs.current.set(id, element)
@@ -711,6 +736,7 @@ export default function App() {
   })
 
   const taskForFocus = activeTasks(snapshot, 'daily')
+  const canCreateInCycle = !selectedCycle || dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)
 
   return (
     <div className="app-shell">
@@ -719,13 +745,14 @@ export default function App() {
         <div className="notice-bar save-notice" role="status">
           <span className="notice-dot" />
           <span>{saveMessage ? noticeLabel(saveMessage) : saveState === 'offline' || !online ? t('offline') : t('error')}</span>
+          {failedJobRef.current?.draft && !canReopenDraft ? <span className="save-operation">{failedJobRef.current.draft}</span> : null}
           {failedJobRef.current && (saveState === 'error' || saveState === 'offline') && failureKind !== 'conflict' ? <button className="text-button" onClick={retrySave}>{t('retry')}</button> : null}
           {failureKind === 'conflict' && !failedJobRef.current ? <button className="text-button" onClick={() => void reloadLatest(true)}>{t('reloadLatest')}</button> : null}
-          {failureKind === 'conflict' && failedJobRef.current && !canReopenDraft ? <button className="text-button" onClick={() => void reloadLatest(false)}>{t('reloadLatestDirect')}</button> : null}
+          {failureKind === 'conflict' && failedJobRef.current && !canReopenDraft ? <button className="text-button" onClick={discardDirectConflict}>{t('reloadLatestDirect')}</button> : null}
           {failureKind === 'conflict' && canReopenDraft ? <button className="text-button" onClick={() => void reopenDraft()}>{t('reopenDraft')}</button> : null}
         </div>
       ) : null}
-      {draftLabel && (saveState === 'error' || saveState === 'offline') ? (
+      {draftLabel && canReopenDraft && (saveState === 'error' || saveState === 'offline') ? (
         <div className="notice-bar draft-notice" role="status">
           <div><strong>{t('draftTitle')}</strong><span>{draftLabel}</span></div>
           <div className="notice-actions">
@@ -737,7 +764,7 @@ export default function App() {
       {runningBlock && runningBlock.dateKey !== selectedDate ? (
         <div className="running-banner" role="status">
           <span className="pulse-dot" />{t('runningElsewhere')} · {formatDateKey(runningBlock.dateKey, language, currentZone)}
-          <button className="text-button" onClick={() => { setDate(runningBlock.dateKey); panelRefs.current[3]?.scrollIntoView({ behavior: 'smooth', inline: 'start' }) }}>{t('jumpFocus')}</button>
+          <button className="text-button" onClick={() => { setDate(runningBlock.dateKey, true); panelRefs.current[3]?.scrollIntoView({ behavior: 'smooth', inline: 'start' }) }}>{t('jumpFocus')}</button>
         </div>
       ) : null}
       {snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'daily' && !task.parentId && !task.checked && Boolean(task.dateKey && task.dateKey < todayInTimeZone(currentZone))).length ? <PastSuggestions tasks={snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'daily' && !task.parentId && !task.checked && Boolean(task.dateKey && task.dateKey < todayInTimeZone(currentZone)))} language={language} t={t} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} /> : null}
@@ -754,18 +781,18 @@ export default function App() {
             panelRef={panelRef(1)} domain="weekly" title={t('weekly')} hint={t('weeklyHint')} language={language} t={t}
             tasks={panelTasks('weekly')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
             rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={selectedCycle} language={language} t={t} onSelect={selectWeek} onGoCurrent={() => selectWeek(currentWeekKey)} />}
-            canAdd onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
+            canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} />
           <TaskPanel
             panelRef={panelRef(2)} domain="daily" title={`${t('daily')} · ${weekdayLabel(selectedDate, language)}`} hint={t('dailyHint')} language={language} t={t}
             tasks={panelTasks('daily')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
             rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
-            canAdd onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'daily' })}
+            canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'daily' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'daily', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
           <FocusPanel
             panelRef={panelRef(3)} blocks={snapshot.focusBlocks.filter((block) => block.dateKey === selectedDate)} allTasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} now={now}
             rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
-            onAdd={() => setDialog({ kind: 'focus' })} onEdit={(block) => setDialog({ kind: 'focus', block })} onDelete={deleteFocusWithConfirm} onCommand={focusCommand}
+            canAdd={canCreateInCycle} onAdd={() => setDialog({ kind: 'focus' })} onEdit={(block) => setDialog({ kind: 'focus', block })} onDelete={deleteFocusWithConfirm} onCommand={focusCommand}
           />
         </div>
       </main>
@@ -780,7 +807,7 @@ export default function App() {
   )
 
   function toggleTask(task: Task) {
-    updateSnapshot((current) => updateTask(current, task.id, { checked: !task.checked }), null)
+    updateSnapshot((current) => updateTask(current, task.id, { checked: !task.checked }), `${t('title')}: ${task.title}`)
   }
 
   function deleteTaskWithConfirm(task: Task) {
@@ -789,22 +816,22 @@ export default function App() {
     const hasChildren = current.snapshot.tasks.some((candidate) => candidate.parentId === task.id && !candidate.archivedAt)
     const message = hasChildren ? t('confirmDeleteWithChildren') : t('confirmDelete')
     if (!window.confirm(message)) return
-    updateSnapshot((snapshot) => deleteTask(snapshot, task.id), null)
+    updateSnapshot((snapshot) => deleteTask(snapshot, task.id), `${t('delete')}: ${task.title}`)
     if (selectedTaskId === task.id) setSelectedTaskId(null)
   }
 
   function reorderTask(task: Task, direction: -1 | 1) {
     // 带上来源，冲突时直接加载最新版本后再明确重做，不把排序伪装成表单草稿。
-    updateSnapshot((current) => reorderSibling(current, task.id, direction), null, reorderOrigin(task, direction))
+    updateSnapshot((current) => reorderSibling(current, task.id, direction), `${t('title')}: ${task.title}`, reorderOrigin(task, direction))
   }
 
   function deleteFocusWithConfirm(block: FocusBlock) {
     if (!window.confirm(t('confirmDeleteFocus'))) return
-    updateSnapshot((current) => deleteFocusBlock(current, block.id), null)
+    updateSnapshot((current) => deleteFocusBlock(current, block.id), `${t('delete')}: ${block.title}`)
   }
 
   function focusCommand(block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') {
-    updateSnapshot((current) => setFocusCommand(current, block.id, command), null)
+    updateSnapshot((current) => setFocusCommand(current, block.id, command), `${t('focus')}: ${block.title}`)
   }
 
   function updateSettings(zone: string) {
@@ -814,11 +841,11 @@ export default function App() {
     if (safe !== zone) { setFlash(t('invalidTimeZone')); return }
     const next = cloneSnapshot(current.snapshot)
     next.settings.timeZone = safe
-    commitSnapshot(next)
+    commitSnapshot(next, `${t('timezone')}: ${safe}`)
   }
 
   function rescheduleTask(task: Task, date: string) {
-    updateSnapshot((current) => rescheduleDailyTask(current, task.id, date), null)
+    updateSnapshot((current) => rescheduleDailyTask(current, task.id, date), `${t('reschedule')}: ${task.title}`)
   }
 }
 
@@ -877,39 +904,64 @@ function CycleRail({ cycles, selectedId, language, t, onSelect, onAdd, onEdit }:
 }
 
 // 周、日的导航范围来自选中的长期周期；没有周期时保留独立的当前窗口，方便空板继续使用。
+const RAIL_ROW_HEIGHT = 52
+const RAIL_VIEW_HEIGHT = 480
+const RAIL_VIRTUAL_THRESHOLD = 20
+const RAIL_OVERSCAN = 4
+
+function useRailWindow<T>(items: T[], selectedIndex: number) {
+  const railRef = useRef<HTMLDivElement | null>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const virtual = items.length > RAIL_VIRTUAL_THRESHOLD
+  useLayoutEffect(() => {
+    if (!virtual || selectedIndex < 0 || !railRef.current) return
+    const rail = railRef.current
+    const top = selectedIndex * RAIL_ROW_HEIGHT
+    const bottom = top + RAIL_ROW_HEIGHT
+    const nextScrollTop = top < rail.scrollTop ? top : bottom > rail.scrollTop + rail.clientHeight ? bottom - rail.clientHeight : rail.scrollTop
+    if (nextScrollTop !== rail.scrollTop) {
+      rail.scrollTop = nextScrollTop
+      setScrollTop(nextScrollTop)
+    }
+  }, [items.length, selectedIndex, virtual])
+  const start = virtual ? Math.max(0, Math.floor(scrollTop / RAIL_ROW_HEIGHT) - RAIL_OVERSCAN) : 0
+  const end = virtual ? Math.min(items.length, Math.ceil((scrollTop + RAIL_VIEW_HEIGHT) / RAIL_ROW_HEIGHT) + RAIL_OVERSCAN) : items.length
+  return { railRef, onScroll: (event: React.UIEvent<HTMLDivElement>) => setScrollTop(event.currentTarget.scrollTop), visible: items.slice(start, end), paddingTop: virtual ? start * RAIL_ROW_HEIGHT : 0, paddingBottom: virtual ? Math.max(0, (items.length - end) * RAIL_ROW_HEIGHT) : 0 }
+}
+
 function WeekRail({ selectedWeek, currentWeek, cycle, language, t, onSelect, onGoCurrent }: { selectedWeek: string; currentWeek: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void; onGoCurrent: () => void }) {
   const weeks = useMemo(() => cycle ? weekKeysInRange(cycle.startDate, cycle.endDate) : [-2, -1, 0, 1, 2].map((offset) => weekKey(addDays(weekRange(selectedWeek).start, offset * 7))), [cycle?.startDate, cycle?.endDate, selectedWeek])
-  const hasCurrent = weeks.includes(currentWeek)
-  const offCurrent = hasCurrent && selectedWeek !== currentWeek
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className={`rail-items ${weeks.length > 7 ? 'range-items' : ''}`}>{weeks.map((key) => {
-    const isCurrent = key === currentWeek
-    return <button className={`rail-item ${selectedWeek === key ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}`} aria-current={selectedWeek === key ? 'page' : undefined} aria-label={isCurrent ? `${key.slice(5)} · ${t('currentWeek')}` : key.slice(5)} key={key} onClick={() => onSelect(key)}><span>{key.slice(5)}{isCurrent ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{weekRange(key).start.slice(5)}</small></button>
-  })}</div>{offCurrent ? <button className="rail-return" onClick={onGoCurrent}><Icon name="back" />{t('backToCurrentWeek')}</button> : null}</aside>
+  const items = useMemo(() => weeks.map((key) => ({ key, start: weekRange(key).start.slice(5), isCurrent: key === currentWeek })), [currentWeek, weeks])
+  const selectedIndex = items.findIndex((item) => item.key === selectedWeek)
+  const windowed = useRailWindow(items, selectedIndex)
+  const canGoCurrent = !cycle || items.some((item) => item.isCurrent)
+  const offCurrent = canGoCurrent && selectedWeek !== currentWeek
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className={`rail-items ${weeks.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ key, start, isCurrent }) => <button className={`rail-item ${selectedWeek === key ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}`} aria-current={selectedWeek === key ? 'page' : undefined} aria-label={isCurrent ? `${key.slice(5)} · ${t('currentWeek')}` : key.slice(5)} key={key} onClick={() => onSelect(key)}><span>{key.slice(5)}{isCurrent ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{start}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div>{offCurrent ? <button className="rail-return" onClick={onGoCurrent}><Icon name="back" />{t('backToCurrentWeek')}</button> : null}</aside>
 }
 
 function DayRail({ selectedDate, selectedWeek, todayKey, cycle, language, t, onSelect, onGoToday }: { selectedDate: string; selectedWeek: string; todayKey: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void; onGoToday: () => void }) {
   const days = useMemo(() => cycle ? dateKeysInRange(cycle.startDate, cycle.endDate) : Array.from({ length: 7 }, (_, index) => addDays(weekRange(selectedWeek).start, index)), [cycle?.startDate, cycle?.endDate, selectedWeek])
-  const hasToday = days.includes(todayKey)
-  const offToday = hasToday && selectedDate !== todayKey
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className={`rail-items ${days.length > 7 ? 'range-items' : ''}`}>{days.map((date) => {
-    const isToday = date === todayKey
-    const label = weekdayShortLabel(date, language)
-    return <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(5)} · ${t('currentDay')}` : `${label} ${date.slice(5)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(5)}</small></button>
-  })}</div>{offToday ? <button className="rail-return" onClick={onGoToday}><Icon name="back" />{t('backToCurrentDay')}</button> : null}</aside>
+  const items = useMemo(() => days.map((date) => ({ date, label: weekdayShortLabel(date, language), isToday: date === todayKey })), [days, language, todayKey])
+  const selectedIndex = items.findIndex((item) => item.date === selectedDate)
+  const windowed = useRailWindow(items, selectedIndex)
+  const canGoToday = !cycle || items.some((item) => item.isToday)
+  const offToday = canGoToday && selectedDate !== todayKey
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className={`rail-items ${days.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ date, label, isToday }) => <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(5)} · ${t('currentDay')}` : `${label} ${date.slice(5)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(5)}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div>{offToday ? <button className="rail-return" onClick={onGoToday}><Icon name="back" />{t('backToCurrentDay')}</button> : null}</aside>
 }
 
 function PastSuggestions({ tasks, language, t, onReschedule }: { tasks: Task[]; language: Language; t: (key: CopyKey) => string; onReschedule: (task: Task) => void }) {
   return <div className="past-suggestions" role="region" aria-label={t('reschedule')}><div className="past-suggestion-title"><span className="notice-dot" /><strong>{t('reschedule')}</strong><span>{t('pastHint')}</span></div><div className="past-suggestion-list">{tasks.slice(0, 5).map((task) => <button key={task.id} className="suggestion-item" onClick={() => onReschedule(task)}><span>{task.title}</span><small>{task.dateKey}</small></button>)}</div>{tasks.length > 5 ? <span className="suggestion-more">+{tasks.length - 5}</span> : null}</div>
 }
 
-function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone, selectedId, selectedChain, registerRow, rail, canAdd, onAdd, onEdit, onDelete, onToggle, onReorder, onSelect, onAddSubtask, onReschedule, panelRef }: {
-  domain: Domain; title: string; hint: string; language: Language; t: (key: CopyKey) => string; tasks: Task[]; snapshot: BoardSnapshot; timeZone: string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; rail: React.ReactNode; canAdd: boolean; onAdd: () => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void; panelRef?: (element: HTMLElement | null) => void
+function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone, selectedId, selectedChain, registerRow, rail, canAdd, canCreate = true, onAdd, onEdit, onDelete, onToggle, onReorder, onSelect, onAddSubtask, onReschedule, panelRef }: {
+  domain: Domain; title: string; hint: string; language: Language; t: (key: CopyKey) => string; tasks: Task[]; snapshot: BoardSnapshot; timeZone: string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; rail: React.ReactNode; canAdd: boolean; canCreate?: boolean; onAdd: () => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void; panelRef?: (element: HTMLElement | null) => void
 }) {
   const topLevel = tasks.filter((task) => !task.parentId)
+  const addEnabled = canAdd && canCreate
   return <section className={`panel-shell domain-${domain}`} ref={panelRef} aria-labelledby={`panel-${domain}`}>
-    {rail}<div className="paper-panel"><div className="panel-top"><div><div className="eyebrow">{domain === 'long' ? '01' : domain === 'weekly' ? '02' : '03'}</div><h2 id={`panel-${domain}`}>{title}</h2><p>{hint}</p></div><button className="add-button" onClick={onAdd} disabled={!canAdd}><Icon name="plus" />{t('addTask')}</button></div>
+    {rail}<div className="paper-panel"><div className="panel-top"><div><div className="eyebrow">{domain === 'long' ? '01' : domain === 'weekly' ? '02' : '03'}</div><h2 id={`panel-${domain}`}>{title}</h2><p>{hint}</p></div><button className="add-button" onClick={onAdd} disabled={!addEnabled}><Icon name="plus" />{t('addTask')}</button></div>
       {domain === 'daily' && tasks.some((task) => !task.checked && task.dateKey && task.dateKey < todayInTimeZone(snapshot.settings.timeZone)) ? <div className="past-note">{t('reschedule')}</div> : null}
-      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd}>{t('addTask')}</button></div> : <div className="task-list">{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</div>}
+      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list">{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</div>}
       <div className="paper-space" />
     </div>
   </section>
@@ -929,10 +981,10 @@ function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selec
   </div>{childrenTasks.length ? <div className="subtask-list">{childrenTasks.map((child) => <TaskRow key={child.id} task={child} childrenTasks={[]} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</div> : null}</div>
 }
 
-function FocusPanel({ blocks, allTasks, selectedDate, language, t, now, rail, onAdd, onEdit, onDelete, onCommand, panelRef }: {
-  blocks: FocusBlock[]; allTasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; now: number; rail: React.ReactNode; onAdd: () => void; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void; panelRef?: (element: HTMLElement | null) => void
+function FocusPanel({ blocks, allTasks, selectedDate, language, t, now, rail, canAdd = true, onAdd, onEdit, onDelete, onCommand, panelRef }: {
+  blocks: FocusBlock[]; allTasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; now: number; rail: React.ReactNode; canAdd?: boolean; onAdd: () => void; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void; panelRef?: (element: HTMLElement | null) => void
 }) {
-  return <section className="panel-shell focus-shell" ref={panelRef} aria-labelledby="panel-focus">{rail}<div className="focus-panel"><div className="panel-top"><div><div className="eyebrow">{`04 · ${t('timeLabel')}`}</div><h2 id="panel-focus">{t('focus')}</h2><p>{t('focusHint')}</p></div><button className="add-button light" onClick={onAdd}><Icon name="plus" />{t('add')}</button></div><div className="focus-date-label">{formatDateKey(selectedDate, language)} <span>{selectedDate}</span></div>{blocks.length ? <div className="focus-list">{blocks.map((block) => <FocusCard key={block.id} block={block} allTasks={allTasks} language={language} t={t} now={now} onEdit={onEdit} onDelete={onDelete} onCommand={onCommand} />)}</div> : <div className="focus-empty"><div className="empty-glyph">◯</div><p>{t('emptyFocus')}</p><button className="text-button light-text" onClick={onAdd}>{t('add')}</button></div>}<div className="focus-space" /></div></section>
+  return <section className="panel-shell focus-shell" ref={panelRef} aria-labelledby="panel-focus">{rail}<div className="focus-panel"><div className="panel-top"><div><div className="eyebrow">{`04 · ${t('timeLabel')}`}</div><h2 id="panel-focus">{t('focus')}</h2><p>{t('focusHint')}</p></div><button className="add-button light" onClick={onAdd} disabled={!canAdd}><Icon name="plus" />{t('add')}</button></div><div className="focus-date-label">{formatDateKey(selectedDate, language)} <span>{selectedDate}</span></div>{blocks.length ? <div className="focus-list">{blocks.map((block) => <FocusCard key={block.id} block={block} allTasks={allTasks} language={language} t={t} now={now} onEdit={onEdit} onDelete={onDelete} onCommand={onCommand} />)}</div> : <div className="focus-empty"><div className="empty-glyph">◯</div><p>{t('emptyFocus')}</p><button className="text-button light-text" onClick={onAdd} disabled={!canAdd}>{t('add')}</button></div>}<div className="focus-space" /></div></section>
 }
 
 function FocusCard({ block, allTasks, language, t, now, onEdit, onDelete, onCommand }: { block: FocusBlock; allTasks: Task[]; language: Language; t: (key: CopyKey) => string; now: number; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void }) {

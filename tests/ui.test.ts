@@ -9,18 +9,18 @@ const cssSource = async () => readFile(new URL('../src/styles.css', import.meta.
 test('the week rail shows the week start as MM-DD and highlights the week containing today', async () => {
   const source = await appSource()
   // 周轨道的第二行日期必须与日轨道一致使用 MM-DD（slice(5)），而不是本地化的长日期
-  assert.match(source, /<small>\{weekRange\(key\)\.start\.slice\(5\)\}<\/small>/, 'week rail must render the start date as MM-DD')
+  assert.match(source, /start: weekRange\(key\)\.start\.slice\(5\)/, 'week rail must render the start date as MM-DD')
   assert.doesNotMatch(source, /<small>\{formatDateKey\(weekRange\(key\)\.start/, 'week rail must not use the localized long date')
   // 本周：与选中的周比较的是“今天所在周”，而不是“当前查看的周”
   assert.match(source, /const currentWeekKey = weekKey\(todayKey\)/, 'the rail must compare against the week of today')
-  assert.match(source, /const isCurrent = key === currentWeek/, 'week rail must mark the week containing today')
+  assert.match(source, /isCurrent: key === currentWeek/, 'week rail must mark the week containing today')
   assert.match(source, /currentWeek=\{currentWeekKey\}/, 'the week rail must receive the current week')
 })
 
 test('the day rail highlights today, separately from the day being viewed', async () => {
   const source = await appSource()
   assert.match(source, /const todayKey = todayInTimeZone\(currentZone\)/, 'the app must derive today once from the configured time zone')
-  assert.match(source, /const isToday = date === todayKey/, 'day rail must mark the date that is today')
+  assert.match(source, /isToday: date === todayKey/, 'day rail must mark the date that is today')
   assert.match(source, /todayKey=\{todayKey\}/, 'the day rail must receive today')
   // 选中态与“今天”必须落在不同的 class 上，否则用户无法区分“今天”和“正在查看”
   assert.match(source, /selectedDate === date \? 'selected' : ''} \$\{isToday \? 'is-current' : ''\}/, 'today must not reuse the selected class')
@@ -128,11 +128,11 @@ test('the space left by the removed add buttons is used for "back to this week /
   assert.match(css, /\.rail-return\b/, 'rail-return needs a style')
 
   // 已经处在当前周期时不显示，避免无意义的按钮（用 offCurrent / offToday 控制）
-  assert.match(weekRail, /const hasCurrent = weeks\.includes\(currentWeek\)/, 'the week rail must know whether the current week is in range')
-  assert.match(weekRail, /const offCurrent = hasCurrent && selectedWeek !== currentWeek/, 'the week rail must know when it is off the current week')
+  assert.match(weekRail, /const canGoCurrent = !cycle \|\| items\.some\(\(item\) => item\.isCurrent\)/, 'the week rail must know whether the current week is in range')
+  assert.match(weekRail, /const offCurrent = canGoCurrent && selectedWeek !== currentWeek/, 'the week rail must know when it is off the current week')
   assert.match(weekRail, /offCurrent \? <button className="rail-return"/, 'the week control only shows when off the current week')
-  assert.match(dayRail, /const hasToday = days\.includes\(todayKey\)/, 'the day rail must know whether today is in range')
-  assert.match(dayRail, /const offToday = hasToday && selectedDate !== todayKey/, 'the day rail must know when it is off today')
+  assert.match(dayRail, /const canGoToday = !cycle \|\| items\.some\(\(item\) => item\.isToday\)/, 'the day rail must know whether today is in range')
+  assert.match(dayRail, /const offToday = canGoToday && selectedDate !== todayKey/, 'the day rail must know when it is off today')
   assert.match(dayRail, /offToday \? <button className="rail-return"/, 'the day control only shows when off today')
 
   // 调用处：回到本周同时切换周与日（与点周条目一致）；回到今天只切日期，由它顺带把周带过去
@@ -143,12 +143,11 @@ test('the space left by the removed add buttons is used for "back to this week /
 test('direct mutations do not flash a form-draft banner during a normal save', async () => {
   const source = await appSource()
   // 删除、勾选、排序、计时等直接操作仍走 CAS，但不应把表单草稿提示条当作“保存中”指示器。
-  assert.match(source, /draftLabel && \(saveState === 'error' \|\| saveState === 'offline'\)/, 'draft banner must only appear for failed/offline saves')
-  assert.match(source, /updateSnapshot\(\(current\) => updateTask\(current, task\.id, \{ checked: !task\.checked \}\), null\)/, 'toggling must not create a form draft')
-  assert.match(source, /updateSnapshot\(\(snapshot\) => deleteTask\(snapshot, task\.id\), null\)/, 'deleting must not create a form draft')
-  assert.match(source, /updateSnapshot\(\(current\) => deleteFocusBlock\(current, block\.id\), null\)/, 'deleting a focus block must not create a form draft')
+  assert.match(source, /draftLabel && canReopenDraft && \(saveState === 'error' \|\| saveState === 'offline'\)/, 'draft banner must only appear for failed/offline form saves')
   assert.match(source, /const canReopenDraft = failedOrigin\?\.kind === 'task'/, 'only form-origin failures may reopen an editor')
   assert.match(source, /failureKind === 'conflict' && failedJobRef\.current && !canReopenDraft/, 'direct conflicts need load-latest recovery, not a fake editor')
+  assert.match(source, /if \(window\.confirm\(t\('confirmDiscardDirect'\)\)\) void reloadLatest\(false\)/, 'discarding a direct conflict must be confirmed')
+  assert.match(source, /failedJobRef\.current\?\.draft && !canReopenDraft/, 'direct failures must identify the operation without calling it a form draft')
 })
 
 test('cycle duration scopes the week and day rails', async () => {
@@ -156,8 +155,12 @@ test('cycle duration scopes the week and day rails', async () => {
   assert.match(source, /weekKeysInRange/, 'the week rail must derive weeks from the cycle range')
   assert.match(source, /dateKeysInRange/, 'the day rail must derive dates from the cycle range')
   assert.match(source, /cycle=\{selectedCycle\}/g, 'all calendar rails must receive the selected cycle')
-  assert.match(source, /const date = dateForCycleSelection\(selectedDate, cycle, todayKey\)/, 'switching cycles must preserve or clamp the selected date')
+  assert.match(source, /const selection = selectionForSnapshot\(nextSnapshot, preferredCycleId, preferredDate\)/, 'selection normalization must use one cycle-aware helper')
+  assert.match(source, /const selectCycle = \(cycleId: string\) => reconcileSelection\(snapshot, cycleId, selectedDate\)/, 'switching cycles must preserve or clamp the selected date')
   assert.match(source, /const date = dateForWeek\(key, selectedCycle, selectedDate\)/, 'selecting a week must choose an in-range date')
+  assert.match(source, /const virtual = items\.length > RAIL_VIRTUAL_THRESHOLD/, 'long ranges must use a render window')
+  assert.match(source, /visible: items\.slice\(start, end\)/, 'the render window must preserve scrollable endpoints with spacers')
+  assert.match(source, /const RAIL_VIRTUAL_THRESHOLD = 20/, 'monthly ranges must not render every day at once')
   assert.doesNotMatch(source, /className="rail-hint"/, 'static current-period hints are unnecessary beside scoped rails')
   assert.match(source, /<small>\{date\.slice\(5\)\}<\/small>/, 'daily entries must show MM-DD across month boundaries')
 })
