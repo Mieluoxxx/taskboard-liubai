@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { adapterError, createDemoBoardAdapter } from '../src/storage'
+import { adapterError, createDemoBoardAdapter, createSessionBoundFetch } from '../src/storage'
 import { cloneSnapshot } from '../src/domain'
 
 class MemoryStorage {
@@ -21,6 +21,24 @@ test('cloud errors distinguish owner denial from expired sessions and generic pe
   assert.equal(codeOf(adapterError({ message: 'Authentication required' })), 'noticeSessionExpired')
   assert.equal(codeOf(adapterError({ message: 'Unauthorized' }, 401)), 'noticeSessionExpired')
   assert.equal(codeOf(adapterError({ code: '42501', message: 'permission denied for schema private' })), 'noticeCloudError')
+})
+
+test('a board request is bound to its user and cannot send after the session switches', async () => {
+  let session: { userId: string; accessToken: string } | null = { userId: 'user-a', accessToken: 'token-a' }
+  const requests: RequestInit[] = []
+  const fetch = createSessionBoundFetch(
+    { userId: 'user-a', getSession: async () => session },
+    async (_input, init) => {
+      requests.push(init || {})
+      return new Response(null, { status: 204 })
+    },
+  )
+
+  await fetch('https://example.test/rpc', { headers: { 'x-test': '1' } })
+  assert.equal(new Headers(requests[0].headers).get('authorization'), 'Bearer token-a')
+  session = { userId: 'user-b', accessToken: 'token-b' }
+  await assert.rejects(() => fetch('https://example.test/rpc'), /session changed/i)
+  assert.equal(requests.length, 1)
 })
 
 test('demo adapter uses compare-and-swap and rejects stale whole-board writes', async () => {

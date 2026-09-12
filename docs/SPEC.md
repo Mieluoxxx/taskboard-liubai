@@ -23,11 +23,11 @@ Liubai 是一个个人规划看板：长期目标、周计划、日计划和专�
 - 默认 45 分钟，首次开始前可改；时长必须为有限正数且不超过 24 小时。
 - 支持添加、分配日任务、开始、暂停、恢复、完成；完成不勾选任务。结束和累计毫秒数都持久化。
 - 运行中用 `startedAt` + `elapsedMs` 计算，不依赖 interval tick 累加；后台、刷新、关闭页面不会自动暂停，重开后按时间戳恢复。到时 UI 显示完成态，但必须由用户保存/结束状态，任务不受影响。
-- 一个 owner 在所有设备和所有日期上最多一个运行计时器。客户端先提供即时错误；数据库 RPC 在事务内以 CAS 和约束再次拒绝竞争写入。
+- 一个用户在所有设备和所有日期上最多一个运行计时器。客户端先提供即时错误；数据库 RPC 在事务内以 CAS 和约束再次拒绝竞争写入。
 
 ## 持久化与冲突
 
-- 单个私有 owner board JSONB 行，带单调递增 `revision`。每次变更（含计时器）都在同一条受保护路径中以客户端加载的 revision 做 compare-and-swap；禁止无条件 overwrite/upsert。
+- 每个认证用户一行私有 board JSONB，带单调递增 `revision`。每次变更（含计时器）都在同一条受保护路径中以客户端加载的 revision 做 compare-and-swap；禁止无条件 overwrite/upsert。
 - 数据库验证 schema、大小、任务图、日期/时长、运行计时器数量。存入 React 前客户端也验证外部状态。
 - 版本冲突使用 SQLSTATE `PT409`（PostgREST 映射为 HTTP 409）。**不要用 `40001`**：它属于 serialization_failure，平台会视为可重试并自动重试，导致每次正常冲突都重试到边缘超时（实测约 125 秒后 504），期间客户端停在“保存中”并可能耗尽连接池。`tests/sql.test.ts` 锁定该状态码。
 - CAS 被拒绝时保留该次变更的**表单输入**（`DraftOrigin`）与编辑器草稿标签。冲突路径会先尝试自动三方合并（见下），只有无法自动合并时才需要用户决定；恢复在线或瞬时错误可手动重试。
@@ -38,12 +38,12 @@ Liubai 是一个个人规划看板：长期目标、周计划、日计划和专�
 - 顺序冲突也可恢复：「重新打开编辑器」会把这次移动重放到最新版本，而不是写回旧整板；目标任务已被删除时明确告知并保留草稿。
 - 自动刷新（标签页获得焦点、恢复联网）在**存在未保存改动**（在途 / 排队 / 失败保留）时直接放弃刷新，读取 ref 判断而不是 React state，避免闭包过期导致把刚失败的改动连同草稿一起丢掉、界面还显示“已保存”。只有用户明确点“丢弃草稿”才会丢弃未保存内容。
 - 冲突后**不做整板回写**。界面提供“重新打开编辑器”：它先刷新到最新 `revision`，刷新失败或会话变化就中止；目标已被删除时不静默改成新建，而是保留草稿并告知。离线时拒绝提交并保留输入。
-- 这是小型个人应用的单行快照上限（`ponytail: 单 owner JSONB/CAS；若数据量或协作增长，升级为按实体的规范化 mutation`）。
+- 这是小型个人应用的单用户单行快照上限（`ponytail: 每用户 JSONB/CAS；若数据量或协作增长，升级为按实体的规范化 mutation`）。
 
 ## 身份、安全和部署
 
 - 真实模式只使用 Supabase 邮箱/密码登录，不提供公开注册、OAuth 或重置 UI。缺少 Vite Supabase 配置时显示诚实的设置页，用户必须显式点击 LOCAL DEMO；云错误不会静默切 demo。
-- SQL 将 owner UUID 放在受保护配置表中，RLS 策略要求 `auth.uid() = candidate = 配置的 owner`（只比较 candidate 会放行任何已认证用户）；客户端不能读取、写入或认领 owner。私有表不授予客户端任何权限，读写只能经由 SECURITY DEFINER RPC，`tests/sql.test.ts` 在可回滚事务中用受控授权分别验证 owner / 其他已认证用户 / 匿名三种身份。所有 SECURITY DEFINER 函数固定 `search_path`，检查 `auth.uid()`，撤销 `PUBLIC/anon` 执行权限。
+- SQL 不再依赖单例 owner 配置；RLS 策略要求 `personal_boards.owner_uuid = auth.uid()`。私有表不授予客户端任何权限，读写只能经由 SECURITY DEFINER RPC；首次读取按当前 `auth.uid()` 幂等创建空板，保存只能更新当前用户行。`tests/sql.test.ts` 验证多个用户各自读写、互不可见、匿名拒绝和伪造归属失败。所有 SECURITY DEFINER 函数固定 `search_path`，检查 `auth.uid()`，撤销 `PUBLIC/anon` 执行权限。
 - Demo 数据只使用 demo 专用 localStorage key，永不上传。
 
 ## 写入保护
@@ -58,7 +58,7 @@ Liubai 是一个个人规划看板：长期目标、周计划、日计划和专�
 - 历史条目的放置也必须与其自身 domain 一致（long↔cycleId、weekly↔weekKey、daily↔dateKey），与客户端 `parseHistory` 完全相同；否则数据库会存入客户端下次拒绝加载的快照。
 - 客户端 bundle 只允许 `VITE_SUPABASE_` 前缀的环境变量（`envPrefix`），避免无关 `VITE_*` 变量被内联。
 - 演示模式是本地共享状态，写入通过浏览器原生 Web Locks 串行化，避免两个标签页互相覆盖。
-- `supabase/migrations/001_private_board.sql` 的校验逻辑由 `tests/sql.test.ts` 在真实 Postgres（PGlite）中执行验证。
+- `supabase/migrations/001_private_board.sql` 与 `002_independent_boards.sql` 的校验逻辑由 `tests/sql.test.ts` 在真实 Postgres（PGlite）中执行验证。
 - 正常的直接操作（删除、勾选、排序、计时、重排等）仍通过快照 CAS 保护，但不创建表单草稿；保存中的反馈只使用固定高度的顶部状态指示器，避免页面因草稿条出现/消失而跳动。只有失败或离线时才显示恢复入口；表单来源可重新打开编辑器，直接操作冲突则先加载最新状态后由用户明确重做。
 
 ## 界面细节

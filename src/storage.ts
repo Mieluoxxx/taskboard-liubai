@@ -5,6 +5,7 @@ import type { AdapterResult, AuthUser, BoardAdapter, BoardSnapshot, FocusBlock, 
 
 const DEMO_STORAGE_KEY = 'liubai-taskboard:demo-board:v1'
 const DEMO_LOCK_NAME = 'liubai-taskboard:demo-board'
+const SESSION_SCOPE_CHANGED = 'session changed before board request'
 
 function browserStorage(): Storage | null {
   return typeof globalThis.localStorage === 'undefined' ? null : globalThis.localStorage
@@ -13,6 +14,16 @@ function browserStorage(): Storage | null {
 export interface SupabaseConfig {
   url: string
   key: string
+}
+
+export interface SessionSnapshot {
+  userId: string
+  accessToken: string
+}
+
+export interface SessionScope {
+  userId: string
+  getSession: () => Promise<SessionSnapshot | null>
 }
 
 export function getSupabaseConfig(): SupabaseConfig | null {
@@ -28,8 +39,22 @@ export function getSupabaseConfig(): SupabaseConfig | null {
   return { url, key }
 }
 
-export function createSupabaseBoardAdapter(config: SupabaseConfig): SupabaseBoardAdapter {
-  return new SupabaseBoardAdapter(createClient(config.url, config.key))
+export function createSessionBoundFetch(scope: SessionScope, baseFetch: typeof fetch = globalThis.fetch.bind(globalThis)): typeof fetch {
+  return async (input, init) => {
+    const session = await scope.getSession()
+    if (!session || session.userId !== scope.userId) throw new Error(SESSION_SCOPE_CHANGED)
+    const headers = new Headers(init?.headers)
+    headers.set('Authorization', `Bearer ${session.accessToken}`)
+    return baseFetch(input, { ...init, headers })
+  }
+}
+
+export function createSupabaseBoardAdapter(config: SupabaseConfig, scope?: SessionScope): SupabaseBoardAdapter {
+  const client = createClient(config.url, config.key, scope ? {
+    auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
+    global: { fetch: createSessionBoundFetch(scope) },
+  } : undefined)
+  return new SupabaseBoardAdapter(client, config)
 }
 
 function parseStoredBoard(value: unknown): StoredBoard {
@@ -50,7 +75,7 @@ export function adapterError(error: { message?: string; code?: string } | null |
   if (error?.code === '42501' && /board owner is not authorized/i.test(message)) {
     return { ok: false, kind: 'auth', code: 'noticeWrongOwner', message: 'Current account is not the configured board owner' }
   }
-  if (status === 401 || error?.code === 'PGRST301' || /authentication required|session expired|jwt.*expired|expired.*jwt|invalid jwt|invalid token/i.test(message)) {
+  if (status === 401 || error?.code === 'PGRST301' || /authentication required|session expired|session changed|jwt.*expired|expired.*jwt|invalid jwt|invalid token/i.test(message)) {
     return { ok: false, kind: 'auth', code: 'noticeSessionExpired', message: 'Cloud session expired' }
   }
   return { ok: false, kind: 'error', code: 'noticeCloudError', message }
@@ -59,10 +84,32 @@ export function adapterError(error: { message?: string; code?: string } | null |
 export class SupabaseBoardAdapter implements BoardAdapter {
   readonly mode = 'cloud' as const
 
-  constructor(readonly client: SupabaseClient) {}
+  constructor(readonly client: SupabaseClient, private readonly config?: SupabaseConfig) {}
+
+  async getBoardAdapterForCurrentSession(expectedUserId?: string): Promise<SupabaseBoardAdapter | null> {
+    if (!this.config) return null
+    const scope = await this.getCurrentSessionSnapshot()
+    if (!scope || (expectedUserId && scope.userId !== expectedUserId)) return null
+    return createSupabaseBoardAdapter(this.config, {
+      userId: scope.userId,
+      getSession: () => this.getCurrentSessionSnapshot(),
+    })
+  }
+
+  private async getCurrentSessionSnapshot(): Promise<SessionSnapshot | null> {
+    const { data } = await this.client.auth.getSession()
+    const session = data.session
+    return session?.user && session.access_token ? { userId: session.user.id, accessToken: session.access_token } : null
+  }
 
   async load(): Promise<AdapterResult<StoredBoard>> {
-    const { data, error, status } = await this.client.rpc('get_private_board')
+    let response
+    try {
+      response = await this.client.rpc('get_private_board')
+    } catch (caught) {
+      return adapterError({ message: caught instanceof Error ? caught.message : String(caught) })
+    }
+    const { data, error, status } = response
     if (error) return adapterError(error, status)
     try {
       return { ok: true, value: parseStoredBoard(data) }
@@ -80,10 +127,16 @@ export class SupabaseBoardAdapter implements BoardAdapter {
     } catch (caught) {
       return { ok: false, kind: 'error', code: 'noticeInvalidState', message: caught instanceof Error ? caught.message : 'Board is invalid' }
     }
-    const { data, error, status } = await this.client.rpc('cas_save_private_board', {
-      p_expected_revision: expectedRevision,
-      p_snapshot: snapshot,
-    })
+    let response
+    try {
+      response = await this.client.rpc('cas_save_private_board', {
+        p_expected_revision: expectedRevision,
+        p_snapshot: snapshot,
+      })
+    } catch (caught) {
+      return adapterError({ message: caught instanceof Error ? caught.message : String(caught) })
+    }
+    const { data, error, status } = response
     if (error) return adapterError(error, status)
     try {
       return { ok: true, value: parseStoredBoard(data) }

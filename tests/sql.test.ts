@@ -6,14 +6,15 @@ import { addCycle, addFocusBlock, addTask, createTask, emptySnapshot, reschedule
 
 const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
+const THIRD = '00000000-0000-0000-0000-000000000003'
 
-async function database() {
+async function database(applyIndependentMigration = true) {
   const db = new PGlite()
   await db.waitReady
   await db.exec(`
     create schema auth;
     create table auth.users(id uuid primary key);
-    insert into auth.users values ('${OWNER}'), ('${OTHER}');
+    insert into auth.users values ('${OWNER}'), ('${OTHER}'), ('${THIRD}');
     create function auth.uid() returns uuid language sql stable as $$
       select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
     $$;
@@ -21,9 +22,58 @@ async function database() {
     create role authenticated;
   `)
   await db.exec(await readFile(new URL('../supabase/migrations/001_private_board.sql', import.meta.url), 'utf8'))
-  await db.exec(`insert into private.owner_config(owner_uuid) values ('${OWNER}'); select set_config('request.jwt.claim.sub', '${OWNER}', false);`)
+  if (!applyIndependentMigration) await db.exec(`insert into private.owner_config(owner_uuid) values ('${OWNER}');`)
+  if (applyIndependentMigration) await db.exec(await readFile(new URL('../supabase/migrations/002_independent_boards.sql', import.meta.url), 'utf8'))
+  await db.exec(`select set_config('request.jwt.claim.sub', '${OWNER}', false);`)
   return db
 }
+
+test('independent board migration preserves an existing user board', async () => {
+  const db = await database(false)
+  try {
+    const before = await db.query<{ revision: number; snapshot: Record<string, unknown> }>('select * from public.get_private_board()')
+    const snapshot = { ...before.rows[0].snapshot, settings: { timeZone: 'UTC' }, tasks: [{
+      id: 'legacy-task', domain: 'daily', title: 'Legacy task', note: '', checked: false, color: 'ink',
+      dateKey: '2025-01-15', history: [], createdAt: '2025-01-15T12:00:00.000Z', updatedAt: '2025-01-15T12:00:00.000Z',
+    }] }
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [before.rows[0].revision, JSON.stringify(snapshot)])
+    await db.exec(await readFile(new URL('../supabase/migrations/002_independent_boards.sql', import.meta.url), 'utf8'))
+    const after = await db.query<{ revision: number; snapshot: { tasks: Array<{ id: string }> } }>('select * from public.get_private_board()')
+    assert.equal(Number(after.rows[0].revision), 1)
+    assert.deepEqual(after.rows[0].snapshot.tasks.map((task) => task.id), ['legacy-task'])
+  } finally {
+    await db.close()
+  }
+})
+
+test('independent boards are created per authenticated user without owner provisioning', async () => {
+  const db = await database()
+  try {
+    await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OWNER}', false)`)
+    const ownerBoard = await db.query<{ revision: number; snapshot: Record<string, unknown> }>('select * from public.get_private_board()')
+    assert.equal(Number(ownerBoard.rows[0].revision), 0)
+    const ownerSnapshot = { ...ownerBoard.rows[0].snapshot, settings: { timeZone: 'UTC' }, tasks: [{
+      id: 'owner-task', domain: 'daily', title: 'Owner task', note: '', checked: false, color: 'ink',
+      dateKey: '2025-01-15', history: [], createdAt: '2025-01-15T12:00:00.000Z', updatedAt: '2025-01-15T12:00:00.000Z',
+    }] }
+    const savedOwner = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(ownerSnapshot)])
+    assert.equal(Number(savedOwner.rows[0].revision), 1)
+
+    await db.exec(`select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
+    const otherBoard = await db.query<{ revision: number; snapshot: { tasks: unknown[] } }>('select * from public.get_private_board()')
+    assert.equal(Number(otherBoard.rows[0].revision), 0)
+    assert.deepEqual(otherBoard.rows[0].snapshot.tasks, [])
+    const savedOther = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(otherBoard.rows[0].snapshot)])
+    assert.equal(Number(savedOther.rows[0].revision), 1)
+
+    await db.exec(`select set_config('request.jwt.claim.sub', '${OWNER}', false)`)
+    const ownerAgain = await db.query<{ revision: number; snapshot: { tasks: Array<{ id: string }> } }>('select * from public.get_private_board()')
+    assert.equal(Number(ownerAgain.rows[0].revision), 1)
+    assert.deepEqual(ownerAgain.rows[0].snapshot.tasks.map((task) => task.id), ['owner-task'])
+  } finally {
+    await db.close()
+  }
+})
 
 test('Supabase migration executes CAS and rejects stale or unsafe snapshots', async () => {
   const db = await database()
@@ -50,11 +100,14 @@ test('Supabase migration executes CAS and rejects stale or unsafe snapshots', as
   }
 })
 
-test('Supabase migration denies a wrong owner and direct table writes', async () => {
+test('Supabase migration rejects anonymous access and keeps direct table writes private', async () => {
   const db = await database()
   try {
     await db.exec(`select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
-    await assert.rejects(db.query('select * from public.get_private_board()'), /not authorized|owner/i)
+    const loaded = await db.query<{ revision: number }>('select * from public.get_private_board()')
+    assert.equal(Number(loaded.rows[0].revision), 0)
+    await db.exec("select set_config('request.jwt.claim.sub', '', false)")
+    await assert.rejects(db.query('select * from public.get_private_board()'), /Authentication required/i)
     await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OWNER}', false)`)
     await assert.rejects(db.query('select * from private.personal_boards'), /permission denied/i)
     await db.exec('reset role')
@@ -63,7 +116,7 @@ test('Supabase migration denies a wrong owner and direct table writes', async ()
   }
 })
 
-test('the RPCs are callable by the authenticated role and still enforce the owner check', async () => {
+test('the RPCs are callable by authenticated users and create independent boards', async () => {
   const db = await database()
   try {
     // Run as the real `authenticated` role instead of the PGlite superuser, so EXECUTE grants matter.
@@ -71,7 +124,8 @@ test('the RPCs are callable by the authenticated role and still enforce the owne
     const loaded = await db.query<{ revision: number }>('select revision from public.get_private_board()')
     assert.equal(Number(loaded.rows[0].revision), 0)
     await db.exec(`select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
-    await assert.rejects(db.query('select * from public.get_private_board()'), /not authorized|owner/i)
+    const other = await db.query<{ revision: number }>('select revision from public.get_private_board()')
+    assert.equal(Number(other.rows[0].revision), 0)
     await db.exec('reset role')
   } finally {
     await db.close()
@@ -438,22 +492,24 @@ test('SQL matches JS trim() and String.length semantics, not btrim and character
   }
 })
 
-test('RLS exposes the owner row only to the configured owner, not to every authenticated user', async () => {
+test('RLS exposes each personal board only to its own authenticated user', async () => {
   const db = await database()
   try {
+    await db.query('select * from public.get_private_board()')
+    await db.exec(`select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
     await db.query('select * from public.get_private_board()')
     // Grant table privileges INSIDE a transaction that is rolled back, so the POLICY (not a missing
     // GRANT) is what decides access. Without this the test would pass even if the policy were open.
     await db.exec('begin')
-    await db.exec('grant select, insert, update, delete on private.personal_boards to authenticated')
+    await db.exec('grant usage on schema private to authenticated, anon; grant select, insert, update, delete on private.personal_boards to authenticated, anon')
 
     const contexts: Array<[string, string | null, boolean]> = [
-      ['the configured owner', OWNER, true],
-      ['another authenticated user', OTHER, false],
+      ['the first user', OWNER, true],
+      ['the second user', OTHER, true],
       ['an anonymous session', null, false],
     ]
     for (const [label, subject, shouldSee] of contexts) {
-      await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', ${subject === null ? 'null' : `'${subject}'`}, false)`)
+      await db.exec(`set role ${subject === null ? 'anon' : 'authenticated'}; select set_config('request.jwt.claim.sub', ${subject === null ? 'null' : `'${subject}'`}, false)`)
       let rows = 0
       let blocked = false
       try {
@@ -469,29 +525,31 @@ test('RLS exposes the owner row only to the configured owner, not to every authe
         shouldSee,
         `RLS decision for ${label}: saw ${rows} row(s), blocked=${blocked}`,
       )
+      if (shouldSee) assert.equal(rows, 1, `${label} must see exactly one personal board`)
     }
 
-    // The other user must not be able to write a row of their own either: the policy's WITH CHECK
-    // ties the row to the configured owner. The write goes to OTHER (not OWNER) so a rejection can
-    // only come from the policy — inserting OWNER would also fail on the existing primary key.
-    // A policy violation aborts the transaction, so isolate it in a savepoint and undo it.
+    // The second user may update their own row.
+    await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
+    const ownUpdate = await db.query('update private.personal_boards set revision = revision + 1 where owner_uuid = $1 returning owner_uuid', [OTHER])
+    assert.equal(ownUpdate.rows.length, 1, 'a user must be able to update their own board')
+
+    // A user cannot claim a third Auth identity's row. A policy violation aborts the transaction,
+    // so isolate it in a savepoint and undo it.
     await db.exec('savepoint claim')
     await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
     let inserted = 0
     let rejection = ''
     try {
-      const result = await db.query("insert into private.personal_boards(owner_uuid, revision, snapshot) values ($1, 9, '{}'::jsonb) returning owner_uuid", [OTHER])
+      const result = await db.query("insert into private.personal_boards(owner_uuid, revision, snapshot) values ($1, 9, '{}'::jsonb) returning owner_uuid", [THIRD])
       inserted = result.rows.length
     } catch (caught) {
       rejection = caught instanceof Error ? caught.message : String(caught)
     }
     await db.exec('rollback to savepoint claim')
-    assert.equal(inserted, 0, 'another authenticated user must not insert a board row')
+    assert.equal(inserted, 0, 'a user must not insert a board row for another user')
     assert.match(rejection, /row-level security|row level security/i, `expected a policy rejection, saw: ${rejection}`)
 
-    // INSERT-as-OTHER is rejected because OTHER is not the configured owner, which is true for two
-    // different policy mistakes. Pin the specific rule with an UPDATE aimed at the OWNER's row:
-    // a policy that only compared candidate-to-config-owner would match it and change a row.
+    // A user cannot update another user's row; USING filters it out without leaking an error.
     await db.exec('savepoint claim2')
     await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
     let updated = -1
@@ -502,7 +560,7 @@ test('RLS exposes the owner row only to the configured owner, not to every authe
       updated = 0
     }
     await db.exec('rollback to savepoint claim2')
-    assert.equal(updated, 0, 'another authenticated user must not be able to update the owner row')
+    assert.equal(updated, 0, 'a user must not be able to update another personal board')
     await db.exec('rollback')
     // Outside that grant, the private tables are not reachable by clients at all: all access goes
     // through the SECURITY DEFINER RPCs.
@@ -541,7 +599,7 @@ test('the private SECURITY DEFINER helpers are unreachable from client roles', a
   const db = await database()
   try {
     for (const role of ['authenticated', 'anon']) {
-      for (const call of ['select private.assert_board_owner()', "select private.validate_board_snapshot('{}'::jsonb)"]) {
+      for (const call of ['select private.assert_authenticated_user()', "select private.validate_board_snapshot('{}'::jsonb)"]) {
         await db.exec(`set role ${role}`)
         await assert.rejects(db.query(call), /permission denied for function|permission denied for schema/i, `${role} must not call ${call}`)
         await db.exec('reset role')

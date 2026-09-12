@@ -222,6 +222,7 @@ export default function App() {
   }, [screen])
 
   const clearPrivateState = useCallback((nextScreen: Screen) => {
+    const resetDate = todayInTimeZone(safeTimeZone())
     loadTokenRef.current += 1
     saveEpochRef.current += 1
     pendingJobRef.current = null
@@ -231,7 +232,12 @@ export default function App() {
     baselineRef.current = null
     setStored(null)
     setSelectedTaskId(null)
+    selectionRef.current = { cycleId: null, date: resetDate, week: weekKey(resetDate) }
+    setSelectedCycleId(null)
+    setSelectedDate(resetDate)
+    setSelectedWeek(weekKey(resetDate))
     setDraftLabel(null)
+    setAuthError('')
     setSaveMessage('')
     setFailureKind(null)
     setSaveState('saved')
@@ -279,6 +285,19 @@ export default function App() {
     }
   }, [clearPrivateState])
 
+  const openSessionBoard = useCallback(async (cloud: SupabaseBoardAdapter, expectedUserId: string) => {
+    if (userRef.current?.id !== expectedUserId) return
+    const board = await cloud.getBoardAdapterForCurrentSession(expectedUserId)
+    if (userRef.current?.id !== expectedUserId) return
+    if (!board) {
+      clearPrivateState('auth')
+      setSaveState('error')
+      setSaveMessage('noticeSessionExpired')
+      return
+    }
+    await openBoard(board)
+  }, [clearPrivateState, openBoard])
+
   useEffect(() => {
     if (!config) return
     const cloud = createSupabaseBoardAdapter(config)
@@ -290,7 +309,7 @@ export default function App() {
       if (!alive || sessionEpoch !== 0) return
       userRef.current = nextUser
       setUser(nextUser)
-      if (nextUser) void openBoard(cloud)
+      if (nextUser) void openSessionBoard(cloud, nextUser.id)
       else setScreen('auth')
     })
     const subscription = cloud.onAuthStateChange((nextUser) => {
@@ -302,11 +321,12 @@ export default function App() {
       if (!nextUser) {
         clearPrivateState('auth')
       } else if (changed) {
-        void openBoard(cloud)
+        clearPrivateState('loading')
+        void openSessionBoard(cloud, nextUser.id)
       }
     })
     return () => { alive = false; subscription.unsubscribe() }
-  }, [config, clearPrivateState, openBoard])
+  }, [config, clearPrivateState, openSessionBoard])
 
   useEffect(() => {
     if (!stored || !boardLoadToken) return
@@ -332,6 +352,7 @@ export default function App() {
       // 否则 saveInFlightRef 永远为 true，界面卡在“保存中”且后续保存全部被跳过。
       if (thrown instanceof Error) console.warn('[taskboard]', thrown.message)
       saveInFlightRef.current = false
+      if (epoch !== saveEpochRef.current || adapterRef.current !== currentAdapter) return
       failedJobRef.current = job
       setSaveState('error')
       setSaveMessage('noticeCloudError')
@@ -385,6 +406,7 @@ export default function App() {
       if (result.kind === 'conflict') {
         const base = baselineRef.current
         const remoteBoard = await currentAdapter.load()
+        if (epoch !== saveEpochRef.current || adapterRef.current !== currentAdapter) return
         if (epoch === saveEpochRef.current && adapterRef.current === currentAdapter && remoteBoard.ok) {
           const remoteSnapshot = remoteBoard.value.snapshot
           const merged = base ? mergeSnapshots(base, retained.snapshot, remoteSnapshot) : { snapshot: remoteSnapshot, conflicts: ['__no_base__'] }
@@ -572,10 +594,12 @@ export default function App() {
       setAuthError(result.code ? t(result.code) : result.message || t('invalidCredentials'))
       return
     }
+    const changed = result.value.id !== userRef.current?.id
+    if (changed) clearPrivateState('loading')
     userRef.current = result.value
     setUser(result.value)
     setAuthPassword('')
-    await openBoard(cloud)
+    if (changed) await openSessionBoard(cloud, result.value.id)
   }
 
   const signOut = async () => {
