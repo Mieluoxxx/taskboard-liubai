@@ -107,7 +107,12 @@ test('Supabase migration rejects anonymous access and keeps direct table writes 
     const loaded = await db.query<{ revision: number }>('select * from public.get_private_board()')
     assert.equal(Number(loaded.rows[0].revision), 0)
     await db.exec("select set_config('request.jwt.claim.sub', '', false)")
-    await assert.rejects(db.query('select * from public.get_private_board()'), /Authentication required/i)
+    for (const role of ['anon', 'authenticated']) {
+      await db.exec(`set role ${role}`)
+      await assert.rejects(db.query('select * from public.get_private_board()'), /Authentication required|permission denied/i)
+      await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(emptySnapshot('UTC'))]), /Authentication required|permission denied/i)
+      await db.exec('reset role')
+    }
     await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OWNER}', false)`)
     await assert.rejects(db.query('select * from private.personal_boards'), /permission denied/i)
     await db.exec('reset role')
@@ -571,15 +576,9 @@ test('RLS exposes each personal board only to its own authenticated user', async
     // A user cannot update another user's row; USING filters it out without leaking an error.
     await db.exec('savepoint claim2')
     await db.exec(`set role authenticated; select set_config('request.jwt.claim.sub', '${OTHER}', false)`)
-    let updated = -1
-    try {
-      const result = await db.query('update private.personal_boards set revision = revision + 1 where owner_uuid = $1', [OWNER])
-      updated = result.affectedRows ?? 0
-    } catch {
-      updated = 0
-    }
+    const updated = await db.query('update private.personal_boards set revision = revision + 1 where owner_uuid = $1 returning owner_uuid', [OWNER])
     await db.exec('rollback to savepoint claim2')
-    assert.equal(updated, 0, 'a user must not be able to update another personal board')
+    assert.equal(updated.rows.length, 0, 'a user must not be able to update another personal board')
     await db.exec('rollback')
     // Outside that grant, the private tables are not reachable by clients at all: all access goes
     // through the SECURITY DEFINER RPCs.

@@ -33,6 +33,7 @@ import {
   weekKeysInRange,
   weekRange,
 } from './domain'
+import { AuthLifecycle, type AuthIdentity, type AuthTransition } from './auth-flow'
 import { copy, type CopyKey } from './i18n'
 import { BoardError, isNoticeCode, type NoticeCode } from './notices'
 import { createDemoBoardAdapter, createSupabaseBoardAdapter, getSupabaseConfig, type SupabaseBoardAdapter } from './storage'
@@ -72,6 +73,7 @@ type DraftOrigin =
   | { kind: 'focus'; input: FocusInput; blockId?: string }
 
 type PendingJob = { expectedRevision: number; snapshot: BoardSnapshot; draft: string | null; origin?: DraftOrigin }
+type AuthLoad = { userId: string; generation: number; promise: Promise<void> }
 
 function readLanguage(): Language {
   try {
@@ -146,14 +148,14 @@ export default function App() {
   const config = useMemo(() => getSupabaseConfig(), [])
   const [language, setLanguage] = useState<Language>(readLanguage)
   const [screen, setScreen] = useState<Screen>(config ? 'auth' : 'setup')
+  const screenRef = useRef<Screen>(screen)
   const [adapter, setAdapter] = useState<BoardAdapter | null>(null)
   const adapterRef = useRef<BoardAdapter | null>(null)
   const cloudRef = useRef<SupabaseBoardAdapter | null>(null)
-  const authGenerationRef = useRef(0)
-  const authAttemptRef = useRef(0)
-  const authLoadGenerationRef = useRef<number | null>(null)
-  const [user, setUser] = useState<{ id: string; email?: string } | null>(null)
-  const userRef = useRef<{ id: string; email?: string } | null>(null)
+  const [authLifecycle] = useState(() => new AuthLifecycle())
+  const authLoadRef = useRef<AuthLoad | null>(null)
+  const [user, setUser] = useState<AuthIdentity | null>(null)
+  const userRef = useRef<AuthIdentity | null>(null)
   const [authEmail, setAuthEmail] = useState('')
   const [authPassword, setAuthPassword] = useState('')
   const [authBusy, setAuthBusy] = useState(false)
@@ -203,6 +205,7 @@ export default function App() {
   }, [applySelection])
 
   useEffect(() => { persistLanguage(language) }, [language])
+  useEffect(() => { screenRef.current = screen }, [screen])
   useEffect(() => {
     document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'
     document.title = copy[language].documentTitle
@@ -240,7 +243,6 @@ export default function App() {
     setSelectedDate(resetDate)
     setSelectedWeek(weekKey(resetDate))
     setDraftLabel(null)
-    setAuthBusy(false)
     setAuthError('')
     setSaveMessage('')
     setFailureKind(null)
@@ -249,7 +251,7 @@ export default function App() {
     setScreen(nextScreen)
   }, [])
 
-  const openBoard = useCallback(async (nextAdapter: BoardAdapter, nextScreen: Screen = 'workspace', expectedAuthGeneration = authGenerationRef.current) => {
+  const openBoard = useCallback(async (nextAdapter: BoardAdapter, nextScreen: Screen = 'workspace', expectedAuthGeneration = authLifecycle.generation()) => {
     const token = ++loadTokenRef.current
     saveEpochRef.current += 1
     setAdapter(nextAdapter)
@@ -261,7 +263,7 @@ export default function App() {
     failedJobRef.current = null
     setDraftLabel(null)
     const result = await nextAdapter.load()
-    if (token !== loadTokenRef.current || expectedAuthGeneration !== authGenerationRef.current) return
+    if (token !== loadTokenRef.current || !authLifecycle.isCurrent(expectedAuthGeneration)) return
     if (!result.ok) {
       setSaveState(result.kind === 'offline' ? 'offline' : 'error')
       if (result.message) console.warn('[taskboard]', result.message)
@@ -287,22 +289,45 @@ export default function App() {
       setSaveState('error')
       setSaveMessage(message)
     }
-  }, [clearPrivateState])
+  }, [authLifecycle, clearPrivateState])
 
-  const openSessionBoard = useCallback(async (cloud: SupabaseBoardAdapter, expectedUserId: string, expectedAuthGeneration = authGenerationRef.current) => {
-    if (userRef.current?.id !== expectedUserId || expectedAuthGeneration !== authGenerationRef.current) return
-    if (authLoadGenerationRef.current === expectedAuthGeneration) return
-    authLoadGenerationRef.current = expectedAuthGeneration
-    const board = await cloud.getBoardAdapterForCurrentSession(expectedUserId)
-    if (userRef.current?.id !== expectedUserId || expectedAuthGeneration !== authGenerationRef.current) return
-    if (!board) {
-      clearPrivateState('auth')
-      setSaveState('error')
-      setSaveMessage('noticeSessionExpired')
+  const openSessionBoard = useCallback(async (cloud: SupabaseBoardAdapter, expectedUserId: string, expectedAuthGeneration = authLifecycle.generation()) => {
+    if (userRef.current?.id !== expectedUserId || !authLifecycle.isCurrent(expectedAuthGeneration)) return
+    const activeLoad = authLoadRef.current
+    if (activeLoad?.userId === expectedUserId && activeLoad.generation === expectedAuthGeneration) {
+      await activeLoad.promise
       return
     }
-    await openBoard(board, 'workspace', expectedAuthGeneration)
-  }, [clearPrivateState, openBoard])
+    const promise = (async () => {
+      const board = await cloud.getBoardAdapterForCurrentSession(expectedUserId)
+      if (userRef.current?.id !== expectedUserId || !authLifecycle.isCurrent(expectedAuthGeneration)) return
+      if (!board) {
+        clearPrivateState('auth')
+        setSaveState('error')
+        setSaveMessage('noticeSessionExpired')
+        return
+      }
+      await openBoard(board, 'workspace', expectedAuthGeneration)
+    })()
+    authLoadRef.current = { userId: expectedUserId, generation: expectedAuthGeneration, promise }
+    try {
+      await promise
+    } finally {
+      if (authLoadRef.current?.promise === promise) authLoadRef.current = null
+    }
+  }, [authLifecycle, clearPrivateState, openBoard])
+
+  const applyAuthTransition = useCallback((cloud: SupabaseBoardAdapter | null, transition: AuthTransition) => {
+    userRef.current = transition.user
+    setUser(transition.user)
+    setAuthBusy(false)
+    if (!transition.user) {
+      clearPrivateState('auth')
+      return
+    }
+    if (transition.shouldClear) clearPrivateState(transition.shouldClear)
+    if (transition.shouldLoad && cloud) void openSessionBoard(cloud, transition.user.id, transition.generation)
+  }, [clearPrivateState, openSessionBoard])
 
   useEffect(() => {
     if (!config) return
@@ -311,30 +336,18 @@ export default function App() {
     let alive = true
     // 初始 session 查询可能晚于 auth 事件返回；用 epoch 保证过期的初始结果不会覆盖更新的登录状态。
     let sessionEpoch = 0
-    const initialGeneration = authGenerationRef.current
+    const initialGeneration = authLifecycle.generation()
     void cloud.getSessionUser().then((nextUser) => {
-      if (!alive || sessionEpoch !== 0 || initialGeneration !== authGenerationRef.current) return
-      userRef.current = nextUser
-      setUser(nextUser)
-      if (nextUser) void openSessionBoard(cloud, nextUser.id, initialGeneration)
-      else setScreen('auth')
+      if (!alive || sessionEpoch !== 0 || !authLifecycle.isCurrent(initialGeneration)) return
+      applyAuthTransition(cloud, authLifecycle.accept(userRef.current, nextUser, screenRef.current, Boolean(storedRef.current), false))
     })
     const subscription = cloud.onAuthStateChange((nextUser) => {
       if (!alive) return
       sessionEpoch += 1
-      const changed = nextUser?.id !== userRef.current?.id
-      const generation = changed ? ++authGenerationRef.current : authGenerationRef.current
-      userRef.current = nextUser
-      setUser(nextUser)
-      if (!nextUser) {
-        clearPrivateState('auth')
-      } else if (changed) {
-        clearPrivateState('loading')
-        void openSessionBoard(cloud, nextUser.id, generation)
-      }
+      applyAuthTransition(cloud, authLifecycle.receiveAuthEvent(userRef.current, nextUser, screenRef.current, Boolean(storedRef.current)))
     })
-    return () => { alive = false; subscription.unsubscribe() }
-  }, [config, clearPrivateState, openSessionBoard])
+    return () => { alive = false; authLifecycle.invalidate(); subscription.unsubscribe() }
+  }, [applyAuthTransition, authLifecycle, config])
 
   useEffect(() => {
     if (!stored || !boardLoadToken) return
@@ -554,9 +567,13 @@ export default function App() {
   const reopenDraft = useCallback(async () => {
     const origin = failedJobRef.current?.origin
     if (!origin) { setFlash(copy[language].noRetainedInput); return }
+    const generation = authLifecycle.generation()
+    const expectedAdapter = adapterRef.current
+    const expectedUserId = userRef.current?.id
     // 只有真正换上新板才继续：刷新失败（离线/错误）或会话已变时中止，避免在过期版本上继续编辑。
     const reloaded = await reloadLatest(true)
     if (!reloaded) return
+    if (!authLifecycle.isCurrent(generation) || adapterRef.current !== expectedAdapter || userRef.current?.id !== expectedUserId) return
     const board = storedRef.current?.snapshot
     if (!board) return
     if (origin.kind === 'reorder') {
@@ -594,35 +611,29 @@ export default function App() {
     event.preventDefault()
     const cloud = cloudRef.current
     if (!cloud || !authEmail.trim() || !authPassword) return
-    const generation = ++authGenerationRef.current
-    const attempt = ++authAttemptRef.current
+    const attempt = authLifecycle.beginLogin()
     setAuthBusy(true)
     setAuthError('')
     const result = await cloud.signIn(authEmail.trim(), authPassword)
-    if (attempt !== authAttemptRef.current || generation !== authGenerationRef.current) return
+    if (!authLifecycle.isLoginCurrent(attempt)) return
     setAuthBusy(false)
     if (!result.ok) {
       setAuthError(result.code ? t(result.code) : result.message || t('invalidCredentials'))
       return
     }
-    const changed = result.value.id !== userRef.current?.id
-    const shouldLoad = changed || screen !== 'workspace' || !storedRef.current
-    if (changed) clearPrivateState('loading')
-    userRef.current = result.value
-    setUser(result.value)
+    const transition = authLifecycle.completeLogin(attempt, userRef.current, result.value, screenRef.current, Boolean(storedRef.current))
+    if (!transition) return
+    applyAuthTransition(cloud, transition)
     setAuthPassword('')
-    if (shouldLoad) await openSessionBoard(cloud, result.value.id, generation)
   }
 
   const signOut = async () => {
     const cloud = cloudRef.current
-    const generation = ++authGenerationRef.current
-    authAttemptRef.current += 1
+    const generation = authLifecycle.invalidate()
     if (cloud) await cloud.signOut()
-    if (generation !== authGenerationRef.current) return
-    userRef.current = null
-    setUser(null)
-    clearPrivateState(config ? 'auth' : 'setup')
+    if (!authLifecycle.isCurrent(generation)) return
+    setAuthBusy(false)
+    applyAuthTransition(cloud, { user: null, changed: true, generation, shouldClear: 'auth', shouldLoad: false })
   }
 
   useEffect(() => {

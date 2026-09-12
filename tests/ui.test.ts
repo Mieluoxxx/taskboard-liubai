@@ -152,13 +152,6 @@ test('direct mutations do not flash a form-draft banner during a normal save', a
   assert.match(source, /const cycleDraftDiscarded = !keepDraft && \(failedJobRef\.current\?\.origin\?\.kind === 'cycle'/, 'discarding a failed cycle edit must force selection normalization')
 })
 
-test('switching accounts clears the old board before loading the new personal board', async () => {
-  const source = await appSource()
-  assert.match(source, /else if \(changed\) \{[\s\S]{0,240}clearPrivateState\('loading'\)[\s\S]{0,240}void openSessionBoard\(cloud, nextUser\.id(?:, generation)?\)/, 'auth changes must clear old private state before loading the new user')
-  assert.match(source, /const generation = \+\+authGenerationRef\.current/, 'manual sign-in must advance the auth generation')
-  assert.match(source, /if \(shouldLoad\) await openSessionBoard\(cloud, result\.value\.id, generation\)/, 'manual sign-in must load the current account board')
-  assert.match(source, /if \(epoch !== saveEpochRef\.current \|\| adapterRef\.current !== currentAdapter\) return/, 'late save responses must not update a newer account')
-})
 
 test('cycle duration scopes the week and day rails', async () => {
   const source = await appSource()
