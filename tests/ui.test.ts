@@ -99,6 +99,30 @@ test('fonts are self-hosted Maple Mono CN, preloaded in core-only size and lazil
   await readFile(new URL('../public/fonts/LICENSE-maple-mono.txt', import.meta.url), 'utf8')
 })
 
+test('the space left by the removed add buttons is used for "back to this week / today"', async () => {
+  const source = await appSource()
+  const css = await cssSource()
+  const weekRail = source.slice(source.indexOf('function WeekRail'), source.indexOf('function DayRail'))
+  const dayRail = source.slice(source.indexOf('function DayRail'), source.indexOf('function PastSuggestions'))
+
+  // 两个轨道都提供回到当前周期的跳转，并复用同一个按钮样式
+  assert.match(weekRail, /className="rail-return"[^>]*onClick=\{onGoCurrent\}/, 'the week rail needs a back-to-this-week control')
+  assert.match(weekRail, /t\('backToCurrentWeek'\)/, 'and it must be labelled through the dictionary')
+  assert.match(dayRail, /className="rail-return"[^>]*onClick=\{onGoToday\}/, 'the day rail needs a back-to-today control')
+  assert.match(dayRail, /t\('backToCurrentDay'\)/, 'and it must be labelled through the dictionary')
+  assert.match(css, /\.rail-return\b/, 'rail-return needs a style')
+
+  // 已经处在当前周期时不显示，避免无意义的按钮（用 offCurrent / offToday 控制）
+  assert.match(weekRail, /const offCurrent = selectedWeek !== currentWeek/, 'the week rail must know when it is off the current week')
+  assert.match(weekRail, /offCurrent \? <button className="rail-return"/, 'the week control only shows when off the current week')
+  assert.match(dayRail, /const offToday = selectedDate !== todayKey/, 'the day rail must know when it is off today')
+  assert.match(dayRail, /offToday \? <button className="rail-return"/, 'the day control only shows when off today')
+
+  // 调用处：回到本周同时切换周与日（与点周条目一致）；回到今天只切日期，由它顺带把周带过去
+  assert.match(source, /onGoCurrent=\{\(\) => \{ setSelectedWeek\(currentWeekKey\); setSelectedDate\(weekRange\(currentWeekKey\)\.start\) \}\}/, 'back-to-this-week must also move the selected date into that week')
+  assert.equal((source.match(/onGoToday=\{\(\) => setDate\(todayKey\)\}/g) || []).length, 2, 'both day rails (daily and focus) must offer back-to-today')
+})
+
 test('each panel offers exactly one add entry, so no action is duplicated', async () => {
   const source = await appSource()
   // 周与日是固定的日历周期，不存在“新建周/新建日”：它们的周期轨道上不能有添加按钮，
