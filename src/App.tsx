@@ -299,15 +299,23 @@ export default function App() {
       return
     }
     const promise = (async () => {
-      const board = await cloud.getBoardAdapterForCurrentSession(expectedUserId)
-      if (userRef.current?.id !== expectedUserId || !authLifecycle.isCurrent(expectedAuthGeneration)) return
-      if (!board) {
-        clearPrivateState('auth')
+      try {
+        const board = await cloud.getBoardAdapterForCurrentSession(expectedUserId)
+        if (userRef.current?.id !== expectedUserId || !authLifecycle.isCurrent(expectedAuthGeneration)) return
+        if (!board) {
+          clearPrivateState('auth')
+          setSaveState('error')
+          setSaveMessage('noticeSessionExpired')
+          return
+        }
+        await openBoard(board, 'workspace', expectedAuthGeneration)
+      } catch (caught) {
+        if (userRef.current?.id !== expectedUserId || !authLifecycle.isCurrent(expectedAuthGeneration)) return
+        if (caught instanceof Error) console.warn('[taskboard]', caught.message)
         setSaveState('error')
-        setSaveMessage('noticeSessionExpired')
-        return
+        setSaveMessage('noticeCloudError')
+        setScreen('auth')
       }
-      await openBoard(board, 'workspace', expectedAuthGeneration)
     })()
     authLoadRef.current = { userId: expectedUserId, generation: expectedAuthGeneration, promise }
     try {
@@ -611,13 +619,15 @@ export default function App() {
     event.preventDefault()
     const cloud = cloudRef.current
     if (!cloud || !authEmail.trim() || !authPassword) return
-    const attempt = authLifecycle.beginLogin()
+    const attempt = authLifecycle.beginLogin(userRef.current?.id || null, authEmail.trim())
+    if (attempt === null) return
     setAuthBusy(true)
     setAuthError('')
     const result = await cloud.signIn(authEmail.trim(), authPassword)
     if (!authLifecycle.isLoginCurrent(attempt)) return
-    setAuthBusy(false)
     if (!result.ok) {
+      authLifecycle.finishLogin(attempt)
+      setAuthBusy(false)
       setAuthError(result.code ? t(result.code) : result.message || t('invalidCredentials'))
       return
     }
@@ -629,9 +639,16 @@ export default function App() {
 
   const signOut = async () => {
     const cloud = cloudRef.current
-    const generation = authLifecycle.invalidate()
-    if (cloud) await cloud.signOut()
+    const generation = authLifecycle.beginLogout()
+    if (generation === null) return
+    const result = cloud ? await cloud.signOut() : { ok: true as const, value: undefined }
     if (!authLifecycle.isCurrent(generation)) return
+    if (!authLifecycle.finishLogout(generation)) return
+    if (!result.ok) {
+      setSaveState(result.kind === 'offline' ? 'offline' : 'error')
+      setSaveMessage(noticeText(result, 'noticeCloudError'))
+      return
+    }
     setAuthBusy(false)
     applyAuthTransition(cloud, { user: null, changed: true, generation, shouldClear: 'auth', shouldLoad: false })
   }

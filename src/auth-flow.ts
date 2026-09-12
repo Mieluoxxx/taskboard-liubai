@@ -16,6 +16,8 @@ export interface AuthTransition {
 export class AuthLifecycle {
   private authGeneration = 0
   private loginAttempt = 0
+  private activeCommand: 'login' | 'logout' | null = null
+  private activeLogin: { attempt: number; userId: string | null; email: string } | null = null
 
   generation(): number {
     return this.authGeneration
@@ -25,21 +27,59 @@ export class AuthLifecycle {
     return generation === this.authGeneration
   }
 
-  beginLogin(): number {
-    return ++this.loginAttempt
+  beginLogin(currentUserId: string | null, email: string): number | null {
+    if (this.activeCommand) return null
+    const attempt = ++this.loginAttempt
+    this.activeCommand = 'login'
+    this.activeLogin = { attempt, userId: currentUserId, email: email.trim().toLowerCase() }
+    return attempt
   }
 
   isLoginCurrent(attempt: number): boolean {
-    return attempt === this.loginAttempt
+    return this.activeLogin?.attempt === attempt
+  }
+
+  finishLogin(attempt: number): boolean {
+    if (!this.isLoginCurrent(attempt) || this.activeCommand !== 'login') return false
+    this.activeLogin = null
+    this.activeCommand = null
+    return true
+  }
+
+  beginLogout(): number | null {
+    if (this.activeCommand) return null
+    this.loginAttempt += 1
+    this.activeCommand = 'logout'
+    return ++this.authGeneration
+  }
+
+  finishLogout(generation: number): boolean {
+    if (this.activeCommand !== 'logout') return false
+    this.activeCommand = null
+    return this.isCurrent(generation)
   }
 
   invalidate(): number {
     this.loginAttempt += 1
+    this.activeCommand = null
+    this.activeLogin = null
     return ++this.authGeneration
   }
 
   receiveAuthEvent(current: AuthIdentity | null, next: AuthIdentity | null, screen: AuthScreen, hasBoard: boolean): AuthTransition {
-    if (current?.id !== next?.id) this.loginAttempt += 1
+    const changed = current?.id !== next?.id
+    const activeLogin = this.activeLogin
+    const belongsToLogin = Boolean(
+      changed && activeLogin &&
+      ((activeLogin.userId === null && current === null && next?.email?.toLowerCase() === activeLogin.email) || activeLogin.userId === next?.id),
+    )
+    if (this.activeCommand === 'logout' && !next) this.activeCommand = null
+    else if (belongsToLogin && next) this.activeLogin!.userId = next.id
+    else if (changed) {
+      this.loginAttempt += 1
+      this.activeCommand = null
+      this.activeLogin = null
+    }
     return this.accept(current, next, screen, hasBoard, false)
   }
 
@@ -57,6 +97,8 @@ export class AuthLifecycle {
 
   completeLogin(attempt: number, current: AuthIdentity | null, next: AuthIdentity, screen: AuthScreen, hasBoard: boolean): AuthTransition | null {
     if (!this.isLoginCurrent(attempt)) return null
-    return this.accept(current, next, screen, hasBoard, true)
+    this.activeLogin = null
+    this.activeCommand = null
+    return this.accept(current, next, screen, hasBoard, false)
   }
 }
