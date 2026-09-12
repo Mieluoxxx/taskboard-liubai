@@ -705,18 +705,18 @@ export default function App() {
           <TaskPanel
             panelRef={panelRef(1)} domain="weekly" title={t('weekly')} hint={t('weeklyHint')} language={language} t={t}
             tasks={panelTasks('weekly')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} language={language} t={t} onSelect={(key) => { setSelectedWeek(key); setSelectedDate(weekRange(key).start) }} onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} />}
+            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} language={language} t={t} onSelect={(key) => { setSelectedWeek(key); setSelectedDate(weekRange(key).start) }} />}
             canAdd onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} />
           <TaskPanel
             panelRef={panelRef(2)} domain="daily" title={`${t('daily')} · ${weekdayLabel(selectedDate, language)}`} hint={t('dailyHint')} language={language} t={t}
             tasks={panelTasks('daily')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} language={language} t={t} onSelect={setDate} onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} language={language} t={t} onSelect={setDate} />}
             canAdd onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'daily' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'daily', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
           <FocusPanel
             panelRef={panelRef(3)} blocks={snapshot.focusBlocks.filter((block) => block.dateKey === selectedDate)} allTasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} now={now}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} language={language} t={t} onSelect={setDate} onAdd={() => setDialog({ kind: 'focus' })} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} language={language} t={t} onSelect={setDate} />}
             onAdd={() => setDialog({ kind: 'focus' })} onEdit={(block) => setDialog({ kind: 'focus', block })} onDelete={deleteFocusWithConfirm} onCommand={focusCommand}
           />
         </div>
@@ -828,23 +828,25 @@ function CycleRail({ cycles, selectedId, language, t, onSelect, onAdd, onEdit }:
   return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('cycles')}</div><div className="rail-items">{cycles.map((cycle) => <div className="rail-item-wrap" key={cycle.id}><button className={`rail-item ${selectedId === cycle.id ? 'selected' : ''}`} aria-current={selectedId === cycle.id ? 'page' : undefined} onClick={() => onSelect(cycle.id)}><span>{cycle.name}</span><small>{cycle.startDate.slice(5)}</small></button>{selectedId === cycle.id ? <button className="rail-edit" aria-label={t('editCycle')} onClick={() => onEdit(cycle)}><Icon name="edit" /></button> : null}</div>)}</div><button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('addCycle')}</button></aside>
 }
 
-function WeekRail({ selectedWeek, currentWeek, language, t, onSelect, onAdd }: { selectedWeek: string; currentWeek: string; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void; onAdd: () => void }) {
+// 周、日都是固定的日历周期（ISO 周与自然日），不存在“新建周/新建日”，
+// 因此 rail 上不再放添加按钮：添加周任务/日任务由面板自身的按钮承担，避免同一个动作出现两个入口。
+function WeekRail({ selectedWeek, currentWeek, language, t, onSelect }: { selectedWeek: string; currentWeek: string; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void }) {
   const start = weekRange(selectedWeek).start
   const weeks = [-2, -1, 0, 1, 2].map((offset) => weekKey(addDays(start, offset * 7)))
   return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className="rail-items">{weeks.map((key) => {
     const isCurrent = key === currentWeek
     return <button className={`rail-item ${selectedWeek === key ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}`} aria-current={selectedWeek === key ? 'page' : undefined} aria-label={isCurrent ? `${key.slice(5)} · ${t('currentWeek')}` : key.slice(5)} key={key} onClick={() => onSelect(key)}><span>{key.slice(5)}{isCurrent ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{weekRange(key).start.slice(5)}</small></button>
-  })}</div><div className="rail-hint">{t('currentWeek')}</div><button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('add')}</button></aside>
+  })}</div><div className="rail-hint">{t('currentWeek')}</div></aside>
 }
 
-function DayRail({ selectedDate, selectedWeek, todayKey, language, t, onSelect, onAdd }: { selectedDate: string; selectedWeek: string; todayKey: string; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void; onAdd: () => void }) {
+function DayRail({ selectedDate, selectedWeek, todayKey, language, t, onSelect }: { selectedDate: string; selectedWeek: string; todayKey: string; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void }) {
   const range = weekRange(selectedWeek)
   const days = Array.from({ length: 7 }, (_, index) => addDays(range.start, index))
   return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className="rail-items">{days.map((date) => {
     const isToday = date === todayKey
     const label = weekdayShortLabel(date, language)
     return <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(8)} · ${t('currentDay')}` : `${label} ${date.slice(8)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(8)}</small></button>
-  })}</div><div className="rail-hint">{t('currentDay')}</div><button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('add')}</button></aside>
+  })}</div><div className="rail-hint">{t('currentDay')}</div></aside>
 }
 
 function PastSuggestions({ tasks, language, t, onReschedule }: { tasks: Task[]; language: Language; t: (key: CopyKey) => string; onReschedule: (task: Task) => void }) {

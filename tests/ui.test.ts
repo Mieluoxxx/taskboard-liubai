@@ -98,3 +98,31 @@ test('fonts are self-hosted Maple Mono CN, preloaded in core-only size and lazil
   // 且必须声明许可（OFL 要求随字体分发许可文本）
   await readFile(new URL('../public/fonts/LICENSE-maple-mono.txt', import.meta.url), 'utf8')
 })
+
+test('each panel offers exactly one add entry, so no action is duplicated', async () => {
+  const source = await appSource()
+  // 周与日是固定的日历周期，不存在“新建周/新建日”：它们的周期轨道上不能有添加按钮，
+  // 否则会与面板自身的「添加任务」重复（同一动作两个入口）。
+  const weekRail = source.slice(source.indexOf('function WeekRail'), source.indexOf('function DayRail'))
+  const dayRail = source.slice(source.indexOf('function DayRail'), source.indexOf('function PastSuggestions'))
+  assert.doesNotMatch(weekRail, /rail-add/, 'the week rail must not offer an add button')
+  assert.doesNotMatch(dayRail, /rail-add/, 'the day rail must not offer an add button')
+  assert.doesNotMatch(weekRail, /onAdd/, 'WeekRail should not even accept an onAdd prop')
+  assert.doesNotMatch(dayRail, /onAdd/, 'DayRail should not even accept an onAdd prop')
+
+  // 周期轨道保留「新周期」——它是另一件事（新建周期），不是重复的添加任务
+  const cycleRail = source.slice(source.indexOf('function CycleRail'), source.indexOf('function WeekRail'))
+  assert.match(cycleRail, /rail-add/, 'the cycle rail keeps its own "new cycle" action')
+  assert.match(cycleRail, /addCycle/, 'and that action is labelled as creating a cycle')
+
+  // 四个面板都仍然各有唯一的添加入口
+  for (const domain of ['long', 'weekly', 'daily']) {
+    const calls = source.match(new RegExp(`onAdd=\\{\\(\\) => setDialog\\(\\{ kind: 'task', domain: '${domain}'`, 'g')) || []
+    assert.equal(calls.length, 1, `${domain} panel must have exactly one add action, saw ${calls.length}`)
+  }
+  const focusCalls = source.match(/onAdd=\{\(\) => setDialog\(\{ kind: 'focus' \}\)\}/g) || []
+  assert.equal(focusCalls.length, 1, `the focus panel must have exactly one add action, saw ${focusCalls.length}`)
+  // 调用处不得再给周/日轨道传 onAdd
+  assert.doesNotMatch(source, /<WeekRail[^>]*onAdd=/, 'WeekRail call site must not pass onAdd')
+  assert.equal((source.match(/<DayRail[^>]*onAdd=/g) || []).length, 0, 'DayRail call sites must not pass onAdd')
+})
