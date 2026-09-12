@@ -59,6 +59,8 @@ type TaskInput = {
   parentId?: string
 }
 
+type SelectionState = { cycleId: string | null; date: string; week: string }
+
 type FocusInput = { title: string; durationMinutes: string; taskId?: string }
 
 // 失败变更除了快照，还要记住它来自哪个表单与输入值：
@@ -175,6 +177,7 @@ export default function App() {
   const [selectedCycleId, setSelectedCycleId] = useState<string | null>(null)
   const [selectedWeek, setSelectedWeek] = useState(() => weekKey(todayInTimeZone(safeTimeZone())))
   const [selectedDate, setSelectedDate] = useState(() => todayInTimeZone(safeTimeZone()))
+  const selectionRef = useRef<SelectionState>({ cycleId: null, date: selectedDate, week: selectedWeek })
   const [now, setNow] = useState(() => Date.now())
   const workspaceScrollRef = useRef<HTMLDivElement | null>(null)
   const [stageElement, setStageElement] = useState<HTMLDivElement | null>(null)
@@ -185,12 +188,16 @@ export default function App() {
   const t = useCallback((key: CopyKey) => copy[language][key], [language])
   // 保存提示可能是 notice code（可本地化），也可能是无 code 的诊断文本。
   const noticeLabel = useCallback((value: string) => (isNoticeCode(value) ? copy[language][value] : value), [language])
-  const reconcileSelection = useCallback((nextSnapshot: BoardSnapshot, preferredCycleId: string | null, preferredDate: string) => {
-    const selection = selectionForSnapshot(nextSnapshot, preferredCycleId, preferredDate)
+  const applySelection = useCallback((selection: SelectionState) => {
+    selectionRef.current = selection
     setSelectedCycleId(selection.cycleId)
     setSelectedDate(selection.date)
     setSelectedWeek(selection.week)
   }, [])
+  const reconcileSelection = useCallback((nextSnapshot: BoardSnapshot, preferredCycleId = selectionRef.current.cycleId, preferredDate = selectionRef.current.date) => {
+    const selection = selectionForSnapshot(nextSnapshot, preferredCycleId, preferredDate)
+    applySelection(selection)
+  }, [applySelection])
 
   useEffect(() => { persistLanguage(language) }, [language])
   useEffect(() => {
@@ -349,7 +356,7 @@ export default function App() {
         pendingJobRef.current = nextPending
         storedRef.current = merged
         setStored(merged)
-        if (cycleRangesChanged) reconcileSelection(current.snapshot, selectedCycleId, selectedDate)
+        if (cycleRangesChanged) reconcileSelection(current.snapshot)
         setSaveState('pending')
         setSaveMessage('')
         setFailureKind(null)
@@ -359,7 +366,7 @@ export default function App() {
         storedRef.current = result.value
         baselineRef.current = cloneSnapshot(result.value.snapshot)
         setStored(result.value)
-        if (cycleRangesChanged) reconcileSelection(result.value.snapshot, selectedCycleId, selectedDate)
+        if (cycleRangesChanged) reconcileSelection(result.value.snapshot)
         setSaveState('saved')
         setSaveMessage('')
         setFailureKind(null)
@@ -386,7 +393,7 @@ export default function App() {
             baselineRef.current = cloneSnapshot(remoteSnapshot)
             storedRef.current = { revision: remoteBoard.value.revision, snapshot: merged.snapshot }
             setStored(storedRef.current)
-            if (cycleRangesChanged) reconcileSelection(merged.snapshot, selectedCycleId, selectedDate)
+            if (cycleRangesChanged) reconcileSelection(merged.snapshot)
             const mergeJob: PendingJob = { expectedRevision: remoteBoard.value.revision, snapshot: merged.snapshot, draft: retained.draft, origin: retained.origin }
             pendingJobRef.current = mergeJob
             failedJobRef.current = null
@@ -407,7 +414,7 @@ export default function App() {
       setFailureKind(result.kind === 'conflict' ? 'conflict' : null)
       setDraftLabel(retained.draft)
     }
-  }, [clearPrivateState, language, reconcileSelection, selectedCycleId, selectedDate])
+  }, [clearPrivateState, language, reconcileSelection])
   drainRef.current = drainSave
 
   const commitSnapshot = useCallback((next: BoardSnapshot, draft: string | null = null, origin?: DraftOrigin): boolean => {
@@ -465,21 +472,22 @@ export default function App() {
       return false
     }
     // 冲突时用户若选择“保留草稿”，失败的那次快照要留着，否则草稿只剩一个标题字符串，改动等于丢失。
+    const cycleDraftDiscarded = !keepDraft && (failedJobRef.current?.origin?.kind === 'cycle' || pendingJobRef.current?.origin?.kind === 'cycle')
     const retained = keepDraft ? (failedJobRef.current || pendingJobRef.current) : null
-    const cycleRangesChanged = cycleRangesDiffer(baselineRef.current, safeBoard.snapshot) || !safeBoard.snapshot.cycles.some((cycle) => cycle.id === selectedCycleId)
+    const cycleRangesChanged = cycleDraftDiscarded || cycleRangesDiffer(baselineRef.current, safeBoard.snapshot) || !safeBoard.snapshot.cycles.some((cycle) => cycle.id === selectionRef.current.cycleId)
     pendingJobRef.current = null
     failedJobRef.current = retained
     storedRef.current = safeBoard
     baselineRef.current = cloneSnapshot(safeBoard.snapshot)
     setStored(safeBoard)
-    if (cycleRangesChanged) reconcileSelection(safeBoard.snapshot, selectedCycleId, selectedDate)
+    if (cycleRangesChanged) reconcileSelection(safeBoard.snapshot)
     setSaveState(retained ? 'error' : 'saved')
     setSaveMessage(retained ? 'noticeReapplyDraft' : '')
     setFailureKind(retained ? 'conflict' : null)
     if (!keepDraft) setDraftLabel(null)
     else setDraftLabel(existingDraft)
     return true
-  }, [clearPrivateState, draftLabel, language, reconcileSelection, selectedCycleId, selectedDate])
+  }, [clearPrivateState, draftLabel, language, reconcileSelection])
 
   const retrySave = useCallback(() => {
     // 若已有更新的待保存变更，保留它；重试只补上失败的那次，不能用旧快照覆盖新改动。
@@ -664,7 +672,7 @@ export default function App() {
       if (commitSnapshot(next, `${t('cycle')}: ${input.name}`, { kind: 'cycle', input, cycleId: existing?.id })) {
         const created = next.cycles.find((cycle) => !existing && cycle.name === input.name.trim())
         const nextCycleId = existing?.id || created?.id || selectedCycleId
-        reconcileSelection(next, nextCycleId, selectedDate)
+        reconcileSelection(next, nextCycleId, selectionRef.current.date)
         setDialog(null)
       }
     } catch (caught) {
@@ -712,16 +720,14 @@ export default function App() {
 
   const snapshot = stored.snapshot
   const selectedCycle = snapshot.cycles.find((cycle) => cycle.id === selectedCycleId) || snapshot.cycles[0]
-  const selectCycle = (cycleId: string) => reconcileSelection(snapshot, cycleId, selectedDate)
+  const selectCycle = (cycleId: string) => reconcileSelection(snapshot, cycleId, selectionRef.current.date)
   const selectWeek = (key: string) => {
-    const date = dateForWeek(key, selectedCycle, selectedDate)
-    setSelectedWeek(key)
-    setSelectedDate(date)
+    const date = dateForWeek(key, selectedCycle, selectionRef.current.date)
+    applySelection({ cycleId: selectedCycle?.id || null, date, week: key })
   }
   const setDate = (date: string, allowOutsideCycle = false) => {
     const nextDate = !allowOutsideCycle && selectedCycle ? clampDate(date, selectedCycle.startDate, selectedCycle.endDate) : date
-    setSelectedDate(nextDate)
-    setSelectedWeek(weekKey(nextDate))
+    applySelection({ cycleId: selectedCycle?.id || null, date: nextDate, week: weekKey(nextDate) })
   }
   const panelRef = (index: number) => (element: HTMLElement | null) => { panelRefs.current[index] = element }
   const registerRow = (id: string) => (element: HTMLElement | null) => {
@@ -906,13 +912,20 @@ function CycleRail({ cycles, selectedId, language, t, onSelect, onAdd, onEdit }:
 // 周、日的导航范围来自选中的长期周期；没有周期时保留独立的当前窗口，方便空板继续使用。
 const RAIL_ROW_HEIGHT = 52
 const RAIL_VIEW_HEIGHT = 480
-const RAIL_VIRTUAL_THRESHOLD = 20
+const RAIL_VIRTUAL_THRESHOLD = 9
 const RAIL_OVERSCAN = 4
 
 function useRailWindow<T>(items: T[], selectedIndex: number) {
   const railRef = useRef<HTMLDivElement | null>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const virtual = items.length > RAIL_VIRTUAL_THRESHOLD
+  useLayoutEffect(() => {
+    if (!railRef.current) return
+    const rail = railRef.current
+    const clamped = Math.min(rail.scrollTop, Math.max(0, rail.scrollHeight - rail.clientHeight))
+    if (rail.scrollTop !== clamped) rail.scrollTop = clamped
+    if (scrollTop !== clamped) setScrollTop(clamped)
+  }, [items.length, virtual])
   useLayoutEffect(() => {
     if (!virtual || selectedIndex < 0 || !railRef.current) return
     const rail = railRef.current
