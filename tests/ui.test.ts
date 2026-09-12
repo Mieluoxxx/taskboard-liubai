@@ -99,6 +99,21 @@ test('fonts are self-hosted Maple Mono CN, preloaded in core-only size and lazil
   await readFile(new URL('../public/fonts/LICENSE-maple-mono.txt', import.meta.url), 'utf8')
 })
 
+test('task marker colors use visual native radio swatches instead of text-only select options', async () => {
+  const source = await appSource()
+  const css = await cssSource()
+  assert.match(source, /<fieldset className="color-field">/, 'color choices need a labelled fieldset')
+  assert.match(source, /type="radio" name="task-color"/, 'color choices must remain keyboard-accessible native radios')
+  assert.doesNotMatch(source, /<select value=\{color\}/, 'marker colors must not be a text-only select')
+  for (const color of ['ink', 'blue', 'orange', 'green', 'violet']) {
+    assert.match(source, new RegExp(`'${color}', 'color`), `${color} needs a visual swatch`)
+  }
+  assert.match(css, /\.color-swatch \{[^}]*width: 32px;[^}]*height: 32px;[^}]*border-radius: 50%/, 'swatches must be circular')
+  assert.match(css, /\.dialog-form \.color-choice \{[^}]*width: 44px;[^}]*height: 44px;/, 'swatches need touch-sized hit targets')
+  assert.match(css, /\.color-choice input:checked \+ \.color-swatch/, 'selected color needs a visible ring')
+  assert.match(css, /\.color-choice input:focus-visible \+ \.color-swatch/, 'keyboard focus needs a visible outline')
+})
+
 test('the space left by the removed add buttons is used for "back to this week / today"', async () => {
   const source = await appSource()
   const css = await cssSource()
