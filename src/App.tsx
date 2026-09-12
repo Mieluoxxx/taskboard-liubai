@@ -243,6 +243,7 @@ export default function App() {
     setSelectedDate(resetDate)
     setSelectedWeek(weekKey(resetDate))
     setDraftLabel(null)
+    setAuthPassword('')
     setAuthError('')
     setSaveMessage('')
     setFailureKind(null)
@@ -328,7 +329,6 @@ export default function App() {
   const applyAuthTransition = useCallback((cloud: SupabaseBoardAdapter | null, transition: AuthTransition) => {
     userRef.current = transition.user
     setUser(transition.user)
-    setAuthBusy(false)
     if (!transition.user) {
       clearPrivateState('auth')
       return
@@ -619,38 +619,51 @@ export default function App() {
     event.preventDefault()
     const cloud = cloudRef.current
     if (!cloud || !authEmail.trim() || !authPassword) return
-    const attempt = authLifecycle.beginLogin(userRef.current?.id || null, authEmail.trim())
+    const attempt = authLifecycle.beginLogin()
     if (attempt === null) return
     setAuthBusy(true)
     setAuthError('')
-    const result = await cloud.signIn(authEmail.trim(), authPassword)
-    if (!authLifecycle.isLoginCurrent(attempt)) return
-    if (!result.ok) {
-      authLifecycle.finishLogin(attempt)
-      setAuthBusy(false)
-      setAuthError(result.code ? t(result.code) : result.message || t('invalidCredentials'))
-      return
+    try {
+      const result = await cloud.signIn(authEmail.trim(), authPassword)
+      if (!authLifecycle.isLoginCurrent(attempt)) return
+      if (!result.ok) {
+        setAuthError(result.code ? t(result.code) : result.message || t('invalidCredentials'))
+        return
+      }
+      const transition = authLifecycle.completeLogin(attempt, userRef.current, result.value, screenRef.current, Boolean(storedRef.current))
+      if (!transition) return
+      applyAuthTransition(cloud, transition)
+      setAuthPassword('')
+    } catch (caught) {
+      if (!authLifecycle.isLoginCurrent(attempt)) return
+      if (caught instanceof Error) console.warn('[taskboard]', caught.message)
+      setAuthError(t('cloudError'))
+    } finally {
+      if (authLifecycle.finishLogin(attempt)) setAuthBusy(false)
     }
-    const transition = authLifecycle.completeLogin(attempt, userRef.current, result.value, screenRef.current, Boolean(storedRef.current))
-    if (!transition) return
-    applyAuthTransition(cloud, transition)
-    setAuthPassword('')
   }
 
   const signOut = async () => {
     const cloud = cloudRef.current
     const generation = authLifecycle.beginLogout()
     if (generation === null) return
-    const result = cloud ? await cloud.signOut() : { ok: true as const, value: undefined }
-    if (!authLifecycle.isCurrent(generation)) return
-    if (!authLifecycle.finishLogout(generation)) return
-    if (!result.ok) {
-      setSaveState(result.kind === 'offline' ? 'offline' : 'error')
-      setSaveMessage(noticeText(result, 'noticeCloudError'))
-      return
+    try {
+      const result = cloud ? await cloud.signOut() : { ok: true as const, value: undefined }
+      if (!authLifecycle.isCurrent(generation)) return
+      if (!result.ok) {
+        setSaveState(result.kind === 'offline' ? 'offline' : 'error')
+        setSaveMessage(noticeText(result, 'noticeCloudError'))
+        return
+      }
+      applyAuthTransition(cloud, { user: null, changed: true, generation, shouldClear: 'auth', shouldLoad: false })
+    } catch (caught) {
+      if (!authLifecycle.isCurrent(generation)) return
+      if (caught instanceof Error) console.warn('[taskboard]', caught.message)
+      setSaveState('error')
+      setSaveMessage('noticeCloudError')
+    } finally {
+      authLifecycle.finishLogout(generation)
     }
-    setAuthBusy(false)
-    applyAuthTransition(cloud, { user: null, changed: true, generation, shouldClear: 'auth', shouldLoad: false })
   }
 
   useEffect(() => {

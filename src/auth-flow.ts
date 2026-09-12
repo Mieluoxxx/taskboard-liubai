@@ -16,8 +16,8 @@ export interface AuthTransition {
 export class AuthLifecycle {
   private authGeneration = 0
   private loginAttempt = 0
-  private activeCommand: 'login' | 'logout' | null = null
-  private activeLogin: { attempt: number; userId: string | null; email: string } | null = null
+  private activeCommand: { kind: 'login'; attempt: number } | { kind: 'logout'; generation: number } | null = null
+  private activeLogin: { attempt: number; invalidated: boolean } | null = null
 
   generation(): number {
     return this.authGeneration
@@ -27,20 +27,20 @@ export class AuthLifecycle {
     return generation === this.authGeneration
   }
 
-  beginLogin(currentUserId: string | null, email: string): number | null {
+  beginLogin(): number | null {
     if (this.activeCommand) return null
     const attempt = ++this.loginAttempt
-    this.activeCommand = 'login'
-    this.activeLogin = { attempt, userId: currentUserId, email: email.trim().toLowerCase() }
+    this.activeCommand = { kind: 'login', attempt }
+    this.activeLogin = { attempt, invalidated: false }
     return attempt
   }
 
   isLoginCurrent(attempt: number): boolean {
-    return this.activeLogin?.attempt === attempt
+    return this.activeCommand?.kind === 'login' && this.activeCommand.attempt === attempt && this.activeLogin?.attempt === attempt && !this.activeLogin.invalidated
   }
 
   finishLogin(attempt: number): boolean {
-    if (!this.isLoginCurrent(attempt) || this.activeCommand !== 'login') return false
+    if (this.activeCommand?.kind !== 'login' || this.activeCommand.attempt !== attempt) return false
     this.activeLogin = null
     this.activeCommand = null
     return true
@@ -49,14 +49,15 @@ export class AuthLifecycle {
   beginLogout(): number | null {
     if (this.activeCommand) return null
     this.loginAttempt += 1
-    this.activeCommand = 'logout'
-    return ++this.authGeneration
+    const generation = ++this.authGeneration
+    this.activeCommand = { kind: 'logout', generation }
+    return generation
   }
 
   finishLogout(generation: number): boolean {
-    if (this.activeCommand !== 'logout') return false
+    if (this.activeCommand?.kind !== 'logout' || this.activeCommand.generation !== generation) return false
     this.activeCommand = null
-    return this.isCurrent(generation)
+    return true
   }
 
   invalidate(): number {
@@ -69,16 +70,11 @@ export class AuthLifecycle {
   receiveAuthEvent(current: AuthIdentity | null, next: AuthIdentity | null, screen: AuthScreen, hasBoard: boolean): AuthTransition {
     const changed = current?.id !== next?.id
     const activeLogin = this.activeLogin
-    const belongsToLogin = Boolean(
-      changed && activeLogin &&
-      ((activeLogin.userId === null && current === null && next?.email?.toLowerCase() === activeLogin.email) || activeLogin.userId === next?.id),
-    )
-    if (this.activeCommand === 'logout' && !next) this.activeCommand = null
-    else if (belongsToLogin && next) this.activeLogin!.userId = next.id
+    if (changed && this.activeCommand?.kind === 'login' && activeLogin) {
+      if (!next) activeLogin.invalidated = true
+    }
     else if (changed) {
       this.loginAttempt += 1
-      this.activeCommand = null
-      this.activeLogin = null
     }
     return this.accept(current, next, screen, hasBoard, false)
   }
@@ -97,8 +93,7 @@ export class AuthLifecycle {
 
   completeLogin(attempt: number, current: AuthIdentity | null, next: AuthIdentity, screen: AuthScreen, hasBoard: boolean): AuthTransition | null {
     if (!this.isLoginCurrent(attempt)) return null
-    this.activeLogin = null
-    this.activeCommand = null
+    if (current && current.id !== next.id) return null
     return this.accept(current, next, screen, hasBoard, false)
   }
 }
