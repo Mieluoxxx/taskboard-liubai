@@ -90,6 +90,7 @@ async function bring(selector) {
 
 async function verifyAssociationPicker() {
   await bootDemo()
+  const opener = await page.evaluate(() => ({className: document.querySelector('.panel-shell.domain-weekly .add-button')?.className || null}))
   await page.click('.panel-shell.domain-weekly .add-button')
   await page.waitForSelector('#task-association', {state: 'visible'})
   await page.evaluate(() => document.querySelector('#task-association')?.focus())
@@ -98,6 +99,20 @@ async function verifyAssociationPicker() {
   const focusedBefore = await page.evaluate(() => ({id: document.activeElement?.id || null, role: document.activeElement?.getAttribute('role') || null}))
   await page.waitForTimeout(3200)
   const focusedAfter = await page.evaluate(() => ({id: document.activeElement?.id || null, role: document.activeElement?.getAttribute('role') || null}))
+  await page.keyboard.press('Escape')
+  await page.waitForSelector('[role="listbox"]', {state: 'hidden'})
+  const afterFirstEscape = await page.evaluate(() => ({id: document.activeElement?.id || null, role: document.activeElement?.getAttribute('role') || null}))
+  const scrollBeforeDialogKey = await page.evaluate(() => document.querySelector('.workspace-scroll')?.scrollLeft || 0)
+  await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('1')
+  const scrollAfterDialogKey = await page.evaluate(() => document.querySelector('.workspace-scroll')?.scrollLeft || 0)
+  await page.keyboard.press('Escape')
+  await page.waitForSelector('.dialog-form', {state: 'hidden'})
+  const restoredFocus = await page.evaluate(() => ({className: document.activeElement?.className || null}))
+  await page.click('.panel-shell.domain-weekly .add-button')
+  await page.waitForSelector('#task-association', {state: 'visible'})
+  await page.click('#task-association')
+  await page.waitForSelector('[role="listbox"]', {state: 'visible'})
   await page.keyboard.press('ArrowDown')
   await page.keyboard.press('Enter')
   const choice = await page.evaluate(() => ({
@@ -113,7 +128,7 @@ async function verifyAssociationPicker() {
     const task = board.snapshot?.tasks?.find((item) => item.title === '关联测试任务')
     return {upperTaskId: task?.upperTaskId || null}
   })
-  return {focusedBefore, focusedAfter, choice, saved}
+  return {opener, focusedBefore, focusedAfter, afterFirstEscape, scrollBeforeDialogKey, scrollAfterDialogKey, restoredFocus, choice, saved}
 }
 
 await page.cdp('Emulation.setDeviceMetricsOverride', {width: 1262, height: 894, deviceScaleFactor: 1, mobile: false})
@@ -219,6 +234,8 @@ console.log(JSON.stringify({associationPicker, deleteDuringSave, deleteAfter, in
 
 const checks = {
   associationPickerKeepsFocus: associationPicker.focusedBefore.role === 'option' && associationPicker.focusedAfter.role === 'option' && associationPicker.focusedAfter.id !== 'task-title',
+  associationPickerEscapeRestores: associationPicker.afterFirstEscape.id === 'task-association' && associationPicker.restoredFocus.className === associationPicker.opener.className,
+  associationPickerBlocksWorkspaceKeys: associationPicker.scrollBeforeDialogKey === associationPicker.scrollAfterDialogKey,
   associationPickerIsInApp: !associationPicker.choice.hasNativeAssociationSelect,
   associationPickerPersists: Boolean(associationPicker.saved.upperTaskId),
   deleteNoDraftDuringSave: !deleteDuringSave.draft,
