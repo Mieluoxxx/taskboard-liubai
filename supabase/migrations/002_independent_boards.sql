@@ -37,19 +37,19 @@ create or replace function public.get_private_board()
 returns table(revision bigint, snapshot jsonb)
 language plpgsql
 security definer
-set search_path = pg_catalog, private, public
+set search_path = ''
 as $$
 declare
   owner_id uuid;
 begin
   owner_id := private.assert_authenticated_user();
   insert into private.personal_boards(owner_uuid, revision, snapshot)
-  values (owner_id, 0, jsonb_build_object(
+  values (owner_id, 0, pg_catalog.jsonb_build_object(
     'schemaVersion', 1,
-    'settings', jsonb_build_object('timeZone', 'UTC'),
-    'cycles', jsonb_build_array(),
-    'tasks', jsonb_build_array(),
-    'focusBlocks', jsonb_build_array()))
+    'settings', pg_catalog.jsonb_build_object('timeZone', 'UTC'),
+    'cycles', pg_catalog.jsonb_build_array(),
+    'tasks', pg_catalog.jsonb_build_array(),
+    'focusBlocks', pg_catalog.jsonb_build_array()))
   on conflict (owner_uuid) do nothing;
   return query
     select b.revision, b.snapshot
@@ -62,7 +62,7 @@ create or replace function public.cas_save_private_board(p_expected_revision big
 returns table(revision bigint, snapshot jsonb)
 language plpgsql
 security definer
-set search_path = pg_catalog, private, public
+set search_path = ''
 as $$
 declare
   owner_id uuid;
@@ -76,7 +76,7 @@ begin
   perform private.validate_board_snapshot(p_snapshot);
 
   update private.personal_boards b
-  set revision = b.revision + 1, snapshot = p_snapshot, updated_at = now()
+  set revision = b.revision + 1, snapshot = p_snapshot, updated_at = pg_catalog.now()
   where b.owner_uuid = owner_id and b.revision = p_expected_revision
   returning b.revision, b.snapshot into next_revision, next_snapshot;
 
