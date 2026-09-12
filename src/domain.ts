@@ -73,6 +73,21 @@ export function weekRange(key: string): { start: string; end: string } {
   return { start, end: addDays(start, 6) }
 }
 
+export function dateKeysInRange(startDate: string, endDate: string): string[] {
+  if (!isDateKey(startDate) || !isDateKey(endDate) || compareDateKeys(startDate, endDate) > 0) throw new Error('Invalid date range')
+  const dates: string[] = []
+  for (let date = startDate; compareDateKeys(date, endDate) <= 0; date = addDays(date, 1)) dates.push(date)
+  return dates
+}
+
+export function weekKeysInRange(startDate: string, endDate: string): string[] {
+  if (!isDateKey(startDate) || !isDateKey(endDate) || compareDateKeys(startDate, endDate) > 0) throw new Error('Invalid date range')
+  const weeks: string[] = []
+  const lastWeekStart = weekStart(endDate)
+  for (let date = weekStart(startDate); compareDateKeys(date, lastWeekStart) <= 0; date = addDays(date, 7)) weeks.push(weekKey(date))
+  return weeks
+}
+
 function calendarNoon(dateKey: string): Date {
   const [year, month, day] = dateParts(dateKey)
   return new Date(Date.UTC(year, month - 1, day, 12))

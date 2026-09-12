@@ -12,6 +12,7 @@ import {
   compareDateKeys,
   createFocusBlock,
   createTask,
+  dateKeysInRange,
   deleteFocusBlock,
   deleteTask,
   elapsedMsAt,
@@ -29,6 +30,7 @@ import {
   validateDurationMinutes,
   validateSnapshot,
   weekKey,
+  weekKeysInRange,
   weekRange,
 } from './domain'
 import { copy, type CopyKey } from './i18n'
@@ -100,6 +102,27 @@ function weekdayLabel(dateKey: string, language: Language): string {
 function weekdayShortLabel(dateKey: string, language: Language): string {
   const monday = new Date(Date.UTC(2024, 0, 1 + isoDay(dateKey) - 1, 12))
   return new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en-US', { weekday: 'short', timeZone: 'UTC' }).format(monday)
+}
+
+function dateInRange(date: string, startDate: string, endDate: string): boolean {
+  return compareDateKeys(date, startDate) >= 0 && compareDateKeys(date, endDate) <= 0
+}
+
+function clampDate(date: string, startDate: string, endDate: string): string {
+  if (compareDateKeys(date, startDate) < 0) return startDate
+  if (compareDateKeys(date, endDate) > 0) return endDate
+  return date
+}
+
+function dateForCycleSelection(preferredDate: string, cycle: GoalCycle, todayDate: string): string {
+  return dateInRange(preferredDate, cycle.startDate, cycle.endDate) ? preferredDate : clampDate(todayDate, cycle.startDate, cycle.endDate)
+}
+
+function dateForWeek(key: string, cycle: GoalCycle | undefined, preferredDate: string): string {
+  const range = weekRange(key)
+  const start = cycle && compareDateKeys(cycle.startDate, range.start) > 0 ? cycle.startDate : range.start
+  const end = cycle && compareDateKeys(cycle.endDate, range.end) < 0 ? cycle.endDate : range.end
+  return dateInRange(preferredDate, start, end) ? preferredDate : start
 }
 
 
@@ -262,9 +285,11 @@ export default function App() {
     if (!stored || !boardLoadToken) return
     const zone = stored.snapshot.settings.timeZone
     const current = todayInTimeZone(zone)
-    setSelectedDate(current)
-    setSelectedWeek(weekKey(current))
-    setSelectedCycleId(stored.snapshot.cycles[0]?.id || null)
+    const firstCycle = stored.snapshot.cycles[0]
+    const date = firstCycle ? clampDate(current, firstCycle.startDate, firstCycle.endDate) : current
+    setSelectedDate(date)
+    setSelectedWeek(weekKey(date))
+    setSelectedCycleId(firstCycle?.id || null)
     setSelectedTaskId(null)
   }, [boardLoadToken]) // 仅显式加载会改变 boardLoadToken，普通保存不会重置当前周期。
 
@@ -580,7 +605,7 @@ export default function App() {
           color: input.color,
           parentId: parentId || input.parentId,
           upperTaskId: parentId || input.parentId ? undefined : input.upperTaskId,
-          cycleId: targetDomain === 'long' ? selectedCycleId || undefined : undefined,
+          cycleId: targetDomain === 'long' ? selectedCycle?.id : undefined,
           weekKey: targetDomain === 'weekly' ? selectedWeek : undefined,
           dateKey: targetDomain === 'daily' ? selectedDate : undefined,
         }))
@@ -608,7 +633,14 @@ export default function App() {
       }
       if (commitSnapshot(next, `${t('cycle')}: ${input.name}`, { kind: 'cycle', input, cycleId: existing?.id })) {
         const created = next.cycles.find((cycle) => !existing && cycle.name === input.name.trim())
-        setSelectedCycleId(existing?.id || created?.id || selectedCycleId)
+        const nextCycleId = existing?.id || created?.id || selectedCycleId
+        const nextCycle = next.cycles.find((cycle) => cycle.id === nextCycleId)
+        setSelectedCycleId(nextCycleId)
+        if (nextCycle) {
+          const date = dateForCycleSelection(selectedDate, nextCycle, todayInTimeZone(current.snapshot.settings.timeZone))
+          setSelectedDate(date)
+          setSelectedWeek(weekKey(date))
+        }
         setDialog(null)
       }
     } catch (caught) {
@@ -637,6 +669,8 @@ export default function App() {
   const todayKey = todayInTimeZone(currentZone)
   const currentWeekKey = weekKey(todayKey)
   const runningBlock = stored?.snapshot.focusBlocks.find((block) => block.status === 'running')
+  const failedOrigin = failedJobRef.current?.origin
+  const canReopenDraft = failedOrigin?.kind === 'task' || failedOrigin?.kind === 'cycle' || failedOrigin?.kind === 'focus'
 
   if (screen === 'setup') {
     return <SetupScreen language={language} setLanguage={setLanguage} t={t} onDemo={openDemo} />
@@ -650,6 +684,19 @@ export default function App() {
 
   const snapshot = stored.snapshot
   const selectedCycle = snapshot.cycles.find((cycle) => cycle.id === selectedCycleId) || snapshot.cycles[0]
+  const selectCycle = (cycleId: string) => {
+    const cycle = snapshot.cycles.find((candidate) => candidate.id === cycleId)
+    if (!cycle) return
+    const date = dateForCycleSelection(selectedDate, cycle, todayKey)
+    setSelectedCycleId(cycleId)
+    setSelectedDate(date)
+    setSelectedWeek(weekKey(date))
+  }
+  const selectWeek = (key: string) => {
+    const date = dateForWeek(key, selectedCycle, selectedDate)
+    setSelectedWeek(key)
+    setSelectedDate(date)
+  }
   const setDate = (date: string) => { setSelectedDate(date); setSelectedWeek(weekKey(date)) }
   const panelRef = (index: number) => (element: HTMLElement | null) => { panelRefs.current[index] = element }
   const registerRow = (id: string) => (element: HTMLElement | null) => {
@@ -674,10 +721,11 @@ export default function App() {
           <span>{saveMessage ? noticeLabel(saveMessage) : saveState === 'offline' || !online ? t('offline') : t('error')}</span>
           {failedJobRef.current && (saveState === 'error' || saveState === 'offline') && failureKind !== 'conflict' ? <button className="text-button" onClick={retrySave}>{t('retry')}</button> : null}
           {failureKind === 'conflict' && !failedJobRef.current ? <button className="text-button" onClick={() => void reloadLatest(true)}>{t('reloadLatest')}</button> : null}
-          {failureKind === 'conflict' && failedJobRef.current ? <button className="text-button" onClick={() => void reopenDraft()}>{t('reopenDraft')}</button> : null}
+          {failureKind === 'conflict' && failedJobRef.current && !canReopenDraft ? <button className="text-button" onClick={() => void reloadLatest(false)}>{t('reloadLatestDirect')}</button> : null}
+          {failureKind === 'conflict' && canReopenDraft ? <button className="text-button" onClick={() => void reopenDraft()}>{t('reopenDraft')}</button> : null}
         </div>
       ) : null}
-      {draftLabel ? (
+      {draftLabel && (saveState === 'error' || saveState === 'offline') ? (
         <div className="notice-bar draft-notice" role="status">
           <div><strong>{t('draftTitle')}</strong><span>{draftLabel}</span></div>
           <div className="notice-actions">
@@ -699,24 +747,24 @@ export default function App() {
           <TaskPanel
             panelRef={panelRef(0)} domain="long" title={t('long')} hint={t('longHint')} language={language} t={t}
             tasks={panelTasks('long')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycle?.id} language={language} t={t} onSelect={setSelectedCycleId} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} />}
+            rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycle?.id} language={language} t={t} onSelect={selectCycle} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} />}
             canAdd={Boolean(selectedCycle)} onAdd={() => setDialog({ kind: 'task', domain: 'long' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'long' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'long', parentId: task.id })} />
           <TaskPanel
             panelRef={panelRef(1)} domain="weekly" title={t('weekly')} hint={t('weeklyHint')} language={language} t={t}
             tasks={panelTasks('weekly')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} language={language} t={t} onSelect={(key) => { setSelectedWeek(key); setSelectedDate(weekRange(key).start) }} onGoCurrent={() => { setSelectedWeek(currentWeekKey); setSelectedDate(weekRange(currentWeekKey).start) }} />}
+            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={selectedCycle} language={language} t={t} onSelect={selectWeek} onGoCurrent={() => selectWeek(currentWeekKey)} />}
             canAdd onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} />
           <TaskPanel
             panelRef={panelRef(2)} domain="daily" title={`${t('daily')} · ${weekdayLabel(selectedDate, language)}`} hint={t('dailyHint')} language={language} t={t}
             tasks={panelTasks('daily')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
             canAdd onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'daily' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'daily', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
           <FocusPanel
             panelRef={panelRef(3)} blocks={snapshot.focusBlocks.filter((block) => block.dateKey === selectedDate)} allTasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} now={now}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
             onAdd={() => setDialog({ kind: 'focus' })} onEdit={(block) => setDialog({ kind: 'focus', block })} onDelete={deleteFocusWithConfirm} onCommand={focusCommand}
           />
         </div>
@@ -732,7 +780,7 @@ export default function App() {
   )
 
   function toggleTask(task: Task) {
-    updateSnapshot((current) => updateTask(current, task.id, { checked: !task.checked }), `${t('title')}: ${task.title}`)
+    updateSnapshot((current) => updateTask(current, task.id, { checked: !task.checked }), null)
   }
 
   function deleteTaskWithConfirm(task: Task) {
@@ -741,22 +789,22 @@ export default function App() {
     const hasChildren = current.snapshot.tasks.some((candidate) => candidate.parentId === task.id && !candidate.archivedAt)
     const message = hasChildren ? t('confirmDeleteWithChildren') : t('confirmDelete')
     if (!window.confirm(message)) return
-    updateSnapshot((snapshot) => deleteTask(snapshot, task.id), `${t('delete')}: ${task.title}`)
+    updateSnapshot((snapshot) => deleteTask(snapshot, task.id), null)
     if (selectedTaskId === task.id) setSelectedTaskId(null)
   }
 
   function reorderTask(task: Task, direction: -1 | 1) {
-    // 带上来源，冲突时「重新打开编辑器」才能把这次移动重放到最新版本上。
-    updateSnapshot((current) => reorderSibling(current, task.id, direction), `${t('title')}: ${task.title}`, reorderOrigin(task, direction))
+    // 带上来源，冲突时直接加载最新版本后再明确重做，不把排序伪装成表单草稿。
+    updateSnapshot((current) => reorderSibling(current, task.id, direction), null, reorderOrigin(task, direction))
   }
 
   function deleteFocusWithConfirm(block: FocusBlock) {
     if (!window.confirm(t('confirmDeleteFocus'))) return
-    updateSnapshot((current) => deleteFocusBlock(current, block.id), `${t('delete')}: ${block.title}`)
+    updateSnapshot((current) => deleteFocusBlock(current, block.id), null)
   }
 
   function focusCommand(block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') {
-    updateSnapshot((current) => setFocusCommand(current, block.id, command), `${t('focus')}: ${block.title}`)
+    updateSnapshot((current) => setFocusCommand(current, block.id, command), null)
   }
 
   function updateSettings(zone: string) {
@@ -766,11 +814,11 @@ export default function App() {
     if (safe !== zone) { setFlash(t('invalidTimeZone')); return }
     const next = cloneSnapshot(current.snapshot)
     next.settings.timeZone = safe
-    commitSnapshot(next, `${t('timezone')}: ${safe}`)
+    commitSnapshot(next)
   }
 
   function rescheduleTask(task: Task, date: string) {
-    updateSnapshot((current) => rescheduleDailyTask(current, task.id, date), `${t('reschedule')}: ${task.title}`)
+    updateSnapshot((current) => rescheduleDailyTask(current, task.id, date), null)
   }
 }
 
@@ -828,28 +876,26 @@ function CycleRail({ cycles, selectedId, language, t, onSelect, onAdd, onEdit }:
   return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('cycles')}</div><div className="rail-items">{cycles.map((cycle) => <div className="rail-item-wrap" key={cycle.id}><button className={`rail-item ${selectedId === cycle.id ? 'selected' : ''}`} aria-current={selectedId === cycle.id ? 'page' : undefined} onClick={() => onSelect(cycle.id)}><span>{cycle.name}</span><small>{cycle.startDate.slice(5)}</small></button>{selectedId === cycle.id ? <button className="rail-edit" aria-label={t('editCycle')} onClick={() => onEdit(cycle)}><Icon name="edit" /></button> : null}</div>)}</div><button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('addCycle')}</button></aside>
 }
 
-// 周、日都是固定的日历周期（ISO 周与自然日），不存在“新建周/新建日”，
-// 因此周期轨道底部放的是“回到当前”的便捷跳转；添加周任务/日任务由面板自身的按钮承担。
-function WeekRail({ selectedWeek, currentWeek, language, t, onSelect, onGoCurrent }: { selectedWeek: string; currentWeek: string; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void; onGoCurrent: () => void }) {
-  const start = weekRange(selectedWeek).start
-  const weeks = [-2, -1, 0, 1, 2].map((offset) => weekKey(addDays(start, offset * 7)))
-  const offCurrent = selectedWeek !== currentWeek
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className="rail-items">{weeks.map((key) => {
+// 周、日的导航范围来自选中的长期周期；没有周期时保留独立的当前窗口，方便空板继续使用。
+function WeekRail({ selectedWeek, currentWeek, cycle, language, t, onSelect, onGoCurrent }: { selectedWeek: string; currentWeek: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void; onGoCurrent: () => void }) {
+  const weeks = useMemo(() => cycle ? weekKeysInRange(cycle.startDate, cycle.endDate) : [-2, -1, 0, 1, 2].map((offset) => weekKey(addDays(weekRange(selectedWeek).start, offset * 7))), [cycle?.startDate, cycle?.endDate, selectedWeek])
+  const hasCurrent = weeks.includes(currentWeek)
+  const offCurrent = hasCurrent && selectedWeek !== currentWeek
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className={`rail-items ${weeks.length > 7 ? 'range-items' : ''}`}>{weeks.map((key) => {
     const isCurrent = key === currentWeek
     return <button className={`rail-item ${selectedWeek === key ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}`} aria-current={selectedWeek === key ? 'page' : undefined} aria-label={isCurrent ? `${key.slice(5)} · ${t('currentWeek')}` : key.slice(5)} key={key} onClick={() => onSelect(key)}><span>{key.slice(5)}{isCurrent ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{weekRange(key).start.slice(5)}</small></button>
-  })}</div><div className="rail-hint">{t('currentWeek')}</div>{offCurrent ? <button className="rail-return" onClick={onGoCurrent}><Icon name="back" />{t('backToCurrentWeek')}</button> : null}</aside>
+  })}</div>{offCurrent ? <button className="rail-return" onClick={onGoCurrent}><Icon name="back" />{t('backToCurrentWeek')}</button> : null}</aside>
 }
 
-function DayRail({ selectedDate, selectedWeek, todayKey, language, t, onSelect, onGoToday }: { selectedDate: string; selectedWeek: string; todayKey: string; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void; onGoToday: () => void }) {
-  const range = weekRange(selectedWeek)
-  const days = Array.from({ length: 7 }, (_, index) => addDays(range.start, index))
-  // 今天可能不在当前显示的这一周里，此时“回到今天”会顺带把周也切过去。
-  const offToday = selectedDate !== todayKey
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className="rail-items">{days.map((date) => {
+function DayRail({ selectedDate, selectedWeek, todayKey, cycle, language, t, onSelect, onGoToday }: { selectedDate: string; selectedWeek: string; todayKey: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void; onGoToday: () => void }) {
+  const days = useMemo(() => cycle ? dateKeysInRange(cycle.startDate, cycle.endDate) : Array.from({ length: 7 }, (_, index) => addDays(weekRange(selectedWeek).start, index)), [cycle?.startDate, cycle?.endDate, selectedWeek])
+  const hasToday = days.includes(todayKey)
+  const offToday = hasToday && selectedDate !== todayKey
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className={`rail-items ${days.length > 7 ? 'range-items' : ''}`}>{days.map((date) => {
     const isToday = date === todayKey
     const label = weekdayShortLabel(date, language)
-    return <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(8)} · ${t('currentDay')}` : `${label} ${date.slice(8)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(8)}</small></button>
-  })}</div><div className="rail-hint">{t('currentDay')}</div>{offToday ? <button className="rail-return" onClick={onGoToday}><Icon name="back" />{t('backToCurrentDay')}</button> : null}</aside>
+    return <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(5)} · ${t('currentDay')}` : `${label} ${date.slice(5)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(5)}</small></button>
+  })}</div>{offToday ? <button className="rail-return" onClick={onGoToday}><Icon name="back" />{t('backToCurrentDay')}</button> : null}</aside>
 }
 
 function PastSuggestions({ tasks, language, t, onReschedule }: { tasks: Task[]; language: Language; t: (key: CopyKey) => string; onReschedule: (task: Task) => void }) {

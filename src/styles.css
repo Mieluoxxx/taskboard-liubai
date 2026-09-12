@@ -86,7 +86,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .rail-return { display: flex; align-items: center; gap: 5px; margin: 0 4px 12px; padding: 6px 8px; color: #8a705f; border: 1px solid #e7dcd4; background: #fffaf6; font-size: 10px; white-space: nowrap; }
 .rail-return:hover { color: var(--ink); border-color: #d7c2b5; background: #fff5ee; }
 .rail-return .icon { width: 12px; height: 12px; }
-.rail-hint { margin: 12px 8px; font: 9px/1.4 "Maple Mono CN", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; color: #b3b8b4; text-transform: uppercase; letter-spacing: .08em; }
+.rail-items.range-items { max-height: 480px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .paper-panel { position: relative; z-index: 4; min-height: 720px; padding: 32px 29px 24px; background: var(--paper); border: 1px solid #e3e5e2; box-shadow: 0 8px 22px rgba(39,48,42,.035); overflow: visible; }
 .panel-top { justify-content: space-between; align-items: flex-start; gap: 18px; padding-bottom: 28px; border-bottom: 1px solid #eff1ef; }
 .eyebrow { color: #a2a8a3; font: 600 10px/1 "Maple Mono CN", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; letter-spacing: .16em; text-transform: uppercase; }
