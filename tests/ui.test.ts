@@ -6,6 +6,23 @@ import { readFile } from 'node:fs/promises'
 const appSource = async () => readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
 const cssSource = async () => readFile(new URL('../src/styles.css', import.meta.url), 'utf8')
 
+test('task previews wrap with bounded lines and open the editor for full content', async () => {
+  const css = await cssSource()
+  assert.match(css, /\.workspace-stage \{[^}]*min-width: calc\(4 \* 520px \+ 3 \* 24px\)/)
+  assert.match(css, /\.task-title span \{[^}]*white-space: normal;[^}]*overflow-wrap: anywhere;/)
+  assert.match(css, /\.task-title small \{[^}]*white-space: pre-wrap;[^}]*overflow-wrap: anywhere;/)
+  for (const [rule] of css.matchAll(/\.task-title (?:span|small) \{[^}]*\}/g)) {
+    assert.doesNotMatch(rule, /white-space: nowrap/, 'previews must wrap instead of collapsing every line')
+  }
+  assert.match(css, /\.task-title span \{[^}]*-webkit-line-clamp: 2;[^}]*overflow: hidden;/)
+  assert.match(css, /\.task-title small \{[^}]*-webkit-line-clamp: 5;[^}]*overflow: hidden;/)
+  const mobile = css.slice(css.indexOf('@media (max-width: 850px) {'))
+  assert.match(mobile, /\.workspace-stage \{[^}]*min-width: max-content;/, 'fixed viewport tracks must not inherit the desktop stage minimum')
+  assert.match(await appSource(), /className="task-title" onClick=\{\(\) => \{ onSelect\(task.id\); onEdit\(task\) \}\}/, 'clicking a preview must open the existing editor')
+  assert.match(await appSource(), /maxLength=\{MAX_TASK_TITLE_LENGTH\}/)
+  assert.match(await appSource(), /maxLength=\{MAX_TASK_NOTE_LENGTH\}/)
+})
+
 test('the week rail shows the week start as MM-DD and highlights the week containing today', async () => {
   const source = await appSource()
   // 周轨道的第二行日期必须与日轨道一致使用 MM-DD（slice(5)），而不是本地化的长日期

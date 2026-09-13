@@ -8,7 +8,7 @@ const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
 const THIRD = '00000000-0000-0000-0000-000000000003'
 
-async function database(applyIndependentMigration = true) {
+async function database(applyIndependentMigration = true, applyTextLimits = true) {
   const db = new PGlite()
   await db.waitReady
   await db.exec(`
@@ -24,9 +24,48 @@ async function database(applyIndependentMigration = true) {
   await db.exec(await readFile(new URL('../supabase/migrations/001_private_board.sql', import.meta.url), 'utf8'))
   if (!applyIndependentMigration) await db.exec(`insert into private.owner_config(owner_uuid) values ('${OWNER}');`)
   if (applyIndependentMigration) await db.exec(await readFile(new URL('../supabase/migrations/002_independent_boards.sql', import.meta.url), 'utf8'))
+  if (applyIndependentMigration && applyTextLimits) await db.exec(await readFile(new URL('../supabase/migrations/003_task_text_limits.sql', import.meta.url), 'utf8'))
   await db.exec(`select set_config('request.jwt.claim.sub', '${OWNER}', false);`)
   return db
 }
+
+test('task text limits migrate without touching existing data or other validation rules', async () => {
+  const original = await readFile(new URL('../supabase/migrations/001_private_board.sql', import.meta.url), 'utf8')
+  const migration = await readFile(new URL('../supabase/migrations/003_task_text_limits.sql', import.meta.url), 'utf8')
+  const validator = /create or replace function private\.validate_board_snapshot\(input jsonb\)[\s\S]+?\$\$;/
+  const expected = original.match(validator)![0]
+    .replace("private.utf16_length(item->>'title') > 300", "private.utf16_length(item->>'title') > 450")
+    .replace("private.utf16_length(item->>'note') > 2000", "private.utf16_length(item->>'note') > 3000")
+  assert.equal(migration.match(validator)![0], expected, 'only task text bounds may change in the database validator')
+  const db = await database(true, false)
+  try {
+    await db.query('select * from public.get_private_board()')
+    const legacy = addTask(emptySnapshot('UTC'), createTask({ domain: 'daily', title: 'existing', note: 'first\nsecond', dateKey: '2025-01-15' }))
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(legacy)])
+    const expanded = { ...legacy, tasks: [{ ...legacy.tasks[0], title: '中'.repeat(450), note: 'x'.repeat(3000) }] }
+    await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(expanded)]), /invalid/i)
+    await db.exec(migration)
+    const preserved = await db.query<{ revision: number; snapshot: unknown }>('select * from public.get_private_board()')
+    assert.equal(Number(preserved.rows[0].revision), 1)
+    assert.deepEqual(preserved.rows[0].snapshot, JSON.parse(JSON.stringify(legacy)))
+    await db.exec('set role authenticated')
+    let revision = 1
+    for (const [title, note] of [['中'.repeat(450), 'x'.repeat(3000)], ['😀'.repeat(225), '😀'.repeat(1500)]]) {
+      const payload = { ...legacy, tasks: [{ ...legacy.tasks[0], title, note }] }
+      validateSnapshot(payload)
+      const result = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [revision, JSON.stringify(payload)])
+      assert.equal(Number(result.rows[0].revision), ++revision)
+    }
+    for (const patch of [{ title: 'x'.repeat(451) }, { note: 'x'.repeat(3001) }, { title: '😀'.repeat(226) }, { note: '😀'.repeat(1501) }]) {
+      const payload = { ...legacy, tasks: [{ ...legacy.tasks[0], ...patch }] }
+      assert.throws(() => validateSnapshot(payload), /invalid/i)
+      await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [revision, JSON.stringify(payload)]), /invalid/i)
+    }
+    await assert.rejects(db.query('select private.validate_board_snapshot($1::jsonb)', [JSON.stringify(legacy)]), /permission denied/i)
+  } finally {
+    await db.close()
+  }
+})
 
 test('independent board migration preserves an existing user board', async () => {
   const db = await database(false)
@@ -463,8 +502,8 @@ test('SQL matches JS trim() and String.length semantics, not btrim and character
     ['tab-only cycle name', { ...base, cycles: [cycle({ name: '\t' })] }],
     ['NBSP-only task title', { ...base, tasks: [task({ title: '\u00a0' })] }],
     ['BOM-only task title', { ...base, tasks: [task({ title: '\ufeff' })] }],
-    // JS counts UTF-16 code units: 160 astral characters are 320 units, so the client rejects it.
-    ['160 astral characters as a title', { ...base, tasks: [task({ title: '😀'.repeat(160) })] }],
+    // JS counts UTF-16 code units: 226 astral characters are 452 units, over the 450-unit title limit.
+    ['226 astral characters as a title', { ...base, tasks: [task({ title: '😀'.repeat(226) })] }],
     ['160 astral characters as an id', { ...base, tasks: [task({ id: '😀'.repeat(160) })] }],
     // F1: dateKey: null was the one optional key with no JSON-level check.
     ['weekly task with dateKey: null', { ...base, tasks: [task({ domain: 'weekly', dateKey: null, weekKey: '2020-W53' })] }],

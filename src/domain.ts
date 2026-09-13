@@ -3,6 +3,8 @@ import type { BoardSnapshot, Domain, FocusBlock, FocusStatus, GoalCycle, Placeme
 
 export const MAX_BOARD_BYTES = 900_000
 export const MAX_TASKS = 2_000
+export const MAX_TASK_TITLE_LENGTH = 450
+export const MAX_TASK_NOTE_LENGTH = 3_000
 export const MAX_FOCUS_BLOCKS = 500
 export const MAX_TIMER_MINUTES = 24 * 60
 export const MAX_ELAPSED_MS = 86_400_000
@@ -257,8 +259,8 @@ export function validateSnapshot(value: unknown): BoardSnapshot {
   for (const raw of value.tasks) {
     if (!isRecord(raw) || !validId(raw.id) || taskIds.has(raw.id) ||
       !validEnum(raw.domain, ['long', 'weekly', 'daily'] as const) ||
-      typeof raw.title !== 'string' || raw.title.trim().length === 0 || raw.title.length > 300 ||
-      typeof raw.note !== 'string' || raw.note.length > 2_000 || typeof raw.checked !== 'boolean' ||
+      typeof raw.title !== 'string' || raw.title.trim().length === 0 || raw.title.length > MAX_TASK_TITLE_LENGTH ||
+      typeof raw.note !== 'string' || raw.note.length > MAX_TASK_NOTE_LENGTH || typeof raw.checked !== 'boolean' ||
       !validEnum(raw.color, ['ink', 'blue', 'orange', 'green', 'violet'] as const) ||
       !validIso(raw.createdAt) || !validIso(raw.updatedAt)) throw new BoardError('noticeInvalidState', 'Board task is invalid')
     const cycleId = optionalString(raw, 'cycleId')
@@ -449,18 +451,30 @@ export function reapplyReorder(snapshot: BoardSnapshot, taskId: string, directio
 }
 
 export function reorderSibling(snapshot: BoardSnapshot, taskId: string, direction: -1 | 1): BoardSnapshot {
-  const next = cloneSnapshot(snapshot)
-  const index = next.tasks.findIndex((task) => task.id === taskId)
-  if (index < 0) throw new BoardError('noticeTaskMissing', 'Task no longer exists')
-  const task = next.tasks[index]
-  const siblings = next.tasks.filter((candidate) => !candidate.archivedAt && candidate.domain === task.domain &&
+  const task = snapshot.tasks.find((candidate) => candidate.id === taskId && !candidate.archivedAt)
+  if (!task) throw new BoardError('noticeTaskMissing', 'Task no longer exists')
+  const siblings = siblingTasks(snapshot, task)
+  const target = siblings[siblings.indexOf(task) + direction]
+  return target ? reorderSiblingTo(snapshot, taskId, target.id) : snapshot
+}
+
+function siblingTasks(snapshot: BoardSnapshot, task: Task): Task[] {
+  return snapshot.tasks.filter((candidate) => !candidate.archivedAt && candidate.domain === task.domain &&
     candidate.parentId === task.parentId && candidate.cycleId === task.cycleId && candidate.weekKey === task.weekKey && candidate.dateKey === task.dateKey)
-  const siblingIndex = siblings.findIndex((candidate) => candidate.id === taskId)
-  const swap = siblingIndex + direction
-  if (swap < 0 || swap >= siblings.length) return next
-  const otherIndex = next.tasks.findIndex((candidate) => candidate.id === siblings[swap].id)
-  ;[next.tasks[index], next.tasks[otherIndex]] = [next.tasks[otherIndex], next.tasks[index]]
-  return next
+}
+
+/** 一次性移到目标同级位置；无效或过期落点不写入，也不改变任务内容与其他列表的位置。 */
+export function reorderSiblingTo(snapshot: BoardSnapshot, taskId: string, targetId: string): BoardSnapshot {
+  const task = snapshot.tasks.find((candidate) => candidate.id === taskId && !candidate.archivedAt)
+  if (!task || taskId === targetId) return snapshot
+  const siblings = siblingTasks(snapshot, task)
+  const targetIndex = siblings.findIndex((candidate) => candidate.id === targetId)
+  if (targetIndex < 0) return snapshot
+  const slots = new Set(siblings)
+  siblings.splice(siblings.indexOf(task), 1)
+  siblings.splice(targetIndex, 0, task)
+  let index = 0
+  return { ...snapshot, tasks: snapshot.tasks.map((candidate) => slots.has(candidate) ? siblings[index++] : candidate) }
 }
 
 export function rescheduleDailyTask(snapshot: BoardSnapshot, taskId: string, targetDate: string, now = new Date().toISOString()): BoardSnapshot {

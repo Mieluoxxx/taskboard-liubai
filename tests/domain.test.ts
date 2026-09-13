@@ -13,6 +13,8 @@ import {
   mergeSnapshots,
   reapplyReorder,
   reorderOrigin,
+  reorderSibling,
+  reorderSiblingTo,
   rescheduleDailyTask,
   safeTimeZone,
   setFocusCommand,
@@ -372,4 +374,52 @@ test('a reorder can be replayed onto a newer board, and is skipped when the targ
   withoutTarget.tasks = withoutTarget.tasks.filter((task) => task.id !== b.id)
   const skipped = reapplyReorder(withoutTarget, origin.taskId, origin.direction)
   assert.deepEqual(skipped.tasks.map((task) => task.title), ['a'])
+})
+
+test('drag sorting moves across multiple siblings in either direction without changing unrelated slots or task contents', () => {
+  for (const domain of ['long', 'weekly', 'daily'] as const) {
+    const base = withCycle(board())
+    const placement = domain === 'long' ? { cycleId: base.cycles[0].id } : domain === 'weekly' ? { weekKey: '2025-W03' } : { dateKey: '2025-01-15' }
+    const [a, b, c] = ['a', 'b', 'c'].map((title) => createTask({ domain, title, ...placement }, NOW))
+    const child = createTask({ domain, title: 'child', parentId: a.id, ...placement }, NOW)
+    const unrelated = createTask({ domain: 'daily', title: 'another date', dateKey: '2025-02-01' }, NOW)
+    const snapshot = { ...base, tasks: [a, child, b, unrelated, c] }
+    const original = cloneSnapshot(snapshot)
+
+    const down = reorderSiblingTo(snapshot, a.id, c.id)
+    assert.deepEqual(down, { ...snapshot, tasks: [b, child, c, unrelated, a] })
+    assert.deepEqual(reorderSiblingTo(down, a.id, b.id), snapshot)
+    assert.deepEqual(reorderSiblingTo(snapshot, c.id, a.id), { ...snapshot, tasks: [c, child, a, unrelated, b] })
+    assert.deepEqual(reorderSibling(snapshot, a.id, 1), reorderSiblingTo(snapshot, a.id, b.id))
+    assert.deepEqual(snapshot, original, 'sorting must not mutate its input')
+    validateSnapshot(down)
+  }
+})
+
+test('drag sorting limits subtasks to the same parent and ignores stale or invalid drops', () => {
+  const base = withCycle(board())
+  const a = createTask({ domain: 'daily', title: 'a', dateKey: '2025-01-15' }, NOW)
+  const b = { ...a, id: 'b', title: 'b' }
+  const children = ['one', 'two', 'three'].map((title) => ({ ...a, id: title, title, parentId: a.id }))
+  const cousin = { ...children[0], id: 'cousin', parentId: b.id }
+  const archived = { ...a, id: 'archived', archivedAt: NOW, archivedReason: 'rescheduled' as const }
+  const otherDate = { ...a, id: 'other-date', dateKey: '2025-01-16' }
+  const weekly = createTask({ domain: 'weekly', title: 'weekly', weekKey: '2025-W03' }, NOW)
+  const snapshot = { ...base, tasks: [a, children[0], b, cousin, children[1], archived, children[2], otherDate, weekly] }
+  const sorted = reorderSiblingTo(snapshot, children[0].id, children[2].id)
+  assert.deepEqual(sorted, { ...snapshot, tasks: [a, children[1], b, cousin, children[2], archived, children[0], otherDate, weekly] })
+  validateSnapshot(sorted)
+  for (const [source, target] of [
+    [children[0].id, cousin.id], [children[0].id, a.id], [a.id, children[0].id],
+    [a.id, a.id], [a.id, archived.id], [archived.id, a.id], [a.id, otherDate.id],
+    [a.id, weekly.id], [a.id, 'deleted'], ['deleted', a.id],
+  ]) assert.equal(reorderSiblingTo(snapshot, source, target), snapshot, `${source} → ${target} must be a no-op`)
+
+  const long = createTask({ domain: 'long', title: 'long', cycleId: base.cycles[0].id }, NOW)
+  const otherCycle = { ...long, id: 'other-cycle', cycleId: 'another-cycle' }
+  const otherWeek = { ...weekly, id: 'other-week', weekKey: '2025-W04' }
+  const scopes = { ...base, tasks: [long, otherCycle, weekly, otherWeek] }
+  assert.equal(reorderSiblingTo(scopes, long.id, otherCycle.id), scopes)
+  assert.equal(reorderSiblingTo(scopes, weekly.id, otherWeek.id), scopes)
+  assert.equal(reorderSibling(snapshot, a.id, -1), snapshot)
 })

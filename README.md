@@ -6,7 +6,7 @@
 
 **线上地址**：https://taskboard-liubai.vercel.app （Vercel，静态前端 + Supabase 后端）
 
-- 后端：Supabase Free 项目，数据库对象见 `supabase/migrations/001_private_board.sql` 与 `supabase/migrations/002_independent_boards.sql`
+- 后端：Supabase Free 项目，数据库迁移见 `supabase/migrations/`（依次执行 `001`、`002`、`003`）
 - 部署：Vercel 导入本仓库，环境变量 `VITE_SUPABASE_URL` 与 `VITE_SUPABASE_PUBLISHABLE_KEY`（两者都是浏览器可见的公开值，真正的访问控制由 RLS 与数据库 RPC 承担）
 - 推送 `main` 即自动重新部署
 
@@ -61,7 +61,7 @@ pnpm build
 
 1. 在 Supabase 项目中关闭 Auth 的新用户注册（Disable sign ups）；本应用不提供 signup、OAuth 或 reset UI。
 2. 在 Auth 用户页用管理员方式创建任意数量的邮箱/密码账号；不要把密码写入仓库或 `.env`。创建 Auth 用户只提供登录身份，首次登录时应用会自动创建该用户自己的空看板。
-3. 在 SQL Editor 中依次执行 `supabase/migrations/001_private_board.sql` 和 `supabase/migrations/002_independent_boards.sql`。已有项目若已执行过 `001`，只需补执行 `002`；不要再执行 `001` 顶部的旧 owner provisioning 注释。
+3. 在 SQL Editor 中依次执行 `supabase/migrations/001_private_board.sql`、`002_independent_boards.sql`、`003_task_text_limits.sql`。已有项目只补执行尚未执行的迁移；不要重跑 `001` 或它顶部的旧 owner provisioning 注释。`003` 把任务标题／备注上限从 300／2000 放宽到 450／3000，必须先执行，再发布新版前端；否则超过旧上限的文本会被云端拒绝。
 4. 只把 `VITE_SUPABASE_URL` 与 publishable key（旧项目可用 anon key）写入 `.env.local`，重启 Vite。每个账号只能访问自己的看板。
 5. 手动密码重置请由项目管理员在 Supabase Auth 用户管理处完成；应用不会伪造不存在的 dashboard 功能。
 

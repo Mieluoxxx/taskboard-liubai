@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { DndContext, KeyboardSensor, PointerSensor, closestCenter, pointerWithin, useSensor, useSensors, type Announcements, type KeyboardCoordinateGetter } from '@dnd-kit/core'
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import {
   activeTasks,
+  MAX_TASK_TITLE_LENGTH,
+  MAX_TASK_NOTE_LENGTH,
   addCycle,
   addFocusBlock,
   addTask,
@@ -21,6 +26,7 @@ import {
   linkedChainIds,
   isoDay,
   reorderSibling,
+  reorderSiblingTo,
   rescheduleDailyTask,
   safeTimeZone,
   setFocusCommand,
@@ -676,6 +682,7 @@ export default function App() {
     if (screen !== 'workspace') return
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
+      if (target?.closest('.drag-handle')) { if (event.key.startsWith('Arrow')) event.preventDefault(); return }
       if (event.defaultPrevented || target?.closest('[role="dialog"]')) return
       if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
       if (target?.isContentEditable) return
@@ -697,7 +704,8 @@ export default function App() {
     const current = storedRef.current
     if (!current) return
     try {
-      commitSnapshot(operation(current.snapshot), draft, origin)
+      const next = operation(current.snapshot)
+      if (next !== current.snapshot) commitSnapshot(next, draft, origin)
     } catch (caught) {
       setSaveState('error')
       setSaveMessage(errorNotice(caught, 'noticeOperationFailed'))
@@ -859,18 +867,21 @@ export default function App() {
         <div className="workspace-stage" ref={setStageElement}>
           <ConnectorLayer stage={stageElement} snapshot={snapshot} rowRefs={rowRefs} selectedChain={selectedChain} />
           <TaskPanel
+            onSort={sortTask}
             panelRef={panelRef(0)} domain="long" title={t('long')} hint={t('longHint')} language={language} t={t}
             tasks={panelTasks('long')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
             rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycle?.id} language={language} t={t} onSelect={selectCycle} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} />}
             canAdd={Boolean(selectedCycle)} onAdd={() => setDialog({ kind: 'task', domain: 'long' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'long' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'long', parentId: task.id })} />
           <TaskPanel
+            onSort={sortTask}
             panelRef={panelRef(1)} domain="weekly" title={t('weekly')} hint={t('weeklyHint')} language={language} t={t}
             tasks={panelTasks('weekly')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
             rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={selectedCycle} language={language} t={t} onSelect={selectWeek} onGoCurrent={() => selectWeek(currentWeekKey)} />}
             canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} />
           <TaskPanel
+            onSort={sortTask}
             panelRef={panelRef(2)} domain="daily" title={`${t('daily')} · ${weekdayLabel(selectedDate, language)}`} hint={t('dailyHint')} language={language} t={t}
             tasks={panelTasks('daily')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
             rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
@@ -910,6 +921,10 @@ export default function App() {
   function reorderTask(task: Task, direction: -1 | 1) {
     // 带上来源，冲突时直接加载最新版本后再明确重做，不把排序伪装成表单草稿。
     updateSnapshot((current) => reorderSibling(current, task.id, direction), `${t('title')}: ${task.title}`, reorderOrigin(task, direction))
+  }
+
+  function sortTask(task: Task, targetId: string) {
+    updateSnapshot((current) => reorderSiblingTo(current, task.id, targetId), `${t('dragTask')}: ${task.title}`)
   }
 
   function deleteFocusWithConfirm(block: FocusBlock) {
@@ -1047,32 +1062,74 @@ function PastSuggestions({ tasks, language, t, onReschedule }: { tasks: Task[]; 
   return <div className="past-suggestions" role="region" aria-label={t('reschedule')}><div className="past-suggestion-title"><span className="notice-dot" /><strong>{t('reschedule')}</strong><span>{t('pastHint')}</span></div><div className="past-suggestion-list">{tasks.slice(0, 5).map((task) => <button key={task.id} className="suggestion-item" onClick={() => onReschedule(task)}><span>{task.title}</span><small>{task.dateKey}</small></button>)}</div>{tasks.length > 5 ? <span className="suggestion-more">+{tasks.length - 5}</span> : null}</div>
 }
 
-function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone, selectedId, selectedChain, registerRow, rail, canAdd, canCreate = true, onAdd, onEdit, onDelete, onToggle, onReorder, onSelect, onAddSubtask, onReschedule, panelRef }: {
+function SortableTaskList({ tasks, t, onSort, children }: { tasks: Task[]; t: (key: CopyKey) => string; onSort: (task: Task, targetId: string) => void; children: React.ReactNode }) {
+  const mounted = useRef(true)
+  // 传感器的结束事件可能晚于列表卸载；切换日期或退出看板后不能再提交旧拖拽。
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+  const keyboardCoordinates: KeyboardCoordinateGetter = (event, { active, context }) => {
+    if (event.code !== 'ArrowUp' && event.code !== 'ArrowDown') return
+    event.preventDefault()
+    const index = tasks.findIndex((task) => task.id === (context.over?.id ?? active))
+    const target = tasks[index + (event.code === 'ArrowDown' ? 1 : -1)]
+    const rect = target && context.droppableRects.get(target.id)
+    const current = context.collisionRect
+    if (index < 0 || !rect || !current) return
+    // 长备注会产生高度差很大的卡片；对齐中心才能与键盘的 closestCenter 落点一致。
+    return { x: rect.left + (rect.width - current.width) / 2, y: rect.top + (rect.height - current.height) / 2 }
+  }
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: keyboardCoordinates, scrollBehavior: 'auto' }),
+  )
+  const position = (id: string | number) => `${t('dragPosition')}: ${tasks.findIndex((task) => task.id === id) + 1} / ${tasks.length}`
+  const announcements: Announcements = {
+    onDragStart: ({ active }) => `${t('dragStarted')}: ${tasks.find((task) => task.id === active.id)?.title || ''}. ${position(active.id)}`,
+    onDragOver: ({ over }) => over ? position(over.id) : t('dragOutside'),
+    onDragEnd: ({ over }) => over ? t('dragEnded') : t('dragCancelled'),
+    onDragCancel: () => t('dragCancelled'),
+  }
+  return <DndContext sensors={sensors}
+    collisionDetection={(args) => args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)}
+    accessibility={{ screenReaderInstructions: { draggable: t('dragInstructions') }, announcements }}
+    onDragEnd={({ active, over }) => {
+      if (!mounted.current || !over || active.id === over.id) return
+      const task = tasks.find((candidate) => candidate.id === active.id)
+      if (task && tasks.some((candidate) => candidate.id === over.id)) onSort(task, String(over.id))
+    }}>
+    <SortableContext items={tasks} strategy={verticalListSortingStrategy}>{children}</SortableContext>
+  </DndContext>
+}
+
+function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone, selectedId, selectedChain, registerRow, rail, canAdd, canCreate = true, onAdd, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule, panelRef }: {
   domain: Domain; title: string; hint: string; language: Language; t: (key: CopyKey) => string; tasks: Task[]; snapshot: BoardSnapshot; timeZone: string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; rail: React.ReactNode; canAdd: boolean; canCreate?: boolean; onAdd: () => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void; panelRef?: (element: HTMLElement | null) => void
+  onSort: (task: Task, targetId: string) => void
 }) {
   const topLevel = tasks.filter((task) => !task.parentId)
   const addEnabled = canAdd && canCreate
   return <section className={`panel-shell domain-${domain}`} ref={panelRef} aria-labelledby={`panel-${domain}`}>
     {rail}<div className="paper-panel"><div className="panel-top"><div><div className="eyebrow">{domain === 'long' ? '01' : domain === 'weekly' ? '02' : '03'}</div><h2 id={`panel-${domain}`}>{title}</h2><p>{hint}</p></div><button className="add-button" onClick={onAdd} disabled={!addEnabled}><Icon name="plus" />{t('addTask')}</button></div>
       {domain === 'daily' && tasks.some((task) => !task.checked && task.dateKey && task.dateKey < todayInTimeZone(snapshot.settings.timeZone)) ? <div className="past-note">{t('reschedule')}</div> : null}
-      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list">{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</div>}
+      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list"><SortableTaskList key={topLevel[0].cycleId || topLevel[0].weekKey || topLevel[0].dateKey} tasks={topLevel} t={t} onSort={onSort}>{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</SortableTaskList></div>}
       <div className="paper-space" />
     </div>
   </section>
 }
 
-function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selectedChain, registerRow, onEdit, onDelete, onToggle, onReorder, onSelect, onAddSubtask, onReschedule }: {
+function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selectedChain, registerRow, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule }: {
   task: Task; childrenTasks: Task[]; timeZone: string; language: Language; t: (key: CopyKey) => string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void
+  onSort: (task: Task, targetId: string) => void
 }) {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: task.id })
   const isPast = task.domain === 'daily' && Boolean(task.dateKey && task.dateKey < todayInTimeZone(timeZone)) && !task.checked
-  return <div className="task-tree"><div className={`task-row ${selectedId === task.id ? 'selected' : ''} ${selectedChain.has(task.id) ? 'is-linked' : ''} ${task.checked ? 'is-checked' : ''}`} data-task-id={task.id} ref={registerRow(task.id)}>
+  return <div className={`task-tree ${isDragging ? 'is-dragging' : ''}`} ref={setNodeRef} style={{ transform: CSS.Translate.toString(transform), transition }}><div className={`task-row ${selectedId === task.id ? 'selected' : ''} ${selectedChain.has(task.id) ? 'is-linked' : ''} ${task.checked ? 'is-checked' : ''}`} data-task-id={task.id} ref={registerRow(task.id)}>
+    <button type="button" className="drag-handle" ref={setActivatorNodeRef} {...attributes} {...listeners} aria-roledescription={t('dragTask')} aria-label={`${t('dragTask')}: ${task.title}`} title={t('dragInstructions')}><Icon name="grip" /></button>
     <button className="task-select" onClick={() => onSelect(task.id)} aria-label={`${t('taskDetails')}: ${task.title}`}><span className={`task-stroke stroke-${task.color}`} /></button>
     <input type="checkbox" checked={task.checked} onChange={() => onToggle(task)} aria-label={`${task.title} · ${task.checked ? t('taskChecked') : t('taskUnchecked')}`} />
-    <button className="task-title" onClick={() => onSelect(task.id)} title={task.note || task.title}><span>{task.title}</span>{task.note ? <small>{task.note}</small> : null}</button>
+    <button className="task-title" onClick={() => { onSelect(task.id); onEdit(task) }} title={t('taskDetails')}><span>{task.title}</span>{task.note ? <small>{task.note}</small> : null}</button>
     {task.upperTaskId ? <span className="link-mark" title={t('association')}><Icon name="link" /></span> : null}
     {isPast && onReschedule ? <button className="row-action reschedule-action" onClick={() => onReschedule(task)}>{t('reschedule')}</button> : null}
     <div className="row-actions">{!task.parentId ? <button className="row-icon" aria-label={t('addSubtask')} title={t('addSubtask')} onClick={() => onAddSubtask(task)}><Icon name="subtask" /></button> : null}<button className="row-icon" aria-label={t('moveUp')} title={t('moveUp')} onClick={() => onReorder(task, -1)}><Icon name="up" /></button><button className="row-icon" aria-label={t('moveDown')} title={t('moveDown')} onClick={() => onReorder(task, 1)}><Icon name="down" /></button><button className="row-icon" aria-label={t('edit')} title={t('edit')} onClick={() => onEdit(task)}><Icon name="edit" /></button><button className="row-icon danger" aria-label={t('delete')} title={t('delete')} onClick={() => onDelete(task)}><Icon name="trash" /></button></div>
-  </div>{childrenTasks.length ? <div className="subtask-list">{childrenTasks.map((child) => <TaskRow key={child.id} task={child} childrenTasks={[]} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</div> : null}</div>
+  </div>{childrenTasks.length ? <div className="subtask-list"><SortableTaskList tasks={childrenTasks} t={t} onSort={onSort}>{childrenTasks.map((child) => <TaskRow key={child.id} task={child} childrenTasks={[]} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</SortableTaskList></div> : null}</div>
 }
 
 function FocusPanel({ blocks, allTasks, selectedDate, language, t, now, rail, canAdd = true, onAdd, onEdit, onDelete, onCommand, panelRef }: {
@@ -1246,8 +1303,8 @@ function TaskDialog({ task, domain, parentId, initial, placement, tasks, languag
     valueFor(domain, candidate) === valueFor(domain, ownPlacement))
   return <Dialog closeLabel={t('close')} title={task ? t('edit') : parentId ? t('addSubtask') : t('addTask')} onClose={onClose} initialFocus="task-title">
     <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (!title.trim()) return; onSubmit({ title, note, color, upperTaskId: selectedParent ? undefined : upperTaskId || undefined, parentId: selectedParent || undefined }) }}>
-      <label>{t('title')}<input id="task-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={300} required /></label>
-      <label>{t('note')}<textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={2000} rows={3} /></label>
+      <label>{t('title')}<input id="task-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={MAX_TASK_TITLE_LENGTH} required /></label>
+      <label>{t('note')}<textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={MAX_TASK_NOTE_LENGTH} rows={5} /></label>
       <fieldset className="color-field"><legend>{t('color')}</legend><div className="color-picker">{([['ink', 'colorInk'], ['blue', 'colorBlue'], ['orange', 'colorOrange'], ['green', 'colorGreen'], ['violet', 'colorViolet']] as const).map(([value, label]) => <label className={`color-choice color-${value}`} key={value} title={t(label)}><input type="radio" name="task-color" value={value} checked={color === value} onChange={() => setColor(value)} /><span className="color-swatch" aria-hidden="true" /><span className="sr-only">{t(label)}</span></label>)}</div></fieldset>
       {!parentId && domain !== 'long' ? <TaskChoice id="task-association" label={t('association')} value={upperTaskId} noneLabel={t('none')} options={upperOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setUpperTaskId(value); if (value) setSelectedParent('') }} /> : null}
       {!task && !parentId ? <TaskChoice id="task-parent" label={t('parentTask')} value={selectedParent} noneLabel={t('none')} options={parentOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setSelectedParent(value); if (value) setUpperTaskId('') }} /> : null}
@@ -1331,8 +1388,9 @@ function BrandMark() {
   </svg>
 }
 
-function Icon({ name }: { name: 'plus' | 'edit' | 'trash' | 'up' | 'down' | 'subtask' | 'link' | 'sliders' | 'refresh' | 'close' | 'back' }) {
+function Icon({ name }: { name: 'plus' | 'edit' | 'trash' | 'up' | 'down' | 'subtask' | 'link' | 'sliders' | 'refresh' | 'close' | 'back' | 'grip' }) {
   const paths: Record<string, React.ReactNode> = {
+    grip: <path d="M9 5h.01M15 5h.01M9 12h.01M15 12h.01M9 19h.01M15 19h.01" strokeWidth="3" />,
     plus: <><path d="M12 5v14M5 12h14" /></>, edit: <><path d="M4 16.5V20h3.5L18.7 8.8l-3.5-3.5L4 16.5Z" /><path d="m13.5 6.5 3.5 3.5" /></>, trash: <><path d="M5 7h14M10 11v5M14 11v5M7 7l1 13h8l1-13M9 7V4h6v3" /></>, up: <path d="m6 14 6-6 6 6" />, down: <path d="m6 10 6 6 6-6" />, subtask: <><path d="M5 6h14M5 12h9M5 18h6" /><path d="M17 15v6M14 18h6" /></>, link: <><path d="M9.5 14.5 14.5 9.5" /><path d="M7 17H5.5a3.5 3.5 0 0 1 0-7H9M15 7h1.5a3.5 3.5 0 0 1 0 7H15" /></>, sliders: <><path d="M4 6h16M4 12h16M4 18h16" /><circle cx="9" cy="6" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="8" cy="18" r="2" /></>, refresh: <><path d="M20 11a8 8 0 0 0-14-4L4 9" /><path d="M4 4v5h5M4 13a8 8 0 0 0 14 4l2-2" /><path d="M20 20v-5h-5" /></>, close: <><path d="m6 6 12 12M18 6 6 18" /></>, back: <><path d="M9.5 5.5 5 10l4.5 4.5" /><path d="M5 10h8.5a4.5 4.5 0 0 1 0 9H9" /></>,
   }
   return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
