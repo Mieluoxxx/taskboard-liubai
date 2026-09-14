@@ -8,14 +8,6 @@ export type Domain = 'long' | 'weekly' | 'daily'
 
 export type TaskColor = 'ink' | 'blue' | 'orange' | 'green' | 'violet'
 
-export interface PlacementSnapshot {
-  domain: Domain
-  cycleId?: string
-  weekKey?: string
-  dateKey?: string
-  recordedAt: string
-}
-
 export interface Task {
   id: string
   domain: Domain
@@ -30,7 +22,6 @@ export interface Task {
   dateKey?: string
   parentId?: string
   upperTaskId?: string
-  history: PlacementSnapshot[]
   archivedAt?: string
   archivedReason?: 'rescheduled'
   rescheduledTo?: string

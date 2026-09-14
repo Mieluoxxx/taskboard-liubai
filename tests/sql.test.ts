@@ -8,7 +8,7 @@ const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
 const THIRD = '00000000-0000-0000-0000-000000000003'
 
-async function database(applyIndependentMigration = true, applyTextLimits = true) {
+async function database(applyIndependentMigration = true, applyTextLimits = true, applyHistoryRemoval = true) {
   const db = new PGlite()
   await db.waitReady
   await db.exec(`
@@ -25,6 +25,7 @@ async function database(applyIndependentMigration = true, applyTextLimits = true
   if (!applyIndependentMigration) await db.exec(`insert into private.owner_config(owner_uuid) values ('${OWNER}');`)
   if (applyIndependentMigration) await db.exec(await readFile(new URL('../supabase/migrations/002_independent_boards.sql', import.meta.url), 'utf8'))
   if (applyIndependentMigration && applyTextLimits) await db.exec(await readFile(new URL('../supabase/migrations/003_task_text_limits.sql', import.meta.url), 'utf8'))
+  if (applyIndependentMigration && applyTextLimits && applyHistoryRemoval) await db.exec(await readFile(new URL('../supabase/migrations/004_remove_task_history.sql', import.meta.url), 'utf8'))
   await db.exec(`select set_config('request.jwt.claim.sub', '${OWNER}', false);`)
   return db
 }
@@ -37,10 +38,12 @@ test('task text limits migrate without touching existing data or other validatio
     .replace("private.utf16_length(item->>'title') > 300", "private.utf16_length(item->>'title') > 450")
     .replace("private.utf16_length(item->>'note') > 2000", "private.utf16_length(item->>'note') > 3000")
   assert.equal(migration.match(validator)![0], expected, 'only task text bounds may change in the database validator')
-  const db = await database(true, false)
+  const db = await database(true, false, false)
   try {
     await db.query('select * from public.get_private_board()')
-    const legacy = addTask(emptySnapshot('UTC'), createTask({ domain: 'daily', title: 'existing', note: 'first\nsecond', dateKey: '2025-01-15' }))
+    // 004 之前的旧快照形状：history 键仍然存在，001/003 的校验器要求它是数组。
+    const base = addTask(emptySnapshot('UTC'), createTask({ domain: 'daily', title: 'existing', note: 'first\nsecond', dateKey: '2025-01-15' }))
+    const legacy = { ...base, tasks: [{ ...base.tasks[0], history: [] }] }
     await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(legacy)])
     const expanded = { ...legacy, tasks: [{ ...legacy.tasks[0], title: '中'.repeat(450), note: 'x'.repeat(3000) }] }
     await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(expanded)]), /invalid/i)
@@ -209,7 +212,7 @@ test('the SQL validator rejects the same malformed snapshots the client rejects'
   }
 })
 
-test('a task or history entry missing its placement key is rejected, not silently accepted via SQL NULL semantics', async () => {
+test('a task missing its placement key is rejected, not silently accepted via SQL NULL semantics', async () => {
   const db = await database()
   try {
     const loaded = await db.query<{ snapshot: Record<string, unknown> }>('select snapshot from public.get_private_board()')
@@ -223,8 +226,6 @@ test('a task or history entry missing its placement key is rejected, not silentl
       ['weekly with no weekKey', { tasks: [task({ domain: 'weekly' })] }],
       ['daily with no dateKey', { tasks: [task({ domain: 'daily' })] }],
       ['long with no cycleId', { tasks: [task({ domain: 'long' })] }],
-      ['weekly history with no weekKey', { tasks: [{ ...task({ domain: 'weekly', weekKey: '2020-W53' }), history: [{ domain: 'weekly', recordedAt: now }] }] }],
-      ['history with only an empty cycleId', { tasks: [{ ...task({ domain: 'weekly', weekKey: '2020-W53' }), history: [{ domain: 'long', cycleId: '', recordedAt: now }] }] }],
     ]
     for (const [label, patch] of cases) {
       await assert.rejects(
@@ -242,7 +243,6 @@ test('SQL type checks use NULL-safe comparison, so a missing key cannot bypass v
   const base = { schemaVersion: 1, settings: { timeZone: 'UTC' }, cycles: [], tasks: [], focusBlocks: [] }
   const now = '2025-01-15T12:00:00.000Z'
   const cases: Array<[string, unknown]> = [
-    ['task missing the history array', { ...base, tasks: [{ id: 't1', domain: 'daily', title: 'x', note: '', checked: false, color: 'ink', dateKey: '2025-01-15', createdAt: now, updatedAt: now }] }],
     ['snapshot missing the cycles key', { schemaVersion: 1, settings: { timeZone: 'UTC' }, tasks: [], focusBlocks: [] }],
     ['snapshot missing the tasks key', { schemaVersion: 1, settings: { timeZone: 'UTC' }, cycles: [], focusBlocks: [] }],
     ['snapshot missing the focusBlocks key', { schemaVersion: 1, settings: { timeZone: 'UTC' }, cycles: [], tasks: [] }],
@@ -308,48 +308,62 @@ test('a snapshot produced by the client always passes the database validator', a
   }
 })
 
-test('history placement must be domain-consistent, matching the client validator', async () => {
+test('004 removes only the history checks, keeping every other rule and all stored boards intact', async () => {
+  const migration003 = await readFile(new URL('../supabase/migrations/003_task_text_limits.sql', import.meta.url), 'utf8')
+  const migration004 = await readFile(new URL('../supabase/migrations/004_remove_task_history.sql', import.meta.url), 'utf8')
+  const validator = /create or replace function private\.validate_board_snapshot\(input jsonb\)[\s\S]+?\$\$;/
+  // 与 003 的守卫测试同一手法：004 的校验器必须等于 003 的校验器减去 history 相关语句，一字不多不少。
+  const expected = migration003.match(validator)![0]
+    .replace(/^  history_item jsonb;\n/m, '')
+    .replace(/^      or jsonb_typeof\(item->'history'\) is distinct from 'array'\n/m, '')
+    .replace(/^    for history_item[\s\S]*?^    end loop;\n/m, "    -- 004 起不再要求或校验 item->'history'：旧快照里残留的该键被容忍，由客户端在读取时丢弃。\n")
+  assert.equal(migration004.match(validator)![0], expected, 'only the history checks may be removed in the database validator')
+
   const now = '2025-01-15T12:00:00.000Z'
-  const weekly = (history: Array<Record<string, unknown>>) => ({
-    schemaVersion: 1,
-    settings: { timeZone: 'UTC' },
-    cycles: [],
-    tasks: [{ id: 't1', domain: 'weekly', title: 'x', note: '', checked: false, color: 'ink', weekKey: '2020-W53', history, createdAt: now, updatedAt: now }],
-    focusBlocks: [],
-  })
-  // history records the ORIGINAL placement, so an entry may legitimately describe another domain;
-  // what must hold is that each entry carries exactly the placement key its own domain uses.
-  const rejected: Array<[string, Array<Record<string, unknown>>]> = [
-    ['a long history entry with no cycleId', [{ domain: 'long', recordedAt: now }]],
-    ['a daily history entry with no dateKey', [{ domain: 'daily', recordedAt: now }]],
-    ['a weekly history entry carrying a dateKey too', [{ domain: 'weekly', weekKey: '2020-W53', dateKey: '2025-01-15', recordedAt: now }]],
-    ['a long history entry carrying a weekKey as well', [{ domain: 'long', cycleId: 'c1', weekKey: '2020-W53', recordedAt: now }]],
-  ]
-  for (const [label, history] of rejected) {
-    const db = await database()
-    try {
-      await db.query('select * from public.get_private_board()')
-      await assert.rejects(
-        db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(weekly(history))]),
-        /invalid/i,
-        `expected SQL to reject: ${label}`,
-      )
-    } finally {
-      await db.close()
-    }
-  }
-  // a consistent weekly history entry is still accepted and round-trips through the client validator
-  const db = await database()
+  const payload = (task: Record<string, unknown>) => ({ schemaVersion: 1, settings: { timeZone: 'UTC' }, cycles: [], tasks: [task], focusBlocks: [] })
+  const legacyTask = { id: 't1', domain: 'weekly', title: 'x', note: '', checked: false, color: 'ink', weekKey: '2020-W53', history: [], createdAt: now, updatedAt: now }
+  const { history: legacyHistory, ...taskWithoutHistory } = legacyTask
+  assert.deepEqual(legacyHistory, [])
+  const db = await database(true, true, false)
   try {
     await db.query('select * from public.get_private_board()')
-    const snapshot = weekly([{ domain: 'weekly', weekKey: '2020-W52', recordedAt: now }])
-    const saved = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(snapshot)])
-    assert.equal(Number(saved.rows[0].revision), 1)
-    const loaded = await db.query<{ snapshot: unknown }>('select * from public.get_private_board()')
-    validateSnapshot(loaded.rows[0].snapshot)
+    // 003 的校验器仍要求 history 是数组：这就是 004 必须先于新版前端发布的原因。
+    await assert.rejects(
+      db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(payload(taskWithoutHistory))]),
+      /invalid/i,
+      'pre-004 the database must still require the history array',
+    )
+    const beforeMigration = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(payload(legacyTask))])
+    assert.equal(Number(beforeMigration.rows[0].revision), 1)
+    await db.exec(migration004)
+    // 只放宽校验：已存快照与 revision 不变，之后缺 history 与携带旧值两种写入都通过。
+    const preserved = await db.query<{ revision: number; snapshot: unknown }>('select * from public.get_private_board()')
+    assert.equal(Number(preserved.rows[0].revision), 1)
+    assert.deepEqual(preserved.rows[0].snapshot, JSON.parse(JSON.stringify(payload(legacyTask))))
+    const withoutHistory = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(payload(taskWithoutHistory))])
+    assert.equal(Number(withoutHistory.rows[0].revision), 2)
+    // 旧客户端写入的形状不再被重新校验：数据库容忍它，客户端读取时丢弃它。
+    const legacyShaped = await db.query<{ revision: number }>('select * from public.cas_save_private_board($1, $2::jsonb)', [2, JSON.stringify(payload({ ...legacyTask, history: [{ domain: 'long', cycleId: 'c1', weekKey: '2020-W53', dateKey: null, recordedAt: now }] }))])
+    assert.equal(Number(legacyShaped.rows[0].revision), 3)
   } finally {
     await db.close()
   }
+})
+
+test('the client drops a legacy history key instead of rejecting or re-writing it', () => {
+  const now = '2025-01-15T12:00:00.000Z'
+  const legacy = {
+    schemaVersion: 1, settings: { timeZone: 'UTC' }, cycles: [],
+    tasks: [{
+      id: 't1', domain: 'weekly', title: 'x', note: '', checked: false, color: 'ink', weekKey: '2020-W53',
+      history: [{ domain: 'long', cycleId: 'c1', recordedAt: now }], createdAt: now, updatedAt: now,
+    }],
+    focusBlocks: [],
+  }
+  const canonical = validateSnapshot(legacy)
+  assert.equal('history' in canonical.tasks[0], false, 'a legacy key must not survive into the canonical snapshot')
+  // 规范化后的快照可以原样回写，回写路径不需要旧键（save 会落盘这个已验证的结果）。
+  assert.doesNotThrow(() => validateSnapshot(JSON.parse(JSON.stringify(canonical))))
 })
 
 test('the database requires the same JSON types the client requires, not just matching text', async () => {
@@ -410,7 +424,6 @@ test('the database agrees with the client on explicit JSON nulls and whitespace-
     ['task with archivedReason: null', { ...base, tasks: [task({ archivedReason: null })] }],
     ['focus block with startedAt: null', { ...base, focusBlocks: [block({ startedAt: null })] }],
     ['focus block with taskId: null', { ...base, focusBlocks: [block({ taskId: null })] }],
-    ['history entry with dateKey: null', { ...base, tasks: [weekly({ history: [{ domain: 'long', cycleId: 'c1', dateKey: null, recordedAt: now }] })] }],
     ['whitespace-only task title', { ...base, tasks: [task({ title: '   ' })] }],
     ['whitespace-only cycle name', { ...base, cycles: [{ id: 'c', name: '  ', startDate: '2025-01-01', endDate: '2025-02-01', createdAt: now }] }],
     ['whitespace-only focus title', { ...base, focusBlocks: [block({ title: ' ' })] }],

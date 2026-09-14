@@ -87,7 +87,7 @@ test('deleting an upper task detaches lower associations without cross-domain ca
   assert.equal(snapshot.tasks.find((task) => task.id === daily.id)?.upperTaskId, weekly.id)
 })
 
-test('rescheduling keeps original placement history and avoids duplicate active copies', () => {
+test('rescheduling archives the original placement and avoids duplicate active copies', () => {
   let snapshot = board()
   const root = createTask({ domain: 'daily', title: 'Move me', dateKey: '2025-01-10' }, NOW)
   const child = createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-10', parentId: root.id }, NOW)
@@ -98,7 +98,8 @@ test('rescheduling keeps original placement history and avoids duplicate active 
   assert.equal(active.length, 2)
   assert.equal(archived.length, 2)
   assert.equal(active[0].dateKey, '2025-01-16')
-  assert.equal(active[0].history.at(-1)?.dateKey, '2025-01-10')
+  // 原放置只保留在归档条目上：不再抄写一份放置快照到新任务。
+  assert.equal(archived.find((task) => task.title === 'Move me')?.dateKey, '2025-01-10')
   assert.equal(archived[0].rescheduledTo, active.find((task) => task.title === archived[0].title)?.id)
   const nextRoot = active.find((task) => task.title === 'Move me')!
   snapshot = rescheduleDailyTask(snapshot, nextRoot.id, '2025-01-18', '2025-01-16T12:00:00.000Z')

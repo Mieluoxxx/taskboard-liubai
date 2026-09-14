@@ -122,8 +122,10 @@ export class SupabaseBoardAdapter implements BoardAdapter {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       return { ok: false, kind: 'offline', code: 'noticeOffline', message: 'Offline: save paused and draft kept' }
     }
+    // 只落盘校验后的规范快照：旧快照里已废弃的键（例如 history）读取时就被剥掉，不会回写云端。
+    let canonical: BoardSnapshot
     try {
-      validateSnapshot(snapshot)
+      canonical = validateSnapshot(snapshot)
     } catch (caught) {
       return { ok: false, kind: 'error', code: 'noticeInvalidState', message: caught instanceof Error ? caught.message : 'Board is invalid' }
     }
@@ -131,7 +133,7 @@ export class SupabaseBoardAdapter implements BoardAdapter {
     try {
       response = await this.client.rpc('cas_save_private_board', {
         p_expected_revision: expectedRevision,
-        p_snapshot: snapshot,
+        p_snapshot: canonical,
       })
     } catch (caught) {
       return adapterError({ message: caught instanceof Error ? caught.message : String(caught) })
@@ -178,16 +180,16 @@ function demoSample(): StoredBoard {
   const now = new Date().toISOString()
   const cycle: GoalCycle = { id: createId('cycle'), name: `留白 · ${dateKey.slice(0, 4)}`, startDate: cycleStart, endDate: cycleEnd, createdAt: now }
   const longTask: Task = {
-    id: createId('task'), domain: 'long', title: '建立有余地的生活节奏 · Make room for a steady rhythm', note: '让长期方向可以被每周的小步行动看见。 Let small weekly steps reveal the long direction.', checked: false, color: 'blue', createdAt: now, updatedAt: now, cycleId: cycle.id, history: [],
+    id: createId('task'), domain: 'long', title: '建立有余地的生活节奏 · Make room for a steady rhythm', note: '让长期方向可以被每周的小步行动看见。 Let small weekly steps reveal the long direction.', checked: false, color: 'blue', createdAt: now, updatedAt: now, cycleId: cycle.id,
   }
   const weeklyTask: Task = {
-    id: createId('task'), domain: 'weekly', title: '整理本周的注意力边界 · Shape this week’s attention', note: '删掉一个不必要的承诺。 Remove one unnecessary promise.', checked: false, color: 'orange', createdAt: now, updatedAt: now, weekKey: week, upperTaskId: longTask.id, history: [],
+    id: createId('task'), domain: 'weekly', title: '整理本周的注意力边界 · Shape this week’s attention', note: '删掉一个不必要的承诺。 Remove one unnecessary promise.', checked: false, color: 'orange', createdAt: now, updatedAt: now, weekKey: week, upperTaskId: longTask.id,
   }
   const dailyTask: Task = {
-    id: createId('task'), domain: 'daily', title: '写下今天最重要的一步 · Name today’s next step', note: '完成后再决定下一步。 Decide what follows only after this.', checked: false, color: 'green', createdAt: now, updatedAt: now, dateKey, upperTaskId: weeklyTask.id, history: [],
+    id: createId('task'), domain: 'daily', title: '写下今天最重要的一步 · Name today’s next step', note: '完成后再决定下一步。 Decide what follows only after this.', checked: false, color: 'green', createdAt: now, updatedAt: now, dateKey, upperTaskId: weeklyTask.id,
   }
   const subtask: Task = {
-    id: createId('task'), domain: 'daily', title: '关掉一个通知入口 · Close one notification door', note: '', checked: true, color: 'ink', createdAt: now, updatedAt: now, dateKey, parentId: dailyTask.id, history: [],
+    id: createId('task'), domain: 'daily', title: '关掉一个通知入口 · Close one notification door', note: '', checked: true, color: 'ink', createdAt: now, updatedAt: now, dateKey, parentId: dailyTask.id,
   }
   const block: FocusBlock = {
     id: createId('focus'), dateKey, title: '深度工作 · 设计下一页 · Shape the next page', taskId: dailyTask.id, durationMinutes: 90, status: 'finished', elapsedMs: 90 * 60_000, finishedAt: now, createdAt: now,
@@ -228,8 +230,7 @@ class DemoBoardAdapter implements BoardAdapter {
         const raw = storage?.getItem(DEMO_STORAGE_KEY) || null
         const baseline = raw ? parseStoredBoard(JSON.parse(raw)) : demoSample()
         if (baseline.revision !== expectedRevision) return { ok: false, kind: 'conflict', code: 'noticeConflictDemo', message: 'Demo board changed in another tab' }
-        validateSnapshot(snapshot)
-        const next: StoredBoard = { revision: expectedRevision + 1, snapshot }
+        const next: StoredBoard = { revision: expectedRevision + 1, snapshot: validateSnapshot(snapshot) }
         storage?.setItem(DEMO_STORAGE_KEY, JSON.stringify(next))
         return { ok: true, value: next }
       }

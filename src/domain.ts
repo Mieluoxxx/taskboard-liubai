@@ -1,5 +1,5 @@
 import { BoardError } from './notices'
-import type { BoardSnapshot, Domain, FocusBlock, FocusStatus, GoalCycle, PlacementSnapshot, Task, TaskColor } from './types'
+import type { BoardSnapshot, Domain, FocusBlock, FocusStatus, GoalCycle, Task, TaskColor } from './types'
 
 export const MAX_BOARD_BYTES = 900_000
 export const MAX_TASKS = 2_000
@@ -201,29 +201,6 @@ function optionalString(record: Record<string, unknown>, key: string): string | 
   return value
 }
 
-function parseHistory(value: unknown): PlacementSnapshot[] {
-  if (!Array.isArray(value)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
-  return value.map((raw) => {
-    if (!isRecord(raw) || !validEnum(raw.domain, ['long', 'weekly', 'daily'] as const) ||
-      !validIso(raw.recordedAt)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
-    const recordedAt = raw.recordedAt
-    const cycleId = optionalString(raw, 'cycleId')
-    const week = optionalString(raw, 'weekKey')
-    const date = raw.dateKey
-    if (date !== undefined && !isDateKey(date)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
-    if (raw.domain === 'long' && (!cycleId || week !== undefined || date !== undefined)) throw new BoardError('noticeInvalidState', 'Task history is invalid')
-    if (raw.domain === 'weekly' && (cycleId !== undefined || date !== undefined || !validWeekKey(week))) throw new BoardError('noticeInvalidState', 'Task history is invalid')
-    if (raw.domain === 'daily' && (cycleId !== undefined || week !== undefined || !isDateKey(date))) throw new BoardError('noticeInvalidState', 'Task history is invalid')
-    return {
-      domain: raw.domain,
-      ...(cycleId ? { cycleId } : {}),
-      ...(week ? { weekKey: week } : {}),
-      ...(date ? { dateKey: date } : {}),
-      recordedAt,
-    }
-  })
-}
-
 /** 所有外部快照先验证，再进入 React 或变更辅助函数。 */
 export function validateSnapshot(value: unknown): BoardSnapshot {
   if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.settings)) {
@@ -269,7 +246,6 @@ export function validateSnapshot(value: unknown): BoardSnapshot {
     if (date !== undefined && !isDateKey(date)) throw new BoardError('noticeInvalidState', 'Board task placement is invalid')
     const parentId = optionalString(raw, 'parentId')
     const upperTaskId = optionalString(raw, 'upperTaskId')
-    const history = parseHistory(raw.history)
     if (raw.domain === 'long' && (!cycleId || !cycleIds.has(cycleId) || week !== undefined || date !== undefined)) throw new BoardError('noticeInvalidState', 'Long-term task placement is invalid')
     if (raw.domain === 'weekly' && (cycleId !== undefined || date !== undefined || !validWeekKey(week))) throw new BoardError('noticeInvalidState', 'Weekly task placement is invalid')
     if (raw.domain === 'daily' && (cycleId !== undefined || week !== undefined || !isDateKey(date))) throw new BoardError('noticeInvalidState', 'Daily task placement is invalid')
@@ -290,7 +266,7 @@ export function validateSnapshot(value: unknown): BoardSnapshot {
     taskIds.add(id)
     tasks.push({
       id, domain, title, note, checked, color,
-      createdAt, updatedAt, history,
+      createdAt, updatedAt,
       ...(cycleId ? { cycleId } : {}), ...(week ? { weekKey: week } : {}), ...(date ? { dateKey: date } : {}),
       ...(parentId ? { parentId } : {}), ...(upperTaskId ? { upperTaskId } : {}),
       ...(archivedAt ? { archivedAt } : {}), ...(archivedReason ? { archivedReason } : {}), ...(rescheduledTo ? { rescheduledTo } : {}),
@@ -312,7 +288,7 @@ export function validateSnapshot(value: unknown): BoardSnapshot {
       const allowed = task.domain === 'weekly' ? upper?.domain === 'long' : task.domain === 'daily' ? upper?.domain === 'weekly' : false
       if (!upper || upper.parentId !== undefined || !allowed || upper.id === task.id) throw new BoardError('noticeInvalidState', 'Task association is invalid')
     }
-    if (task.rescheduledTo !== undefined && !taskById.has(task.rescheduledTo)) throw new BoardError('noticeInvalidState', 'Reschedule history target is invalid')
+    if (task.rescheduledTo !== undefined && !taskById.has(task.rescheduledTo)) throw new BoardError('noticeInvalidState', 'Reschedule target is invalid')
   }
 
   const focusBlocks: FocusBlock[] = []
@@ -355,16 +331,6 @@ export function cloneSnapshot(snapshot: BoardSnapshot): BoardSnapshot {
 
 export function activeTasks(snapshot: BoardSnapshot, domain?: Domain): Task[] {
   return snapshot.tasks.filter((task) => !task.archivedAt && (!domain || task.domain === domain))
-}
-
-export function taskPlacement(task: Task): PlacementSnapshot {
-  return {
-    domain: task.domain,
-    ...(task.cycleId ? { cycleId: task.cycleId } : {}),
-    ...(task.weekKey ? { weekKey: task.weekKey } : {}),
-    ...(task.dateKey ? { dateKey: task.dateKey } : {}),
-    recordedAt: task.updatedAt,
-  }
 }
 
 export function updateTask(snapshot: BoardSnapshot, taskId: string, patch: Partial<Task>, now = new Date().toISOString()): BoardSnapshot {
@@ -492,7 +458,6 @@ export function rescheduleDailyTask(snapshot: BoardSnapshot, taskId: string, tar
       id: idMap.get(task.id) as string,
       dateKey: targetDate,
       parentId: task.parentId ? idMap.get(task.parentId) : undefined,
-      history: [...task.history, taskPlacement(task)],
       createdAt: now,
       updatedAt: now,
       archivedAt: undefined,
@@ -537,7 +502,6 @@ export function createTask(input: {
     dateKey: input.dateKey,
     upperTaskId: input.upperTaskId,
     parentId: input.parentId,
-    history: [],
   }
   return task
 }

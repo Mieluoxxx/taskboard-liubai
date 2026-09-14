@@ -14,15 +14,15 @@ Liubai 是一个个人规划看板：长期目标、周计划、日计划和专�
 ## 拖拽排序
 
 - 使用 `@dnd-kit/core` + `@dnd-kit/sortable`，长期、周、日任务均可通过独立手柄排序；支持指针（鼠标、触屏）和键盘。聚焦手柄后，空格或回车提起／放下，上下方向键移动，Esc 取消；仍保留上移／下移按钮。
-- 只在当前放置的同级列表内排序，父任务携带子任务整体移动；子任务只在同一父任务下排序，不跨列转换实体、不更改关联、日期、历史或完成状态。
+- 只在当前放置的同级列表内排序，父任务携带子任务整体移动；子任务只在同一父任务下排序，不跨列转换实体、不更改关联、日期或完成状态。
 - 只在有效落点结束拖拽时提交一次现有快照 CAS；取消、原位置或列表外落点不保存。失败可重试，直接操作冲突沿用确认后加载最新并手动重做，不覆盖远端改动。切换查看的周期／周／日会终止原列表的拖拽。
 
-## 周期和历史
+## 周期和重排
 
 - 长期周期为自定义含首尾日期的范围；周使用 ISO Monday-Sunday 周；日使用本地日历日期。
 - 日期键以浏览器设置的时区解释。日期运算在 UTC noon 进行，避免 DST 导致日期漂移；时间戳始终保存 ISO 时间戳。
-- 过去未完成的任务只作为“建议重新安排”，不会自动滚动。用户确认重新安排时，旧任务保留为 `archivedAt` + `archivedReason: rescheduled`，其 `rescheduledTo` 指向新任务；新任务的 `history` 追加旧放置快照。这样重复重新安排会形成可审阅链，不会覆盖原放置，也不会复制同一次操作。
-- 历史在任务编辑面板中可见；已归档的旧放置不会显示为当前活跃任务。
+- 过去未完成的任务只作为“建议重新安排”，不会自动滚动。用户确认重新安排时旧任务保留为 `archivedAt` + `archivedReason: rescheduled`，其 `rescheduledTo` 指向新任务。这样重复重新安排会形成可审阅链，不会覆盖原放置，也不会复制同一次操作。
+- 任务不再保存放置历史：`history` 字段已移除（编辑器里的展示面板因无消费者被删掉，展示的是重复信息）。归档条目本身仍然保留原放置位置，因此“旧放置”这一事实有唯一来源。
 
 ## 专注块
 
@@ -61,10 +61,10 @@ Liubai 是一个个人规划看板：长期目标、周计划、日计划和专�
 - 标题与名称的空白/长度判定与 JS 语义对齐：`private.is_blank()` 覆盖制表符、NBSP、FEFF 等 `String.prototype.trim()` 会去掉的字符（`btrim` 默认只去空格）；`private.utf16_length()` 按 UTF-16 码元计数，与 `String.prototype.length` 相同（例如 160 个星号面字符在两侧都是 320）。
 - 上级关联必须是同域顶层任务：SQL 同样拒绝 `upperTaskId` 指向子任务，与 `validateSnapshot` 一致。
 - 校验强度两侧对齐：文本型字段（id/name/title/note/domain/color/status/schemaVersion）按 JSON 类型校验，`cycleId` 只与周期数组比对（不与任务 id 混用），因此数据库与客户端对同一快照判定一致。目标是两侧都不更宽松；若未来出现分歧，宁可数据库更严格（fail-closed）。
-- 历史条目的放置也必须与其自身 domain 一致（long↔cycleId、weekly↔weekKey、daily↔dateKey），与客户端 `parseHistory` 完全相同；否则数据库会存入客户端下次拒绝加载的快照。
+- `history` 字段自 `004_remove_task_history.sql` 起不在契约内：数据库既不要求也不校验它，客户端 `validateSnapshot` 读取时丢弃它。因此旧快照里残留的该键既不会被拒绝，也不会被回写（落盘的是校验后的规范快照）。`004` 必须先于新版前端执行，因为 `003` 的校验器仍要求该键是数组。
 - 客户端 bundle 只允许 `VITE_SUPABASE_` 前缀的环境变量（`envPrefix`），避免无关 `VITE_*` 变量被内联。
 - 演示模式是本地共享状态，写入通过浏览器原生 Web Locks 串行化，避免两个标签页互相覆盖。
-- `supabase/migrations/001_private_board.sql`、`002_independent_boards.sql` 与 `003_task_text_limits.sql` 的迁移链由 `tests/sql.test.ts` 在真实 Postgres（PGlite）中执行验证。
+- `supabase/migrations/001_private_board.sql`、`002_independent_boards.sql`、`003_task_text_limits.sql` 与 `004_remove_task_history.sql` 的迁移链由 `tests/sql.test.ts` 在真实 Postgres（PGlite）中执行验证。
 - 正常的直接操作（删除、勾选、排序、计时、重排等）仍通过快照 CAS 保护，但不创建表单草稿；保存中的反馈只使用固定高度的顶部状态指示器，避免页面因草稿条出现/消失而跳动。只有失败或离线时才显示恢复入口；表单来源可重新打开编辑器，直接操作冲突则先加载最新状态后由用户明确重做。
 
 ## 界面细节
