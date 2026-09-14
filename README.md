@@ -64,7 +64,7 @@ pnpm build
 3. 在 SQL Editor 中依次执行 `supabase/migrations/001_private_board.sql`、`002_independent_boards.sql`、`003_task_text_limits.sql`、`004_remove_task_history.sql`。已有项目只补执行尚未执行的迁移；不要重跑 `001` 或它顶部的旧 owner provisioning 注释。
    - `003` 把任务标题／备注上限从 300／2000 放宽到 450／3000，必须先执行，再发布新版前端；否则超过旧上限的文本会被云端拒绝。
    - `004` 停止要求与校验 `tasks[].history`。**同样必须先执行 `004`，再发布不写 `history` 的新版前端**，否则 `003` 的校验器会把每一个云保存都判为非法。
-   - 迁移后仍停留在旧页面（未刷新）的标签页继续写带 `history` 的快照：由于 `004` 只放宽校验，这些写入会被接受；但它们读到新版前端存下的无 `history` 快照时会报校验失败。刷新旧标签页即可，失败时草稿会保留在本地，不会被静默丢弃。
+   - 迁移后仍停留在旧页面（未刷新）的标签页继续写带 `history` 的快照：由于 `004` 只放宽校验，这些写入会被接受；但它们读到新版前端存下的无 `history` 快照时会报校验失败。**草稿只存在页面内存里**（没有本地持久化），刷新前请先点恢复入口把失败保存的内容重新编辑或复制出来，否则刷新会丢弃它。
 4. 只把 `VITE_SUPABASE_URL` 与 publishable key（旧项目可用 anon key）写入 `.env.local`，重启 Vite。每个账号只能访问自己的看板。
 5. 手动密码重置请由项目管理员在 Supabase Auth 用户管理处完成；应用不会伪造不存在的 dashboard 功能。
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { adapterError, createDemoBoardAdapter, createSessionBoundFetch } from '../src/storage'
+import { adapterError, createDemoBoardAdapter, createSessionBoundFetch, SupabaseBoardAdapter } from '../src/storage'
 import { cloneSnapshot } from '../src/domain'
 
 class MemoryStorage {
@@ -161,4 +161,53 @@ test('without Web Locks the demo adapter still saves, falling back to a plain re
   } finally {
     Reflect.deleteProperty(globalThis, 'navigator')
   }
+})
+
+// 004 之后 history 不再是契约的一部分：保存边界必须落盘校验后的规范快照，
+// 否则旧快照里残留的 history 会被一遍遍原样回写。调用方传入的对象不能被就地修改。
+const legacyBoardWithHistory = () => ({
+  schemaVersion: 1,
+  settings: { timeZone: 'UTC' },
+  cycles: [],
+  tasks: [{
+    id: 't1', domain: 'weekly', title: 'legacy', note: '', checked: false, color: 'ink', weekKey: '2020-W53',
+    history: [{ domain: 'long', cycleId: 'c1', recordedAt: '2025-01-15T12:00:00.000Z' }],
+    createdAt: '2025-01-15T12:00:00.000Z', updatedAt: '2025-01-15T12:00:00.000Z',
+  }],
+  focusBlocks: [],
+})
+
+test('the cloud save sends the canonical snapshot, so a legacy history key is not re-written', async () => {
+  const calls: Array<{ name: string; params: Record<string, unknown> }> = []
+  const client = {
+    rpc: async (name: string, params: Record<string, unknown>) => {
+      calls.push({ name, params })
+      return { data: [{ revision: 1, snapshot: params.p_snapshot }], error: null, status: 200 }
+    },
+  }
+  const adapter = new SupabaseBoardAdapter(client as never)
+  const legacy = legacyBoardWithHistory()
+  const result = await adapter.save(0, legacy as never)
+  assert.equal(result.ok, true)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, 'cas_save_private_board')
+  const sent = calls[0].params.p_snapshot as { tasks: Array<Record<string, unknown>> }
+  assert.equal('history' in sent.tasks[0], false, 'the RPC payload must not carry the legacy key')
+  assert.equal('history' in legacy.tasks[0], true, 'the caller input must not be mutated')
+})
+
+test('the demo save persists the canonical snapshot, so a legacy history key is not re-written', async () => {
+  const storage = new MemoryStorage()
+  Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true })
+  storage.clear()
+  const adapter = createDemoBoardAdapter()
+  const loaded = await adapter.load()
+  assert.equal(loaded.ok, true)
+  if (!loaded.ok) return
+  const legacy = legacyBoardWithHistory()
+  const saved = await adapter.save(loaded.value.revision, legacy as never)
+  assert.equal(saved.ok, true)
+  const stored = JSON.parse(storage.getItem('liubai-taskboard:demo-board:v1') as string)
+  assert.equal('history' in stored.snapshot.tasks[0], false, 'the stored snapshot must not carry the legacy key')
+  assert.equal('history' in legacy.tasks[0], true, 'the caller input must not be mutated')
 })
