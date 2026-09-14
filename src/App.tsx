@@ -896,7 +896,7 @@ export default function App() {
       </main>
       <footer className="app-footer"><span>{t('keyboard')}</span><span>{t('shortcuts')}</span>{adapter?.mode === 'demo' ? <span>{t('demoNote')}</span> : <span>{t('cloudNote')}</span>}</footer>
       {flash ? <div className="toast" role="status">{flash}</div> : null}
-      {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={{ cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} tasks={activeTasks(snapshot)} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId)} /> : null}
+      {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={{ cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} tasks={activeTasks(snapshot)} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId)} /> : null}
       {dialog?.kind === 'cycle' ? <CycleDialog key={dialog.cycle?.id || 'new'} cycle={dialog.cycle} initial={dialog.initial} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitCycle(input, dialog.cycle)} /> : null}
       {dialog?.kind === 'focus' ? <FocusDialog key={dialog.block?.id || 'new'} block={dialog.block} initial={dialog.initial} tasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitFocus(input, dialog.block)} /> : null}
       {dialog?.kind === 'settings' ? <SettingsDialog zone={snapshot.settings.timeZone} language={language} t={t} onClose={() => setDialog(null)} onLanguage={setLanguage} onSubmit={(zone) => { updateSettings(zone); setDialog(null) }} /> : null}
@@ -1275,7 +1275,7 @@ function TaskChoice({ id, label, value, noneLabel, options, onChange }: { id: st
   </div>
 }
 
-function TaskDialog({ task, domain, parentId, initial, placement, tasks, language, t, onClose, onSubmit }: { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement: { cycleId?: string; weekKey?: string; dateKey?: string }; tasks: Task[]; language: Language; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: TaskInput) => void }) {
+function TaskDialog({ task, domain, parentId, initial, placement, tasks, t, onClose, onSubmit }: { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement: { cycleId?: string; weekKey?: string; dateKey?: string }; tasks: Task[]; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: TaskInput) => void }) {
   const [title, setTitle] = useState(initial?.title || task?.title || '')
   const [note, setNote] = useState(initial?.note ?? task?.note ?? '')
   const [color, setColor] = useState<TaskColor>(initial?.color || task?.color || 'ink')
@@ -1308,7 +1308,6 @@ function TaskDialog({ task, domain, parentId, initial, placement, tasks, languag
       <fieldset className="color-field"><legend>{t('color')}</legend><div className="color-picker">{([['ink', 'colorInk'], ['blue', 'colorBlue'], ['orange', 'colorOrange'], ['green', 'colorGreen'], ['violet', 'colorViolet']] as const).map(([value, label]) => <label className={`color-choice color-${value}`} key={value} title={t(label)}><input type="radio" name="task-color" value={value} checked={color === value} onChange={() => setColor(value)} /><span className="color-swatch" aria-hidden="true" /><span className="sr-only">{t(label)}</span></label>)}</div></fieldset>
       {!parentId && domain !== 'long' ? <TaskChoice id="task-association" label={t('association')} value={upperTaskId} noneLabel={t('none')} options={upperOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setUpperTaskId(value); if (value) setSelectedParent('') }} /> : null}
       {!task && !parentId ? <TaskChoice id="task-parent" label={t('parentTask')} value={selectedParent} noneLabel={t('none')} options={parentOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setSelectedParent(value); if (value) setUpperTaskId('') }} /> : null}
-      {task?.history.length ? <div className="history-box"><strong>{t('history')}</strong>{task.history.map((item, index) => <div key={`${item.recordedAt}:${index}`}><span>{item.dateKey || item.weekKey || item.cycleId || item.domain}</span><small>{new Date(item.recordedAt).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</small></div>)}</div> : task ? <div className="history-box muted-box"><strong>{t('history')}</strong><span>{t('noHistory')}</span></div> : null}
       <div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div>
     </form>
   </Dialog>
