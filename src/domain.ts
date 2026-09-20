@@ -443,12 +443,9 @@ export function reorderSiblingTo(snapshot: BoardSnapshot, taskId: string, target
   return { ...snapshot, tasks: snapshot.tasks.map((candidate) => slots.has(candidate) ? siblings[index++] : candidate) }
 }
 
-export function rescheduleDailyTask(snapshot: BoardSnapshot, taskId: string, targetDate: string, now = new Date().toISOString()): BoardSnapshot {
-  if (!isDateKey(targetDate)) throw new BoardError('noticeRescheduleInvalid', 'Choose a valid target date')
-  const next = cloneSnapshot(snapshot)
-  const root = next.tasks.find((task) => task.id === taskId && !task.archivedAt)
-  if (!root || root.domain !== 'daily') throw new BoardError('noticeRescheduleInvalid', 'Only active daily tasks can be rescheduled')
-  if (root.dateKey === targetDate) throw new BoardError('noticeRescheduleInvalid', 'Choose a different target date')
+// 日任务与周任务的顺延只差「改哪个放置键」：旧条目归档并指向副本，重复顺延形成可审阅链。
+function reschedulePlacement(next: BoardSnapshot, root: Task, key: 'dateKey' | 'weekKey', target: string, now: string): void {
+  if (root[key] === target) throw new BoardError('noticeRescheduleInvalid', 'Choose a different target period')
   const subtree = next.tasks.filter((task) => task.id === root.id || task.parentId === root.id)
   const idMap = new Map<string, string>()
   for (const task of subtree) idMap.set(task.id, createId('task'))
@@ -456,7 +453,7 @@ export function rescheduleDailyTask(snapshot: BoardSnapshot, taskId: string, tar
     const copy: Task = {
       ...task,
       id: idMap.get(task.id) as string,
-      dateKey: targetDate,
+      ...(key === 'dateKey' ? { dateKey: target } : { weekKey: target }),
       parentId: task.parentId ? idMap.get(task.parentId) : undefined,
       createdAt: now,
       updatedAt: now,
@@ -473,6 +470,24 @@ export function rescheduleDailyTask(snapshot: BoardSnapshot, taskId: string, tar
     task.updatedAt = now
   }
   next.tasks.push(...copies)
+}
+
+export function rescheduleDailyTask(snapshot: BoardSnapshot, taskId: string, targetDate: string, now = new Date().toISOString()): BoardSnapshot {
+  if (!isDateKey(targetDate)) throw new BoardError('noticeRescheduleInvalid', 'Choose a valid target date')
+  const next = cloneSnapshot(snapshot)
+  const root = next.tasks.find((task) => task.id === taskId && !task.archivedAt)
+  if (!root || root.domain !== 'daily') throw new BoardError('noticeRescheduleInvalid', 'Only active daily tasks can be rescheduled')
+  reschedulePlacement(next, root, 'dateKey', targetDate, now)
+  validateSnapshot(next)
+  return next
+}
+
+export function rescheduleWeeklyTask(snapshot: BoardSnapshot, taskId: string, targetWeek: string, now = new Date().toISOString()): BoardSnapshot {
+  if (!validWeekKey(targetWeek)) throw new BoardError('noticeRescheduleInvalid', 'Choose a valid target week')
+  const next = cloneSnapshot(snapshot)
+  const root = next.tasks.find((task) => task.id === taskId && !task.archivedAt)
+  if (!root || root.domain !== 'weekly') throw new BoardError('noticeRescheduleInvalid', 'Only active weekly tasks can be rescheduled')
+  reschedulePlacement(next, root, 'weekKey', targetWeek, now)
   validateSnapshot(next)
   return next
 }

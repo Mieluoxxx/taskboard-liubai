@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFile } from 'node:fs/promises'
 import { PGlite } from '@electric-sql/pglite'
-import { addCycle, addFocusBlock, addTask, createTask, emptySnapshot, rescheduleDailyTask, safeTimeZone, validateSnapshot } from '../src/domain'
+import { addCycle, addFocusBlock, addTask, createTask, emptySnapshot, rescheduleDailyTask, rescheduleWeeklyTask, safeTimeZone, validateSnapshot } from '../src/domain'
 
 const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
@@ -292,6 +292,8 @@ test('a snapshot produced by the client always passes the database validator', a
   snapshot = addFocusBlock(snapshot, { id: 'focus-1', dateKey: '2025-01-15', title: 'Deep work', taskId: daily.id, durationMinutes: 45, status: 'running', startedAt: now, elapsedMs: 0, createdAt: now })
   // 重排会保留归档条目与 rescheduledTo 指针，这是最容易被误拒的形状。
   snapshot = rescheduleDailyTask(snapshot, daily.id, '2025-01-17', '2025-01-16T00:00:00.000Z')
+  // 周任务顺延同样归档旧周并指向副本；数据库必须接受这个形状。
+  snapshot = rescheduleWeeklyTask(snapshot, weekly.id, '2025-W04', '2025-01-16T00:00:00.000Z')
   validateSnapshot(snapshot)
 
   const db = await database()

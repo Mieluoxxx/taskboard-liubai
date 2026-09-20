@@ -131,30 +131,78 @@ test('task marker colors use visual native radio swatches instead of text-only s
   assert.match(css, /\.color-choice input:focus-visible \+ \.color-swatch/, 'keyboard focus needs a visible outline')
 })
 
-test('the space left by the removed add buttons is used for "back to this week / today"', async () => {
+test('the rails stay list-only while "back to this week / today" lives in the panel header', async () => {
   const source = await appSource()
   const css = await cssSource()
   const weekRail = source.slice(source.indexOf('function WeekRail'), source.indexOf('function DayRail'))
-  const dayRail = source.slice(source.indexOf('function DayRail'), source.indexOf('function PastSuggestions'))
+  const dayRail = source.slice(source.indexOf('function DayRail'), source.indexOf('function ReturnToCurrent'))
 
-  // 两个轨道都提供回到当前周期的跳转，并复用同一个按钮样式
-  assert.match(weekRail, /className="rail-return"[^>]*onClick=\{onGoCurrent\}/, 'the week rail needs a back-to-this-week control')
-  assert.match(weekRail, /t\('backToCurrentWeek'\)/, 'and it must be labelled through the dictionary')
-  assert.match(dayRail, /className="rail-return"[^>]*onClick=\{onGoToday\}/, 'the day rail needs a back-to-today control')
-  assert.match(dayRail, /t\('backToCurrentDay'\)/, 'and it must be labelled through the dictionary')
-  assert.match(css, /\.rail-return\b/, 'rail-return needs a style')
+  // 设计：跳转不再占轨道底部，轨道只负责列表，也不再接收跳转回调。
+  assert.doesNotMatch(weekRail, /rail-return|onGoCurrent/, 'the week rail must not host the back control anymore')
+  assert.doesNotMatch(dayRail, /rail-return|onGoToday/, 'the day rail must not host the back control anymore')
 
-  // 已经处在当前周期时不显示，避免无意义的按钮（用 offCurrent / offToday 控制）
-  assert.match(weekRail, /const canGoCurrent = !cycle \|\| items\.some\(\(item\) => item\.isCurrent\)/, 'the week rail must know whether the current week is in range')
-  assert.match(weekRail, /const offCurrent = canGoCurrent && selectedWeek !== currentWeek/, 'the week rail must know when it is off the current week')
-  assert.match(weekRail, /offCurrent \? <button className="rail-return"/, 'the week control only shows when off the current week')
-  assert.match(dayRail, /const canGoToday = !cycle \|\| items\.some\(\(item\) => item\.isToday\)/, 'the day rail must know whether today is in range')
-  assert.match(dayRail, /const offToday = canGoToday && selectedDate !== todayKey/, 'the day rail must know when it is off today')
-  assert.match(dayRail, /offToday \? <button className="rail-return"/, 'the day control only shows when off today')
+  // 跳转是面板头部下方右对齐的胶囊：当前圆点 + 返回箭头 + 短标签，完整语义由 aria-label 承担。
+  const control = source.slice(source.indexOf('function ReturnToCurrent'), source.indexOf('function SortableTaskList'))
+  assert.match(control, /<div className="panel-current"><button className="current-return" onClick=\{onClick\} aria-label=\{hint\} title=\{hint\}>/, 'the control must be an announced chip')
+  assert.match(control, /<i className="current-mark" aria-hidden="true" \/><Icon name="back" \/>\{label\}/, 'the chip pairs the current dot with the back arrow')
+  assert.match(source, /const goCurrentWeek = canGoCurrentWeek && selectedWeek !== currentWeekKey \? <ReturnToCurrent label=\{t\('thisWeek'\)\} hint=\{t\('backToCurrentWeek'\)\}/, 'the week chip only appears when off the current week')
+  assert.match(source, /const goToday = canGoToday && selectedDate !== todayKey \? <ReturnToCurrent label=\{t\('today'\)\} hint=\{t\('backToCurrentDay'\)\}/, 'the day chip only appears when off today')
+  assert.match(source, /const canGoCurrentWeek = !selectedCycle \|\| \(currentWeekKey >= weekKey\(selectedCycle\.startDate\) && currentWeekKey <= weekKey\(selectedCycle\.endDate\)\)/, 'the week chip needs the cycle-aware range check')
+  assert.match(source, /const canGoToday = !selectedCycle \|\| dateInRange\(todayKey, selectedCycle\.startDate, selectedCycle\.endDate\)/, 'the day chip needs the cycle-aware range check')
 
-  // 调用处：回到本周同时切换周与日（与点周条目一致）；回到今天只切日期，由它顺带把周带过去
-  assert.match(source, /onGoCurrent=\{\(\) => selectWeek\(currentWeekKey\)\}/, 'back-to-this-week must use the range-aware week selector')
-  assert.equal((source.match(/onGoToday=\{\(\) => setDate\(todayKey\)\}/g) || []).length, 2, 'both day rails (daily and focus) must offer back-to-today')
+  // 渲染位置：面板头部之后、内容之前；TasksPanel 与 FocusPanel 都接 currentAction。
+  assert.match(source, /currentAction\?: React\.ReactNode/, 'panels take the chip through a prop')
+  assert.match(source, /\{t\('addTask'\)\}<\/button><\/div>\n      \{currentAction\}/, 'the chip row sits right under the panel header')
+  assert.equal((source.match(/<DayRail /g) || []).length, 2, 'both day rails (daily and focus) stay in place')
+  assert.equal((source.match(/currentAction=\{goToday\}/g) || []).length, 2, 'both day panels must offer back-to-today')
+  assert.equal((source.match(/currentAction=\{goCurrentWeek\}/g) || []).length, 1, 'the week panel must offer back-to-this-week')
+
+  assert.match(css, /\.panel-current \{ display: flex; justify-content: flex-end; padding-top: 16px; \}/, 'the chip row must be right-aligned under the header')
+  assert.match(css, /\.current-return \{[^}]*border: 1px solid #e7dcd4;[^}]*background: #fffaf6;/, 'the chip keeps the warm current-period tint from the design')
+  assert.match(css, /\.current-return \.current-mark \{ margin-left: 0; \}/, 'the dot inside the chip must not inherit the rail offset')
+  assert.match(css, /\.focus-panel \.current-return \{[^}]*background: rgba\(255,255,255,\.06\);/, 'the chip needs a dark-panel variant')
+  assert.doesNotMatch(css, /\.rail-return\b/, 'the old rail-bottom control is gone')
+})
+
+test('unfinished weekly tasks from past weeks can be carried forward, not just daily ones', async () => {
+  const source = await appSource()
+  const css = await cssSource()
+  // 同一个建议条按域复用：日任务提示 pastHint，周任务提示 weeklyPastHint，只有未完成的顶层任务上条。
+  assert.match(source, /<PastSuggestions tasks=\{pastDaily\} hintKey="pastHint"/, 'daily suggestions stay wired')
+  assert.match(source, /<PastSuggestions tasks=\{pastWeekly\} hintKey="weeklyPastHint"/, 'weekly suggestions need their own hint')
+  assert.match(source, /const pastWeekly = snapshot\.tasks\.filter\(\(task\) => !task\.archivedAt && task\.domain === 'weekly' && !task\.parentId && isPastPlacement\(task, currentZone\)\)/, 'the weekly bar must list unfinished past weeks only')
+  assert.match(source, /function isPastPlacement\(task: Task, timeZone: string\)/, 'past detection must be shared between domains')
+  // 顺延目标：周任务默认下周，日任务默认次日；保存时按域分发到各自的领域函数。
+  assert.match(source, /task\.domain === 'weekly'\) return \{ value: weekKey\(addDays\(weekRange[\s\S]{0,80}kind: 'week'/, 'weekly rescheduling must default to the following week')
+  assert.match(source, /task\.domain === 'weekly' \? rescheduleWeeklyTask\(current, task\.id, target\) : rescheduleDailyTask\(current, task\.id, target\)/, 'the shared dialog must dispatch by domain')
+  assert.match(source, /onAddSubtask=\{\(task\) => setDialog\(\{ kind: 'task', domain: 'weekly', parentId: task\.id \}\)\} onReschedule=/, 'weekly rows need the reschedule action')
+
+  // 顺延标签：从归档条目的 rescheduledTo 反查来源周期，不需要新增快照字段。
+  assert.match(source, /function carriedFromLabels\(snapshot: BoardSnapshot\): Map<string, string>/, 'carry tags must be derived from the archive pointers')
+  assert.match(source, /if \(task\.archivedReason !== 'rescheduled' \|\| !task\.rescheduledTo\) continue/, 'only rescheduled archive entries name a source')
+  assert.match(source, /const placement = task\.domain === 'weekly' \? task\.weekKey : task\.dateKey/, 'the source label is the domain placement key')
+  assert.match(source, /const carrySource = carriedFromLabels\(snapshot\)/, 'the panel must build the lookup once')
+  assert.match(source, /className="carry-tag"/, 'the tag needs its own styleable element')
+  assert.match(source, /title=\{`\$\{t\('carriedFrom'\)\} \$\{carriedFrom\}`\}/, 'the tag explains itself on hover')
+  assert.match(source, /\{carriedFrom\.slice\(5\)\}/, 'the tag shows the compact MM-DD or Wnn form')
+  assert.match(source, /onReschedule=\{onReschedule\} carrySource=\{carrySource\} /, 'carry sources must reach both task rows')
+  assert.match(css, /\.carry-tag \{[^}]*flex: 0 0 auto;[^}]*white-space: nowrap;/, 'the tag must not be squeezed into a vertical column')
+
+  // 窄屏下“建议重新安排”不得与标题争宽：title 的 flex-basis 必须为 0（basis auto 会被长标题
+  // 按 max-content 换行），并用零高度断行点把按钮区推到第二行。
+  assert.match(css, /\.task-row \{[^}]*flex-wrap: wrap;[^}]*row-gap: 0;/, 'rows must be able to wrap so the action area can take its own line')
+  assert.match(css, /\.task-title \{[^}]*flex: 1 1 0;/, 'a zero basis keeps the title on the first line instead of being pushed by its own max-content width')
+  assert.match(css, /\.row-break \{ display: block; flex: 0 0 100%; height: 0; \}/, 'the zero-height break element is what starts the action line')
+  assert.match(css, /@media \(min-width: 851px\) \{\s*\.row-break \{ display: none; \}\s*\.row-actions \{ position: absolute;[^}]*\}/, 'wide screens keep one line by floating the action buttons')
+  assert.match(source, /<span className="row-break" aria-hidden="true" \/>/, 'the break element must stay out of the accessibility tree')
+
+  // 专注块面板与卡片：网格项 min-width: auto 会被 nowrap 内容撑开，卡片会溢出深色面板。
+  assert.match(css, /\.focus-panel \{[^}]*min-width: 0;/, 'the focus panel must not be sized by its nowrap content')
+  assert.match(css, /\.focus-list \{ display: grid; grid-template-columns: minmax\(0, 1fr\);/, 'the focus list needs an explicit shrinkable column')
+  assert.match(css, /\.focus-subtasks \{ display: grid; min-width: 0;/, 'subtask rows must be able to ellipsize inside the card')
+  assert.match(css, /\.paper-panel, \.focus-panel \{[^}]*\}\.focus-time span \{ font-size: 20px; \}/, 'the big timer readout must shrink on narrow screens')
+  // 回到本周/今天：浅灰描边与其余小部件一致，暖色只留给“当前”标记。
+  assert.match(css, /\.current-return \{[^}]*white-space: nowrap;/, 'the chip label must stay on one line')
 })
 
 test('direct mutations do not flash a form-draft banner during a normal save', async () => {

@@ -28,6 +28,7 @@ import {
   reorderSibling,
   reorderSiblingTo,
   rescheduleDailyTask,
+  rescheduleWeeklyTask,
   safeTimeZone,
   setFocusCommand,
   todayInTimeZone,
@@ -126,6 +127,27 @@ function clampDate(date: string, startDate: string, endDate: string): string {
 
 function dateForCycleSelection(preferredDate: string, cycle: GoalCycle, todayDate: string): string {
   return dateInRange(preferredDate, cycle.startDate, cycle.endDate) ? preferredDate : clampDate(todayDate, cycle.startDate, cycle.endDate)
+}
+
+// 日任务按日期、周任务按 ISO 周判断“已经过去”：同一套规则供建议条、面板提示与行内按钮复用。
+function isPastPlacement(task: Task, timeZone: string): boolean {
+  if (task.checked) return false
+  const today = todayInTimeZone(timeZone)
+  if (task.domain === 'daily') return Boolean(task.dateKey && task.dateKey < today)
+  if (task.domain === 'weekly') return Boolean(task.weekKey && task.weekKey < weekKey(today))
+  return false
+}
+
+// 顺延标签：归档条目上的 rescheduledTo 指向新任务，反查即可知道「它是从哪个周期顺延过来的」。
+// 不新增快照字段：旧数据同样能标出标签，也不需要新的数据库校验。
+function carriedFromLabels(snapshot: BoardSnapshot): Map<string, string> {
+  const labels = new Map<string, string>()
+  for (const task of snapshot.tasks) {
+    if (task.archivedReason !== 'rescheduled' || !task.rescheduledTo) continue
+    const placement = task.domain === 'weekly' ? task.weekKey : task.dateKey
+    if (placement) labels.set(task.rescheduledTo, placement)
+  }
+  return labels
 }
 
 function dateForWeek(key: string, cycle: GoalCycle | undefined, preferredDate: string): string {
@@ -829,6 +851,15 @@ export default function App() {
     if (domain === 'weekly') return task.weekKey === selectedWeek
     return task.dateKey === selectedDate
   })
+  // 过去未完成的任务只提示、不自动滚动：日任务与周任务各出一条建议。
+  const pastDaily = snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'daily' && !task.parentId && isPastPlacement(task, currentZone))
+  const pastWeekly = snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'weekly' && !task.parentId && isPastPlacement(task, currentZone))
+
+  // 「回到当前」只在今天/本周仍在所选周期范围内、且已离开当前周期时出现。
+  const canGoCurrentWeek = !selectedCycle || (currentWeekKey >= weekKey(selectedCycle.startDate) && currentWeekKey <= weekKey(selectedCycle.endDate))
+  const canGoToday = !selectedCycle || dateInRange(todayKey, selectedCycle.startDate, selectedCycle.endDate)
+  const goCurrentWeek = canGoCurrentWeek && selectedWeek !== currentWeekKey ? <ReturnToCurrent label={t('thisWeek')} hint={t('backToCurrentWeek')} onClick={() => selectWeek(currentWeekKey)} /> : null
+  const goToday = canGoToday && selectedDate !== todayKey ? <ReturnToCurrent label={t('today')} hint={t('backToCurrentDay')} onClick={() => setDate(todayKey)} /> : null
 
   const taskForFocus = activeTasks(snapshot, 'daily')
   const canCreateInCycle = !selectedCycle || dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)
@@ -862,7 +893,8 @@ export default function App() {
           <button className="text-button" onClick={() => { setDate(runningBlock.dateKey, true); panelRefs.current[3]?.scrollIntoView({ behavior: 'smooth', inline: 'start' }) }}>{t('jumpFocus')}</button>
         </div>
       ) : null}
-      {snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'daily' && !task.parentId && !task.checked && Boolean(task.dateKey && task.dateKey < todayInTimeZone(currentZone))).length ? <PastSuggestions tasks={snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'daily' && !task.parentId && !task.checked && Boolean(task.dateKey && task.dateKey < todayInTimeZone(currentZone)))} language={language} t={t} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} /> : null}
+      {pastDaily.length ? <PastSuggestions tasks={pastDaily} hintKey="pastHint" language={language} t={t} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} /> : null}
+      {pastWeekly.length ? <PastSuggestions tasks={pastWeekly} hintKey="weeklyPastHint" language={language} t={t} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} /> : null}
       <main className="workspace-scroll" ref={workspaceScrollRef} aria-label={t('subtitle')}>
         <div className="workspace-stage" ref={setStageElement}>
           <ConnectorLayer stage={stageElement} snapshot={snapshot} rowRefs={rowRefs} selectedChain={selectedChain} />
@@ -877,19 +909,22 @@ export default function App() {
             onSort={sortTask}
             panelRef={panelRef(1)} domain="weekly" title={t('weekly')} hint={t('weeklyHint')} language={language} t={t}
             tasks={panelTasks('weekly')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={selectedCycle} language={language} t={t} onSelect={selectWeek} onGoCurrent={() => selectWeek(currentWeekKey)} />}
+            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={selectedCycle} language={language} t={t} onSelect={selectWeek} />}
+            currentAction={goCurrentWeek}
             canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
-            onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} />
+            onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
           <TaskPanel
             onSort={sortTask}
             panelRef={panelRef(2)} domain="daily" title={`${t('daily')} · ${weekdayLabel(selectedDate, language)}`} hint={t('dailyHint')} language={language} t={t}
             tasks={panelTasks('daily')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} />}
+            currentAction={goToday}
             canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'daily' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'daily', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
           <FocusPanel
             panelRef={panelRef(3)} blocks={snapshot.focusBlocks.filter((block) => block.dateKey === selectedDate)} allTasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} now={now}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} onGoToday={() => setDate(todayKey)} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} />}
+            currentAction={goToday}
             canAdd={canCreateInCycle} onAdd={() => setDialog({ kind: 'focus' })} onEdit={(block) => setDialog({ kind: 'focus', block })} onDelete={deleteFocusWithConfirm} onCommand={focusCommand}
           />
         </div>
@@ -946,8 +981,9 @@ export default function App() {
     commitSnapshot(next, `${t('timezone')}: ${safe}`)
   }
 
-  function rescheduleTask(task: Task, date: string) {
-    updateSnapshot((current) => rescheduleDailyTask(current, task.id, date), `${t('reschedule')}: ${task.title}`)
+  function rescheduleTask(task: Task, target: string) {
+    const job = `${t('reschedule')}: ${task.title}`
+    updateSnapshot((current) => task.domain === 'weekly' ? rescheduleWeeklyTask(current, task.id, target) : rescheduleDailyTask(current, task.id, target), job)
   }
 }
 
@@ -1038,28 +1074,30 @@ function useRailWindow<T>(items: T[], selectedIndex: number) {
   return { railRef, onScroll: (event: React.UIEvent<HTMLDivElement>) => setScrollTop(event.currentTarget.scrollTop), visible: items.slice(start, end), paddingTop: virtual ? start * RAIL_ROW_HEIGHT : 0, paddingBottom: virtual ? Math.max(0, (items.length - end) * RAIL_ROW_HEIGHT) : 0 }
 }
 
-function WeekRail({ selectedWeek, currentWeek, cycle, language, t, onSelect, onGoCurrent }: { selectedWeek: string; currentWeek: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void; onGoCurrent: () => void }) {
+function WeekRail({ selectedWeek, currentWeek, cycle, language, t, onSelect }: { selectedWeek: string; currentWeek: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void }) {
   const weeks = useMemo(() => cycle ? weekKeysInRange(cycle.startDate, cycle.endDate) : [-2, -1, 0, 1, 2].map((offset) => weekKey(addDays(weekRange(selectedWeek).start, offset * 7))), [cycle?.startDate, cycle?.endDate, selectedWeek])
   const items = useMemo(() => weeks.map((key) => ({ key, start: weekRange(key).start.slice(5), isCurrent: key === currentWeek })), [currentWeek, weeks])
   const selectedIndex = items.findIndex((item) => item.key === selectedWeek)
   const windowed = useRailWindow(items, selectedIndex)
-  const canGoCurrent = !cycle || items.some((item) => item.isCurrent)
-  const offCurrent = canGoCurrent && selectedWeek !== currentWeek
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className={`rail-items ${weeks.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ key, start, isCurrent }) => <button className={`rail-item ${selectedWeek === key ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}`} aria-current={selectedWeek === key ? 'page' : undefined} aria-label={isCurrent ? `${key.slice(5)} · ${t('currentWeek')}` : key.slice(5)} key={key} onClick={() => onSelect(key)}><span>{key.slice(5)}{isCurrent ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{start}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div>{offCurrent ? <button className="rail-return" onClick={onGoCurrent}><Icon name="back" />{t('backToCurrentWeek')}</button> : null}</aside>
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className={`rail-items ${weeks.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ key, start, isCurrent }) => <button className={`rail-item ${selectedWeek === key ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}`} aria-current={selectedWeek === key ? 'page' : undefined} aria-label={isCurrent ? `${key.slice(5)} · ${t('currentWeek')}` : key.slice(5)} key={key} onClick={() => onSelect(key)}><span>{key.slice(5)}{isCurrent ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{start}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div></aside>
 }
 
-function DayRail({ selectedDate, selectedWeek, todayKey, cycle, language, t, onSelect, onGoToday }: { selectedDate: string; selectedWeek: string; todayKey: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void; onGoToday: () => void }) {
+function DayRail({ selectedDate, selectedWeek, todayKey, cycle, language, t, onSelect }: { selectedDate: string; selectedWeek: string; todayKey: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void }) {
   const days = useMemo(() => cycle ? dateKeysInRange(cycle.startDate, cycle.endDate) : Array.from({ length: 7 }, (_, index) => addDays(weekRange(selectedWeek).start, index)), [cycle?.startDate, cycle?.endDate, selectedWeek])
   const items = useMemo(() => days.map((date) => ({ date, label: weekdayShortLabel(date, language), isToday: date === todayKey })), [days, language, todayKey])
   const selectedIndex = items.findIndex((item) => item.date === selectedDate)
   const windowed = useRailWindow(items, selectedIndex)
-  const canGoToday = !cycle || items.some((item) => item.isToday)
-  const offToday = canGoToday && selectedDate !== todayKey
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className={`rail-items ${days.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ date, label, isToday }) => <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(5)} · ${t('currentDay')}` : `${label} ${date.slice(5)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(5)}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div>{offToday ? <button className="rail-return" onClick={onGoToday}><Icon name="back" />{t('backToCurrentDay')}</button> : null}</aside>
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className={`rail-items ${days.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ date, label, isToday }) => <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(5)} · ${t('currentDay')}` : `${label} ${date.slice(5)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(5)}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div></aside>
 }
 
-function PastSuggestions({ tasks, language, t, onReschedule }: { tasks: Task[]; language: Language; t: (key: CopyKey) => string; onReschedule: (task: Task) => void }) {
-  return <div className="past-suggestions" role="region" aria-label={t('reschedule')}><div className="past-suggestion-title"><span className="notice-dot" /><strong>{t('reschedule')}</strong><span>{t('pastHint')}</span></div><div className="past-suggestion-list">{tasks.slice(0, 5).map((task) => <button key={task.id} className="suggestion-item" onClick={() => onReschedule(task)}><span>{task.title}</span><small>{task.dateKey}</small></button>)}</div>{tasks.length > 5 ? <span className="suggestion-more">+{tasks.length - 5}</span> : null}</div>
+// “回到本周 / 回到今天”：按设计放在面板头部下方、右对齐；图标由“当前”圆点 + 返回箭头组成，
+// 可见文字只写“本周 / 今天”，完整语义由 aria-label / title 承担。
+function ReturnToCurrent({ label, hint, onClick }: { label: string; hint: string; onClick: () => void }) {
+  return <div className="panel-current"><button className="current-return" onClick={onClick} aria-label={hint} title={hint}><i className="current-mark" aria-hidden="true" /><Icon name="back" />{label}</button></div>
+}
+
+function PastSuggestions({ tasks, hintKey, language, t, onReschedule }: { tasks: Task[]; hintKey: CopyKey; language: Language; t: (key: CopyKey) => string; onReschedule: (task: Task) => void }) {
+  return <div className="past-suggestions" role="region" aria-label={t('reschedule')}><div className="past-suggestion-title"><span className="notice-dot" /><strong>{t('reschedule')}</strong><span>{t(hintKey)}</span></div><div className="past-suggestion-list">{tasks.slice(0, 5).map((task) => <button key={task.id} className="suggestion-item" onClick={() => onReschedule(task)}><span>{task.title}</span><small>{task.dateKey || task.weekKey}</small></button>)}</div>{tasks.length > 5 ? <span className="suggestion-more">+{tasks.length - 5}</span> : null}</div>
 }
 
 function SortableTaskList({ tasks, t, onSort, children }: { tasks: Task[]; t: (key: CopyKey) => string; onSort: (task: Task, targetId: string) => void; children: React.ReactNode }) {
@@ -1100,42 +1138,47 @@ function SortableTaskList({ tasks, t, onSort, children }: { tasks: Task[]; t: (k
   </DndContext>
 }
 
-function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone, selectedId, selectedChain, registerRow, rail, canAdd, canCreate = true, onAdd, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule, panelRef }: {
-  domain: Domain; title: string; hint: string; language: Language; t: (key: CopyKey) => string; tasks: Task[]; snapshot: BoardSnapshot; timeZone: string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; rail: React.ReactNode; canAdd: boolean; canCreate?: boolean; onAdd: () => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void; panelRef?: (element: HTMLElement | null) => void
+function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone, selectedId, selectedChain, registerRow, rail, currentAction, canAdd, canCreate = true, onAdd, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule, panelRef }: {
+  domain: Domain; title: string; hint: string; language: Language; t: (key: CopyKey) => string; tasks: Task[]; snapshot: BoardSnapshot; timeZone: string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; rail: React.ReactNode; currentAction?: React.ReactNode; canAdd: boolean; canCreate?: boolean; onAdd: () => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void; panelRef?: (element: HTMLElement | null) => void
   onSort: (task: Task, targetId: string) => void
 }) {
   const topLevel = tasks.filter((task) => !task.parentId)
   const addEnabled = canAdd && canCreate
+  const carrySource = carriedFromLabels(snapshot)
   return <section className={`panel-shell domain-${domain}`} ref={panelRef} aria-labelledby={`panel-${domain}`}>
     {rail}<div className="paper-panel"><div className="panel-top"><div><div className="eyebrow">{domain === 'long' ? '01' : domain === 'weekly' ? '02' : '03'}</div><h2 id={`panel-${domain}`}>{title}</h2><p>{hint}</p></div><button className="add-button" onClick={onAdd} disabled={!addEnabled}><Icon name="plus" />{t('addTask')}</button></div>
-      {domain === 'daily' && tasks.some((task) => !task.checked && task.dateKey && task.dateKey < todayInTimeZone(snapshot.settings.timeZone)) ? <div className="past-note">{t('reschedule')}</div> : null}
-      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list"><SortableTaskList key={topLevel[0].cycleId || topLevel[0].weekKey || topLevel[0].dateKey} tasks={topLevel} t={t} onSort={onSort}>{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</SortableTaskList></div>}
+      {currentAction}
+      {(domain === 'daily' || domain === 'weekly') && tasks.some((task) => isPastPlacement(task, snapshot.settings.timeZone)) ? <div className="past-note">{t('reschedule')}</div> : null}
+      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list"><SortableTaskList key={topLevel[0].cycleId || topLevel[0].weekKey || topLevel[0].dateKey} tasks={topLevel} t={t} onSort={onSort}>{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} carrySource={carrySource} />)}</SortableTaskList></div>}
       <div className="paper-space" />
     </div>
   </section>
 }
 
-function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selectedChain, registerRow, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule }: {
-  task: Task; childrenTasks: Task[]; timeZone: string; language: Language; t: (key: CopyKey) => string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void
+function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selectedChain, registerRow, carrySource, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule }: {
+  task: Task; childrenTasks: Task[]; timeZone: string; language: Language; t: (key: CopyKey) => string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; carrySource: Map<string, string>; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void
   onSort: (task: Task, targetId: string) => void
 }) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: task.id })
-  const isPast = task.domain === 'daily' && Boolean(task.dateKey && task.dateKey < todayInTimeZone(timeZone)) && !task.checked
+  const isPast = isPastPlacement(task, timeZone)
+  const carriedFrom = carrySource.get(task.id)
   return <div className={`task-tree ${isDragging ? 'is-dragging' : ''}`} ref={setNodeRef} style={{ transform: CSS.Translate.toString(transform), transition }}><div className={`task-row ${selectedId === task.id ? 'selected' : ''} ${selectedChain.has(task.id) ? 'is-linked' : ''} ${task.checked ? 'is-checked' : ''}`} data-task-id={task.id} ref={registerRow(task.id)}>
     <button type="button" className="drag-handle" ref={setActivatorNodeRef} {...attributes} {...listeners} aria-roledescription={t('dragTask')} aria-label={`${t('dragTask')}: ${task.title}`} title={t('dragInstructions')}><Icon name="grip" /></button>
     <button className="task-select" onClick={() => onSelect(task.id)} aria-label={`${t('taskDetails')}: ${task.title}`}><span className={`task-stroke stroke-${task.color}`} /></button>
     <input type="checkbox" checked={task.checked} onChange={() => onToggle(task)} aria-label={`${task.title} · ${task.checked ? t('taskChecked') : t('taskUnchecked')}`} />
     <button className="task-title" onClick={() => { onSelect(task.id); onEdit(task) }} title={t('taskDetails')}><span>{task.title}</span>{task.note ? <small>{task.note}</small> : null}</button>
     {task.upperTaskId ? <span className="link-mark" title={t('association')}><Icon name="link" /></span> : null}
+    {carriedFrom ? <span className="carry-tag" title={`${t('carriedFrom')} ${carriedFrom}`}>{carriedFrom.slice(5)}</span> : null}
+    <span className="row-break" aria-hidden="true" />
     {isPast && onReschedule ? <button className="row-action reschedule-action" onClick={() => onReschedule(task)}>{t('reschedule')}</button> : null}
     <div className="row-actions">{!task.parentId ? <button className="row-icon" aria-label={t('addSubtask')} title={t('addSubtask')} onClick={() => onAddSubtask(task)}><Icon name="subtask" /></button> : null}<button className="row-icon" aria-label={t('moveUp')} title={t('moveUp')} onClick={() => onReorder(task, -1)}><Icon name="up" /></button><button className="row-icon" aria-label={t('moveDown')} title={t('moveDown')} onClick={() => onReorder(task, 1)}><Icon name="down" /></button><button className="row-icon" aria-label={t('edit')} title={t('edit')} onClick={() => onEdit(task)}><Icon name="edit" /></button><button className="row-icon danger" aria-label={t('delete')} title={t('delete')} onClick={() => onDelete(task)}><Icon name="trash" /></button></div>
-  </div>{childrenTasks.length ? <div className="subtask-list"><SortableTaskList tasks={childrenTasks} t={t} onSort={onSort}>{childrenTasks.map((child) => <TaskRow key={child.id} task={child} childrenTasks={[]} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} />)}</SortableTaskList></div> : null}</div>
+  </div>{childrenTasks.length ? <div className="subtask-list"><SortableTaskList tasks={childrenTasks} t={t} onSort={onSort}>{childrenTasks.map((child) => <TaskRow key={child.id} task={child} childrenTasks={[]} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} carrySource={carrySource} />)}</SortableTaskList></div> : null}</div>
 }
 
-function FocusPanel({ blocks, allTasks, selectedDate, language, t, now, rail, canAdd = true, onAdd, onEdit, onDelete, onCommand, panelRef }: {
-  blocks: FocusBlock[]; allTasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; now: number; rail: React.ReactNode; canAdd?: boolean; onAdd: () => void; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void; panelRef?: (element: HTMLElement | null) => void
+function FocusPanel({ blocks, allTasks, selectedDate, language, t, now, rail, currentAction, canAdd = true, onAdd, onEdit, onDelete, onCommand, panelRef }: {
+  blocks: FocusBlock[]; allTasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; now: number; rail: React.ReactNode; currentAction?: React.ReactNode; canAdd?: boolean; onAdd: () => void; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void; panelRef?: (element: HTMLElement | null) => void
 }) {
-  return <section className="panel-shell focus-shell" ref={panelRef} aria-labelledby="panel-focus">{rail}<div className="focus-panel"><div className="panel-top"><div><div className="eyebrow">{`04 · ${t('timeLabel')}`}</div><h2 id="panel-focus">{t('focus')}</h2><p>{t('focusHint')}</p></div><button className="add-button light" onClick={onAdd} disabled={!canAdd}><Icon name="plus" />{t('add')}</button></div><div className="focus-date-label">{formatDateKey(selectedDate, language)} <span>{selectedDate}</span></div>{blocks.length ? <div className="focus-list">{blocks.map((block) => <FocusCard key={block.id} block={block} allTasks={allTasks} language={language} t={t} now={now} onEdit={onEdit} onDelete={onDelete} onCommand={onCommand} />)}</div> : <div className="focus-empty"><div className="empty-glyph">◯</div><p>{t('emptyFocus')}</p><button className="text-button light-text" onClick={onAdd} disabled={!canAdd}>{t('add')}</button></div>}<div className="focus-space" /></div></section>
+  return <section className="panel-shell focus-shell" ref={panelRef} aria-labelledby="panel-focus">{rail}<div className="focus-panel"><div className="panel-top"><div><div className="eyebrow">{`04 · ${t('timeLabel')}`}</div><h2 id="panel-focus">{t('focus')}</h2><p>{t('focusHint')}</p></div><button className="add-button light" onClick={onAdd} disabled={!canAdd}><Icon name="plus" />{t('add')}</button></div>{currentAction}<div className="focus-date-label">{formatDateKey(selectedDate, language)} <span>{selectedDate}</span></div>{blocks.length ? <div className="focus-list">{blocks.map((block) => <FocusCard key={block.id} block={block} allTasks={allTasks} language={language} t={t} now={now} onEdit={onEdit} onDelete={onDelete} onCommand={onCommand} />)}</div> : <div className="focus-empty"><div className="empty-glyph">◯</div><p>{t('emptyFocus')}</p><button className="text-button light-text" onClick={onAdd} disabled={!canAdd}>{t('add')}</button></div>}<div className="focus-space" /></div></section>
 }
 
 function FocusCard({ block, allTasks, language, t, now, onEdit, onDelete, onCommand }: { block: FocusBlock; allTasks: Task[]; language: Language; t: (key: CopyKey) => string; now: number; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void }) {
@@ -1338,9 +1381,16 @@ function SettingsDialog({ zone, language, t, onClose, onLanguage, onSubmit }: { 
    return <Dialog closeLabel={t('close')} title={t('settings')} onClose={onClose} initialFocus="timezone"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit(value) }}><label>{t('timezone')}<input id="timezone" list="timezone-options" value={value} onChange={(event) => setValue(event.target.value)} maxLength={100} required /><datalist id="timezone-options"><option value="UTC" /><option value="Asia/Shanghai" /><option value="Asia/Tokyo" /><option value="America/New_York" /><option value="America/Los_Angeles" /><option value="Europe/London" /></datalist></label><p className="form-hint">{t('timezoneHint')}</p><div className="setting-language"><span>{t('language')}</span><div className="language-switch"><button type="button" className={language === 'zh' ? 'active' : ''} onClick={() => onLanguage('zh')}>{t('chinese')}</button><button type="button" className={language === 'en' ? 'active' : ''} onClick={() => onLanguage('en')}>{t('english')}</button></div></div><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div></form></Dialog>
 }
 
-function RescheduleDialog({ task, language, t, zone, onClose, onSubmit }: { task: Task; language: Language; t: (key: CopyKey) => string; zone: string; onClose: () => void; onSubmit: (date: string) => void }) {
-  const [date, setDate] = useState(addDays(task.dateKey || todayInTimeZone(zone), 1))
-   return <Dialog closeLabel={t('close')} title={t('reschedule')} onClose={onClose} initialFocus="reschedule-date"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit(date) }}><p className="reschedule-copy"><strong>{task.title}</strong><span>{t('rescheduleHint')}</span></p><label>{t('rescheduleTitle')}<input id="reschedule-date" type="date" value={date} min={addDays(task.dateKey || date, 1)} onChange={(event) => setDate(event.target.value)} required /></label><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('reschedule')}</button></div></form></Dialog>
+// 日任务默认次日、周任务默认下周；输入框用 min 只允许选更晚的一档，默认值直接确认即可完成顺延。
+function nextRescheduleTarget(task: Task, zone: string): { value: string; kind: 'date' | 'week' } {
+  if (task.domain === 'weekly') return { value: weekKey(addDays(weekRange(task.weekKey || weekKey(todayInTimeZone(zone))).start, 7)), kind: 'week' }
+  return { value: addDays(task.dateKey || todayInTimeZone(zone), 1), kind: 'date' }
+}
+
+function RescheduleDialog({ task, language, t, zone, onClose, onSubmit }: { task: Task; language: Language; t: (key: CopyKey) => string; zone: string; onClose: () => void; onSubmit: (target: string) => void }) {
+  const target = nextRescheduleTarget(task, zone)
+  const [value, setValue] = useState(target.value)
+   return <Dialog closeLabel={t('close')} title={t('reschedule')} onClose={onClose} initialFocus="reschedule-target"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit(value) }}><p className="reschedule-copy"><strong>{task.title}</strong><span>{t('rescheduleHint')}</span></p><label>{t('rescheduleTitle')}<input id="reschedule-target" type={target.kind} value={value} min={target.value} onChange={(event) => setValue(event.target.value)} required /></label><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('reschedule')}</button></div></form></Dialog>
 }
 
 function Dialog({ title, closeLabel, children, onClose, initialFocus }: { title: string; closeLabel: string; children: React.ReactNode; onClose: () => void; initialFocus?: string }) {

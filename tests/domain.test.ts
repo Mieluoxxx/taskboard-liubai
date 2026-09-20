@@ -16,6 +16,7 @@ import {
   reorderSibling,
   reorderSiblingTo,
   rescheduleDailyTask,
+  rescheduleWeeklyTask,
   safeTimeZone,
   setFocusCommand,
   validateSnapshot,
@@ -106,6 +107,31 @@ test('rescheduling archives the original placement and avoids duplicate active c
   assert.equal(snapshot.tasks.filter((task) => !task.archivedAt).length, 2)
   assert.equal(snapshot.tasks.filter((task) => task.archivedReason === 'rescheduled').length, 4)
   assert.throws(() => rescheduleDailyTask(snapshot, snapshot.tasks.find((task) => !task.archivedAt && task.title === 'Move me')!.id, '2025-01-18', NOW), /different|valid target/i)
+})
+
+test('weekly rescheduling carries an unfinished week forward and keeps the original archived', () => {
+  let snapshot = board()
+  const root = createTask({ domain: 'weekly', title: 'Carry me', weekKey: '2025-W03' }, NOW)
+  const child = createTask({ domain: 'weekly', title: 'Child', weekKey: '2025-W03', parentId: root.id }, NOW)
+  snapshot = addTask(addTask(snapshot, root), child)
+  snapshot = rescheduleWeeklyTask(snapshot, root.id, '2025-W04', '2025-01-20T00:00:00.000Z')
+  const active = snapshot.tasks.filter((task) => !task.archivedAt)
+  const archived = snapshot.tasks.filter((task) => task.archivedAt)
+  assert.equal(active.length, 2)
+  assert.equal(archived.length, 2)
+  assert.ok(active.every((task) => task.weekKey === '2025-W04'))
+  assert.ok(archived.every((task) => task.weekKey === '2025-W03' && task.archivedReason === 'rescheduled'))
+  const nextRoot = active.find((task) => task.title === 'Carry me')!
+  assert.equal(archived.find((task) => task.title === 'Carry me')?.rescheduledTo, nextRoot.id)
+  // 子任务跟随父任务一起顺延，并指向新的父任务。
+  assert.equal(active.find((task) => task.title === 'Child')?.parentId, nextRoot.id)
+  validateSnapshot(snapshot)
+  assert.throws(() => rescheduleWeeklyTask(snapshot, nextRoot.id, '2025-W04'), /different/i)
+  assert.throws(() => rescheduleWeeklyTask(snapshot, nextRoot.id, '2025-13'), /valid target/i)
+  // 周顺延只接受周任务，日任务走 rescheduleDailyTask。
+  const daily = createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-15' }, NOW)
+  snapshot = addTask(snapshot, daily)
+  assert.throws(() => rescheduleWeeklyTask(snapshot, daily.id, '2025-W05'), /weekly/i)
 })
 
 test('timer restoration uses timestamps and rejects a second running timer', () => {
