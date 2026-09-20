@@ -17,6 +17,7 @@ import {
   compareDateKeys,
   createFocusBlock,
   createTask,
+  carryForwardTasks,
   dateKeysInRange,
   deleteFocusBlock,
   deleteTask,
@@ -203,6 +204,8 @@ export default function App() {
   const pendingJobRef = useRef<PendingJob | null>(null)
   const saveInFlightRef = useRef(false)
   const drainRef = useRef<(() => Promise<void>) | null>(null)
+  // openBoard 定义在 commitSnapshot 之前，但只在加载完成后调用，因此用 ref 取当下的提交入口。
+  const commitRef = useRef<((next: BoardSnapshot, draft: string | null) => boolean) | null>(null)
   const loadTokenRef = useRef(0)
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' || navigator.onLine)
   const [dialog, setDialog] = useState<DialogState>(null)
@@ -312,6 +315,14 @@ export default function App() {
       setStored(safeBoard)
       setBoardLoadToken((value) => value + 1)
       setScreen('workspace')
+      // 未完成的过去周任务直接顺延到本周，不弹确认条；走同一条 CAS 保存路径，
+      // 失败/离线照常进入重试与草稿提示。顺延本身出错时不能拖垮加载，只记日志。
+      try {
+        const carried = carryForwardTasks(loadedSnapshot, todayInTimeZone(loadedSnapshot.settings.timeZone))
+        if (carried !== loadedSnapshot) commitRef.current?.(carried, null)
+      } catch (caught) {
+        if (caught instanceof Error) console.warn('[taskboard]', caught.message)
+      }
     } catch (caught) {
       const message = errorNotice(caught, 'noticeBoardInvalid')
       clearPrivateState(nextAdapter.mode === 'cloud' ? 'auth' : 'setup')
@@ -517,6 +528,7 @@ export default function App() {
     void drainRef.current?.()
     return true
   }, [])
+  commitRef.current = commitSnapshot
 
   // 返回是否成功换上了新的板（false = 仍在旧板/被取代/失败）。调用方据此决定是否继续依赖它。
   // automatic=true 表示这是焦点/联网触发的自动刷新：只要还有未保存改动（在途、排队、失败保留），
@@ -851,9 +863,8 @@ export default function App() {
     if (domain === 'weekly') return task.weekKey === selectedWeek
     return task.dateKey === selectedDate
   })
-  // 过去未完成的任务只提示、不自动滚动：日任务与周任务各出一条建议。
-  const pastDaily = snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'daily' && !task.parentId && isPastPlacement(task, currentZone))
-  const pastWeekly = snapshot.tasks.filter((task) => !task.archivedAt && task.domain === 'weekly' && !task.parentId && isPastPlacement(task, currentZone))
+  // 过去未完成的任务不再用顶部提示条确认：周任务在载入时已经自动顺延（见 openBoard），
+  // 日任务保留面板提示与行内“建议重新安排”作为手动入口。
 
   // 「回到当前」只在今天/本周仍在所选周期范围内、且已离开当前周期时出现。
   const canGoCurrentWeek = !selectedCycle || (currentWeekKey >= weekKey(selectedCycle.startDate) && currentWeekKey <= weekKey(selectedCycle.endDate))
@@ -893,8 +904,6 @@ export default function App() {
           <button className="text-button" onClick={() => { setDate(runningBlock.dateKey, true); panelRefs.current[3]?.scrollIntoView({ behavior: 'smooth', inline: 'start' }) }}>{t('jumpFocus')}</button>
         </div>
       ) : null}
-      {pastDaily.length ? <PastSuggestions tasks={pastDaily} hintKey="pastHint" language={language} t={t} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} /> : null}
-      {pastWeekly.length ? <PastSuggestions tasks={pastWeekly} hintKey="weeklyPastHint" language={language} t={t} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} /> : null}
       <main className="workspace-scroll" ref={workspaceScrollRef} aria-label={t('subtitle')}>
         <div className="workspace-stage" ref={setStageElement}>
           <ConnectorLayer stage={stageElement} snapshot={snapshot} rowRefs={rowRefs} selectedChain={selectedChain} />
@@ -1094,10 +1103,6 @@ function DayRail({ selectedDate, selectedWeek, todayKey, cycle, language, t, onS
 // 可见文字只写“本周 / 今天”，完整语义由 aria-label / title 承担。
 function ReturnToCurrent({ label, hint, onClick }: { label: string; hint: string; onClick: () => void }) {
   return <div className="panel-current"><button className="current-return" onClick={onClick} aria-label={hint} title={hint}><i className="current-mark" aria-hidden="true" /><Icon name="back" />{label}</button></div>
-}
-
-function PastSuggestions({ tasks, hintKey, language, t, onReschedule }: { tasks: Task[]; hintKey: CopyKey; language: Language; t: (key: CopyKey) => string; onReschedule: (task: Task) => void }) {
-  return <div className="past-suggestions" role="region" aria-label={t('reschedule')}><div className="past-suggestion-title"><span className="notice-dot" /><strong>{t('reschedule')}</strong><span>{t(hintKey)}</span></div><div className="past-suggestion-list">{tasks.slice(0, 5).map((task) => <button key={task.id} className="suggestion-item" onClick={() => onReschedule(task)}><span>{task.title}</span><small>{task.dateKey || task.weekKey}</small></button>)}</div>{tasks.length > 5 ? <span className="suggestion-more">+{tasks.length - 5}</span> : null}</div>
 }
 
 function SortableTaskList({ tasks, t, onSort, children }: { tasks: Task[]; t: (key: CopyKey) => string; onSort: (task: Task, targetId: string) => void; children: React.ReactNode }) {

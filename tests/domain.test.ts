@@ -5,6 +5,7 @@ import {
   addDays,
   addFocusBlock,
   addTask,
+  carryForwardTasks,
   elapsedMsAt,
   emptySnapshot,
   MAX_ELAPSED_MS,
@@ -26,7 +27,7 @@ import {
   createTask,
   deleteTask,
 } from '../src/domain'
-import type { BoardSnapshot } from '../src/types'
+import type { BoardSnapshot, Task } from '../src/types'
 
 const NOW = '2025-01-15T12:00:00.000Z'
 function board(): BoardSnapshot {
@@ -132,6 +133,28 @@ test('weekly rescheduling carries an unfinished week forward and keeps the origi
   const daily = createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-15' }, NOW)
   snapshot = addTask(snapshot, daily)
   assert.throws(() => rescheduleWeeklyTask(snapshot, daily.id, '2025-W05'), /weekly/i)
+})
+
+test('carryForwardTasks moves every unfinished past week into the current week once', () => {
+  let snapshot = board()
+  const root = createTask({ domain: 'weekly', title: 'Carry me', weekKey: '2025-W01' }, NOW)
+  const child = createTask({ domain: 'weekly', title: 'Child', weekKey: '2025-W01', parentId: root.id }, NOW)
+  const done = createTask({ domain: 'weekly', title: 'Done', weekKey: '2025-W01' }, NOW)
+  snapshot = addTask(addTask(addTask(snapshot, root), child), done)
+  snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === done.id ? { ...task, checked: true } : task) }
+  const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
+
+  const active = carried.tasks.filter((task) => !task.archivedAt)
+  // 副本追加在末尾，因此按标题排序后再比较。
+  const placement = (task: Task) => [task.title, task.weekKey]
+  assert.deepEqual(active.map(placement).sort(), [['Carry me', '2025-W03'], ['Child', '2025-W03'], ['Done', '2025-W01']])
+  // 已完成的旧任务不动；原周条目归档并留下可审阅的来源指针。
+  const archived = carried.tasks.filter((task) => task.archivedReason === 'rescheduled')
+  assert.deepEqual(archived.map((task) => task.title), ['Carry me', 'Child'])
+  validateSnapshot(carried)
+
+  // 幂等：再跑一次不应该产生新的副本。
+  assert.equal(carryForwardTasks(carried, '2025-01-15', NOW), carried)
 })
 
 test('timer restoration uses timestamps and rejects a second running timer', () => {

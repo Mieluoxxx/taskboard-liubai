@@ -164,15 +164,19 @@ test('the rails stay list-only while "back to this week / today" lives in the pa
   assert.doesNotMatch(css, /\.rail-return\b/, 'the old rail-bottom control is gone')
 })
 
-test('unfinished weekly tasks from past weeks can be carried forward, not just daily ones', async () => {
+test('unfinished weekly tasks are carried forward automatically, without a confirm bar', async () => {
   const source = await appSource()
   const css = await cssSource()
-  // 同一个建议条按域复用：日任务提示 pastHint，周任务提示 weeklyPastHint，只有未完成的顶层任务上条。
-  assert.match(source, /<PastSuggestions tasks=\{pastDaily\} hintKey="pastHint"/, 'daily suggestions stay wired')
-  assert.match(source, /<PastSuggestions tasks=\{pastWeekly\} hintKey="weeklyPastHint"/, 'weekly suggestions need their own hint')
-  assert.match(source, /const pastWeekly = snapshot\.tasks\.filter\(\(task\) => !task\.archivedAt && task\.domain === 'weekly' && !task\.parentId && isPastPlacement\(task, currentZone\)\)/, 'the weekly bar must list unfinished past weeks only')
+  // 不再有顶部确认条：组件、样式与 i18n 键一起删除，加载时直接顺延。
+  assert.doesNotMatch(source, /PastSuggestions/, 'the top suggestion bar is gone')
+  assert.doesNotMatch(css, /\.past-suggestions\b/, 'the bar styles are gone')
+  assert.doesNotMatch(source, /pastHint|weeklyPastHint/, 'the bar hint keys are gone')
+  assert.match(source, /carryForwardTasks\(loadedSnapshot, todayInTimeZone\(loadedSnapshot\.settings\.timeZone\)\)/, 'loading must carry past weekly tasks forward')
+  assert.match(source, /if \(carried !== loadedSnapshot\) commitRef\.current\?\.\(carried, null\)/, 'the carry is committed through the normal CAS path only when something moved')
+  assert.match(source, /const commitRef = useRef<\(\(next: BoardSnapshot, draft: string \| null\) => boolean\) \| null>\(null\)/, 'openBoard reaches the commit entry point through a ref')
+
+  // 日任务仍保留手动入口：面板提示 + 行内按钮 + 同一个顺延对话框。
   assert.match(source, /function isPastPlacement\(task: Task, timeZone: string\)/, 'past detection must be shared between domains')
-  // 顺延目标：周任务默认下周，日任务默认次日；保存时按域分发到各自的领域函数。
   assert.match(source, /task\.domain === 'weekly'\) return \{ value: weekKey\(addDays\(weekRange[\s\S]{0,80}kind: 'week'/, 'weekly rescheduling must default to the following week')
   assert.match(source, /task\.domain === 'weekly' \? rescheduleWeeklyTask\(current, task\.id, target\) : rescheduleDailyTask\(current, task\.id, target\)/, 'the shared dialog must dispatch by domain')
   assert.match(source, /onAddSubtask=\{\(task\) => setDialog\(\{ kind: 'task', domain: 'weekly', parentId: task\.id \}\)\} onReschedule=/, 'weekly rows need the reschedule action')
@@ -264,7 +268,7 @@ test('each panel offers exactly one add entry, so no action is duplicated', asyn
   // 周与日是固定的日历周期，不存在“新建周/新建日”：它们的周期轨道上不能有添加按钮，
   // 否则会与面板自身的「添加任务」重复（同一动作两个入口）。
   const weekRail = source.slice(source.indexOf('function WeekRail'), source.indexOf('function DayRail'))
-  const dayRail = source.slice(source.indexOf('function DayRail'), source.indexOf('function PastSuggestions'))
+  const dayRail = source.slice(source.indexOf('function DayRail'), source.indexOf('function ReturnToCurrent'))
   assert.doesNotMatch(weekRail, /rail-add/, 'the week rail must not offer an add button')
   assert.doesNotMatch(dayRail, /rail-add/, 'the day rail must not offer an add button')
   assert.doesNotMatch(weekRail, /onAdd/, 'WeekRail should not even accept an onAdd prop')

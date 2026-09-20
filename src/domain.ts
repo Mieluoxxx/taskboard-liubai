@@ -492,6 +492,24 @@ export function rescheduleWeeklyTask(snapshot: BoardSnapshot, taskId: string, ta
   return next
 }
 
+/**
+ * 未完成的过去周任务直接顺延到本周（不需要用户确认）。
+ * 与手动顺延共用同一条归档链：旧周条目保留 archivedAt + rescheduledTo 指针，
+ * 因此“它原本在哪一周”仍然可审阅。只处理顶层任务：子任务随父任务起块搬运。
+ * 没有可顺延的任务时原样返回同一引用，调用方据此判断是否需要保存。
+ */
+export function carryForwardTasks(snapshot: BoardSnapshot, today: string, now = new Date().toISOString()): BoardSnapshot {
+  if (!isDateKey(today)) throw new Error('Invalid calendar date arithmetic')
+  const currentWeek = weekKey(today)
+  let next = snapshot
+  for (const task of snapshot.tasks) {
+    if (task.archivedAt || task.checked || task.parentId) continue
+    if (task.domain !== 'weekly' || !task.weekKey || task.weekKey >= currentWeek) continue
+    next = rescheduleWeeklyTask(next, task.id, currentWeek, now)
+  }
+  return next
+}
+
 export function createTask(input: {
   domain: Domain
   title: string
