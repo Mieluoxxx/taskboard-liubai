@@ -157,6 +157,88 @@ test('carryForwardTasks moves every unfinished past week into the current week o
   assert.equal(carryForwardTasks(carried, '2025-01-15', NOW), carried)
 })
 
+test('carryForwardTasks also carries unfinished past daily tasks to today, and follows the weekly move', () => {
+  let snapshot = board()
+  const weekly = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W01' }, NOW)
+  const root = createTask({ domain: 'daily', title: 'Carry me', dateKey: '2025-01-13', upperTaskId: weekly.id }, NOW)
+  const child = createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-13', parentId: root.id }, NOW)
+  const done = createTask({ domain: 'daily', title: 'Done', dateKey: '2025-01-13' }, NOW)
+  // 今天这条不会被搬，但它挂的周任务本轮搬走了，关联同样要跟着改。
+  const today = createTask({ domain: 'daily', title: 'Today', dateKey: '2025-01-15', upperTaskId: weekly.id }, NOW)
+  snapshot = addTask(addTask(addTask(addTask(addTask(snapshot, weekly), root), child), done), today)
+  snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === done.id ? { ...task, checked: true } : task) }
+  const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
+
+  // 副本追加在末尾，因此按标题取用而不是比数组顺序。
+  const byTitle = new Map(carried.tasks.filter((task) => !task.archivedAt).map((task) => [task.title, task]))
+  assert.deepEqual([...byTitle.keys()].sort(), ['Carry me', 'Child', 'Done', 'Today', 'Week'])
+  assert.equal(byTitle.get('Carry me')?.dateKey, '2025-01-15')
+  assert.equal(byTitle.get('Child')?.dateKey, '2025-01-15')
+  assert.equal(byTitle.get('Child')?.parentId, byTitle.get('Carry me')?.id, 'subtasks ride along with the parent')
+  assert.equal(byTitle.get('Done')?.dateKey, '2025-01-13', 'a checked task stays where it was')
+  assert.equal(byTitle.get('Today')?.dateKey, '2025-01-15')
+  assert.equal(byTitle.get('Week')?.weekKey, '2025-W03')
+
+  // 关联改指周任务现有的副本，而不是停在已归档的旧周上（旧周已不在行内，会断线）。
+  assert.equal(byTitle.get('Carry me')?.upperTaskId, byTitle.get('Week')?.id)
+  assert.equal(byTitle.get('Today')?.upperTaskId, byTitle.get('Week')?.id, 'an untouched daily task needs the same repair')
+  // 归档的旧日任务保留当时的历史关联。
+  const archivedDaily = carried.tasks.find((task) => task.title === 'Carry me' && task.archivedAt)
+  assert.equal(archivedDaily?.upperTaskId, weekly.id)
+  assert.ok(archivedDaily?.rescheduledTo)
+  validateSnapshot(carried)
+
+  assert.equal(carryForwardTasks(carried, '2025-01-15', NOW), carried, 'carrying must be idempotent')
+})
+
+test('a daily task carried later still finds the weekly copy moved in an earlier load', () => {
+  let snapshot = board()
+  const oldWeek = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W01' }, NOW)
+  const newWeek = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W03' }, NOW)
+  const daily = createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-13', upperTaskId: oldWeek.id }, NOW)
+  snapshot = addTask(addTask(addTask(snapshot, oldWeek), newWeek), daily)
+  // 上一次载入已经把周任务搬到了 W03，只留下归档指针；本次调用不会再看到那条周任务。
+  snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === oldWeek.id ? { ...task, archivedAt: NOW, archivedReason: 'rescheduled' as const, rescheduledTo: newWeek.id } : task) }
+
+  const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
+  const moved = carried.tasks.find((task) => task.title === 'Day' && !task.archivedAt)
+  assert.equal(moved?.dateKey, '2025-01-15')
+  assert.equal(moved?.upperTaskId, newWeek.id, 'the reference must be followed across loads, not only within one call')
+  validateSnapshot(carried)
+})
+
+test('carryForwardTasks repairs a stale weekly link even when nothing has to move', () => {
+  let snapshot = board()
+  const oldWeek = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W01' }, NOW)
+  const newWeek = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W03' }, NOW)
+  const daily = createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-15', upperTaskId: oldWeek.id }, NOW)
+  snapshot = addTask(addTask(addTask(snapshot, oldWeek), newWeek), daily)
+  snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === oldWeek.id ? { ...task, archivedAt: NOW, archivedReason: 'rescheduled' as const, rescheduledTo: newWeek.id } : task) }
+
+  const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
+  assert.notEqual(carried, snapshot, 'a repaired link still needs to be saved')
+  assert.equal(carried.tasks.find((task) => task.title === 'Day')?.upperTaskId, newWeek.id)
+  assert.equal(carried.tasks.filter((task) => task.title === 'Day').length, 1, 'repairing a link must not duplicate the task')
+  validateSnapshot(carried)
+})
+
+test('carryForwardTasks survives a reschedule chain that ends somewhere illegal', () => {
+  let snapshot = board()
+  const weekly = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W01' }, NOW)
+  const stray = createTask({ domain: 'daily', title: 'Stray', dateKey: '2025-01-10' }, NOW)
+  const past = createTask({ domain: 'daily', title: 'Past', dateKey: '2025-01-13', upperTaskId: weekly.id }, NOW)
+  snapshot = addTask(addTask(addTask(snapshot, weekly), stray), past)
+  // 快照校验只要求 rescheduledTo 指向存在的 id，不限定域：链尾完全可能是一条日任务。
+  snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === weekly.id ? { ...task, archivedAt: NOW, archivedReason: 'rescheduled' as const, rescheduledTo: stray.id } : task) }
+  validateSnapshot(snapshot)
+
+  const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
+  const moved = carried.tasks.find((task) => task.title === 'Past' && !task.archivedAt)
+  assert.equal(moved?.dateKey, '2025-01-15', 'one bad link must not abort the whole carry')
+  assert.equal(moved?.upperTaskId, weekly.id, 'an illegal chain end must not be adopted')
+  validateSnapshot(carried)
+})
+
 test('timer restoration uses timestamps and rejects a second running timer', () => {
   let snapshot = board()
   snapshot = addFocusBlock(snapshot, { id: 'focus-a', dateKey: '2025-01-15', title: 'A', durationMinutes: 45, status: 'running', startedAt: '2025-01-15T12:00:00.000Z', elapsedMs: 5_000, createdAt: NOW })

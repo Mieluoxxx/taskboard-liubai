@@ -315,7 +315,7 @@ export default function App() {
       setStored(safeBoard)
       setBoardLoadToken((value) => value + 1)
       setScreen('workspace')
-      // 未完成的过去周任务直接顺延到本周，不弹确认条；走同一条 CAS 保存路径，
+      // 未完成的过去任务直接顺延到当前周期（周→本周，日→今天），不弹确认条；走同一条 CAS 保存路径，
       // 失败/离线照常进入重试与草稿提示。顺延本身出错时不能拖垮加载，只记日志。
       try {
         const carried = carryForwardTasks(loadedSnapshot, todayInTimeZone(loadedSnapshot.settings.timeZone))

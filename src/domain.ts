@@ -493,9 +493,31 @@ export function rescheduleWeeklyTask(snapshot: BoardSnapshot, taskId: string, ta
 }
 
 /**
- * 未完成的过去周任务直接顺延到本周（不需要用户确认）。
- * 与手动顺延共用同一条归档链：旧周条目保留 archivedAt + rescheduledTo 指针，
- * 因此“它原本在哪一周”仍然可审阅。只处理顶层任务：子任务随父任务起块搬运。
+ * 顺着 rescheduledTo 指针找到这条周任务现在活着的副本。
+ * 跨周期搬走后日任务不能挂在已归档的旧周上，否则关联线会从界面上消失。
+ * 链断裂（目标已被删）或成环时停在原地，由调用方对比后决定是否写入。
+ */
+function liveRescheduleTarget(tasks: Task[], startId: string): string {
+  const seen = new Set<string>()
+  let current = startId
+  while (!seen.has(current)) {
+    seen.add(current)
+    const archived = tasks.find((task) => task.id === current)
+    if (!archived || !archived.archivedAt || !archived.rescheduledTo) break
+    current = archived.rescheduledTo
+  }
+  const target = tasks.find((task) => task.id === current)
+  // 快照校验对 rescheduledTo 只要求「id 存在」，不限定域与父子关系，因此链尾可能是
+  // 日任务或子任务；那种 id 写进 upperTaskId 会被校验拒绝，进而让整批顺延被
+  // 调用方的 catch 放弃。只有末归档的顶层周任务才是合法终点，其余一律不改。
+  if (!target || target.archivedAt || target.parentId || target.domain !== 'weekly') return startId
+  return target.id
+}
+
+/**
+ * 未完成的过去任务直接顺延到当前周期（周任务 → 本周，日任务 → 今天），不需要用户确认。
+ * 与手动顺延共用同一条归档链：旧条目保留 archivedAt + rescheduledTo 指针，
+ * 因此“它原本在哪一周、哪一天”仍然可审阅。只处理顶层任务：子任务随父任务起块搬运。
  * 没有可顺延的任务时原样返回同一引用，调用方据此判断是否需要保存。
  */
 export function carryForwardTasks(snapshot: BoardSnapshot, today: string, now = new Date().toISOString()): BoardSnapshot {
@@ -503,10 +525,32 @@ export function carryForwardTasks(snapshot: BoardSnapshot, today: string, now = 
   const currentWeek = weekKey(today)
   let next = snapshot
   for (const task of snapshot.tasks) {
-    if (task.archivedAt || task.checked || task.parentId) continue
-    if (task.domain !== 'weekly' || !task.weekKey || task.weekKey >= currentWeek) continue
+    if (task.archivedAt || task.checked || task.parentId || task.domain !== 'weekly') continue
+    if (!task.weekKey || task.weekKey >= currentWeek) continue
     next = rescheduleWeeklyTask(next, task.id, currentWeek, now)
   }
+  for (const task of snapshot.tasks) {
+    if (task.archivedAt || task.checked || task.parentId || task.domain !== 'daily') continue
+    if (!task.dateKey || task.dateKey >= today) continue
+    next = rescheduleDailyTask(next, task.id, today, now)
+  }
+  // 周任务搬走后，所有还活着的日任务（本轮搬的、今天/未来本来就有的、以前搬过但指着旧周的）
+  // 都要改指周任务现有的副本。追链而不是只看本轮搬过谁：现网数据里周任务可能早就搬走了。
+  const stale = new Map<string, string>()
+  for (const task of next.tasks) {
+    if (task.archivedAt || task.parentId || task.domain !== 'daily' || !task.upperTaskId) continue
+    const live = liveRescheduleTarget(next.tasks, task.upperTaskId)
+    if (live !== task.upperTaskId) stale.set(task.id, live)
+  }
+  if (stale.size) {
+    if (next === snapshot) next = cloneSnapshot(snapshot)
+    for (const task of next.tasks) {
+      const live = stale.get(task.id)
+      if (live) task.upperTaskId = live
+    }
+  }
+  // 每次顺延各自校验过一次，改过关联后再校验一次，保证返回的快照一定合法。
+  if (next !== snapshot) validateSnapshot(next)
   return next
 }
 

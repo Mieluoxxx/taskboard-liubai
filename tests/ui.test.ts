@@ -171,11 +171,11 @@ test('unfinished weekly tasks are carried forward automatically, without a confi
   assert.doesNotMatch(source, /PastSuggestions/, 'the top suggestion bar is gone')
   assert.doesNotMatch(css, /\.past-suggestions\b/, 'the bar styles are gone')
   assert.doesNotMatch(source, /pastHint|weeklyPastHint/, 'the bar hint keys are gone')
-  assert.match(source, /carryForwardTasks\(loadedSnapshot, todayInTimeZone\(loadedSnapshot\.settings\.timeZone\)\)/, 'loading must carry past weekly tasks forward')
+  assert.match(source, /carryForwardTasks\(loadedSnapshot, todayInTimeZone\(loadedSnapshot\.settings\.timeZone\)\)/, 'loading must carry past daily and weekly tasks forward')
   assert.match(source, /if \(carried !== loadedSnapshot\) commitRef\.current\?\.\(carried, null\)/, 'the carry is committed through the normal CAS path only when something moved')
   assert.match(source, /const commitRef = useRef<\(\(next: BoardSnapshot, draft: string \| null\) => boolean\) \| null>\(null\)/, 'openBoard reaches the commit entry point through a ref')
 
-  // 日任务仍保留手动入口：面板提示 + 行内按钮 + 同一个顺延对话框。
+  // 手动入口作为兑底保留：面板提示 + 行内按钮 + 同一个顺延对话框。
   assert.match(source, /function isPastPlacement\(task: Task, timeZone: string\)/, 'past detection must be shared between domains')
   assert.match(source, /task\.domain === 'weekly'\) return \{ value: weekKey\(addDays\(weekRange[\s\S]{0,80}kind: 'week'/, 'weekly rescheduling must default to the following week')
   assert.match(source, /task\.domain === 'weekly' \? rescheduleWeeklyTask\(current, task\.id, target\) : rescheduleDailyTask\(current, task\.id, target\)/, 'the shared dialog must dispatch by domain')
