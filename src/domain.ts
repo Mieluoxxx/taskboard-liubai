@@ -247,8 +247,9 @@ export function validateSnapshot(value: unknown): BoardSnapshot {
     const parentId = optionalString(raw, 'parentId')
     const upperTaskId = optionalString(raw, 'upperTaskId')
     if (raw.domain === 'long' && (!cycleId || !cycleIds.has(cycleId) || week !== undefined || date !== undefined)) throw new BoardError('noticeInvalidState', 'Long-term task placement is invalid')
-    if (raw.domain === 'weekly' && (cycleId !== undefined || date !== undefined || !validWeekKey(week))) throw new BoardError('noticeInvalidState', 'Weekly task placement is invalid')
-    if (raw.domain === 'daily' && (cycleId !== undefined || week !== undefined || !isDateKey(date))) throw new BoardError('noticeInvalidState', 'Daily task placement is invalid')
+    if (cycleId !== undefined && !cycleIds.has(cycleId)) throw new BoardError('noticeInvalidState', 'Task cycle is invalid')
+    if (raw.domain === 'weekly' && (date !== undefined || !validWeekKey(week))) throw new BoardError('noticeInvalidState', 'Weekly task placement is invalid')
+    if (raw.domain === 'daily' && (week !== undefined || !isDateKey(date))) throw new BoardError('noticeInvalidState', 'Daily task placement is invalid')
     const archivedAt = raw.archivedAt
     if (archivedAt !== undefined && !validIso(archivedAt)) throw new BoardError('noticeInvalidState', 'Archived task timestamp is invalid')
     const archivedReason = raw.archivedReason
@@ -274,6 +275,17 @@ export function validateSnapshot(value: unknown): BoardSnapshot {
   }
 
   const taskById = new Map(tasks.map((task) => [task.id, task]))
+  // 旧周/日任务没有归属：只沿已有上级与父任务恢复，不按日期或当前选择猜测。
+  // 先处理每个域的顶层任务，再处理子任务；归属落入规范快照后，解除关联也不会丢失。
+  for (const domain of ['long', 'weekly', 'daily']) {
+    for (const child of [false, true]) {
+      for (const task of tasks) {
+        if (task.domain !== domain || Boolean(task.parentId) !== child || task.cycleId) continue
+        const source = taskById.get(task.parentId || task.upperTaskId || '')
+        if (source?.cycleId) task.cycleId = source.cycleId
+      }
+    }
+  }
   for (const task of tasks) {
     if (task.parentId !== undefined) {
       const parent = taskById.get(task.parentId)
@@ -286,7 +298,7 @@ export function validateSnapshot(value: unknown): BoardSnapshot {
       if (task.parentId !== undefined) throw new BoardError('noticeInvalidState', 'Subtasks cannot cross-link')
       const upper = taskById.get(task.upperTaskId)
       const allowed = task.domain === 'weekly' ? upper?.domain === 'long' : task.domain === 'daily' ? upper?.domain === 'weekly' : false
-      if (!upper || upper.parentId !== undefined || !allowed || upper.id === task.id) throw new BoardError('noticeInvalidState', 'Task association is invalid')
+      if (!upper || upper.parentId !== undefined || !allowed || upper.id === task.id || upper.cycleId !== task.cycleId) throw new BoardError('noticeInvalidState', 'Task association is invalid')
     }
     if (task.rescheduledTo !== undefined && !taskById.has(task.rescheduledTo)) throw new BoardError('noticeInvalidState', 'Reschedule target is invalid')
   }
@@ -331,6 +343,25 @@ export function cloneSnapshot(snapshot: BoardSnapshot): BoardSnapshot {
 
 export function activeTasks(snapshot: BoardSnapshot, domain?: Domain): Task[] {
   return snapshot.tasks.filter((task) => !task.archivedAt && (!domain || task.domain === domain))
+}
+
+export function tasksForPlacement(snapshot: BoardSnapshot, domain: Domain, placement: Pick<Task, 'cycleId' | 'weekKey' | 'dateKey'>): Task[] {
+  return activeTasks(snapshot, domain).filter((task) => task.cycleId === placement.cycleId &&
+    (domain === 'long' || (domain === 'weekly' ? task.weekKey === placement.weekKey : task.dateKey === placement.dateKey)))
+}
+
+/** 旧版可能已将任务顺延到项目外：只扩展查看范围，不改项目日期或新建范围。 */
+export function cycleForNavigation(snapshot: BoardSnapshot, cycle?: GoalCycle): GoalCycle | undefined {
+  if (!cycle) return undefined
+  let { startDate, endDate } = cycle
+  for (const task of snapshot.tasks) {
+    if (task.archivedAt || task.cycleId !== cycle.id || task.domain === 'long') continue
+    const range = task.domain === 'weekly' ? weekRange(task.weekKey!) : { start: task.dateKey!, end: task.dateKey! }
+    if (range.start <= cycle.endDate && range.end >= cycle.startDate) continue
+    if (range.start < startDate) startDate = range.start
+    if (range.end > endDate) endDate = range.end
+  }
+  return startDate === cycle.startDate && endDate === cycle.endDate ? cycle : { ...cycle, startDate, endDate }
 }
 
 export function updateTask(snapshot: BoardSnapshot, taskId: string, patch: Partial<Task>, now = new Date().toISOString()): BoardSnapshot {
@@ -443,9 +474,18 @@ export function reorderSiblingTo(snapshot: BoardSnapshot, taskId: string, target
   return { ...snapshot, tasks: snapshot.tasks.map((candidate) => slots.has(candidate) ? siblings[index++] : candidate) }
 }
 
+function placementWithinCycle(snapshot: BoardSnapshot, task: Task, target: string): boolean {
+  const cycle = snapshot.cycles.find((cycle) => cycle.id === task.cycleId)
+  if (!cycle) return true
+  const start = task.domain === 'weekly' ? weekKey(cycle.startDate) : cycle.startDate
+  const end = task.domain === 'weekly' ? weekKey(cycle.endDate) : cycle.endDate
+  return target >= start && target <= end
+}
+
 // 日任务与周任务的顺延只差「改哪个放置键」：旧条目归档并指向副本，重复顺延形成可审阅链。
 function reschedulePlacement(next: BoardSnapshot, root: Task, key: 'dateKey' | 'weekKey', target: string, now: string): void {
   if (root[key] === target) throw new BoardError('noticeRescheduleInvalid', 'Choose a different target period')
+  if (!placementWithinCycle(next, root, target)) throw new BoardError('noticeRescheduleOutsideCycle', 'Reschedule target is outside the task cycle')
   const subtree = next.tasks.filter((task) => task.id === root.id || task.parentId === root.id)
   const idMap = new Map<string, string>()
   for (const task of subtree) idMap.set(task.id, createId('task'))
@@ -507,10 +547,10 @@ function liveRescheduleTarget(tasks: Task[], startId: string): string {
     current = archived.rescheduledTo
   }
   const target = tasks.find((task) => task.id === current)
-  // 快照校验对 rescheduledTo 只要求「id 存在」，不限定域与父子关系，因此链尾可能是
+  // 旧快照可能在顺延后解除或改换关联；rescheduledTo 只要求「id 存在」，不限定归属、域与父子关系，因此链尾可能是
   // 日任务或子任务；那种 id 写进 upperTaskId 会被校验拒绝，进而让整批顺延被
   // 调用方的 catch 放弃。只有末归档的顶层周任务才是合法终点，其余一律不改。
-  if (!target || target.archivedAt || target.parentId || target.domain !== 'weekly') return startId
+  if (!target || target.archivedAt || target.parentId || target.domain !== 'weekly' || target.cycleId !== tasks.find((task) => task.id === startId)?.cycleId) return startId
   return target.id
 }
 
@@ -526,12 +566,12 @@ export function carryForwardTasks(snapshot: BoardSnapshot, today: string, now = 
   let next = snapshot
   for (const task of snapshot.tasks) {
     if (task.archivedAt || task.checked || task.parentId || task.domain !== 'weekly') continue
-    if (!task.weekKey || task.weekKey >= currentWeek) continue
+    if (!task.weekKey || task.weekKey >= currentWeek || !placementWithinCycle(snapshot, task, currentWeek)) continue
     next = rescheduleWeeklyTask(next, task.id, currentWeek, now)
   }
   for (const task of snapshot.tasks) {
     if (task.archivedAt || task.checked || task.parentId || task.domain !== 'daily') continue
-    if (!task.dateKey || task.dateKey >= today) continue
+    if (!task.dateKey || task.dateKey >= today || !placementWithinCycle(snapshot, task, today)) continue
     next = rescheduleDailyTask(next, task.id, today, now)
   }
   // 周任务搬走后，所有还活着的日任务（本轮搬的、今天/未来本来就有的、以前搬过但指着旧周的）
@@ -658,8 +698,7 @@ export function createFocusBlock(input: {
 export function addTask(snapshot: BoardSnapshot, task: Task): BoardSnapshot {
   const next = cloneSnapshot(snapshot)
   next.tasks.push(task)
-  validateSnapshot(next)
-  return next
+  return validateSnapshot(next)
 }
 
 export function addFocusBlock(snapshot: BoardSnapshot, block: FocusBlock): BoardSnapshot {

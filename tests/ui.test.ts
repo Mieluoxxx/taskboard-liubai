@@ -147,8 +147,8 @@ test('the rails stay list-only while "back to this week / today" lives in the pa
   assert.match(control, /<i className="current-mark" aria-hidden="true" \/><Icon name="back" \/>\{label\}/, 'the chip pairs the current dot with the back arrow')
   assert.match(source, /const goCurrentWeek = canGoCurrentWeek && selectedWeek !== currentWeekKey \? <ReturnToCurrent label=\{t\('thisWeek'\)\} hint=\{t\('backToCurrentWeek'\)\}/, 'the week chip only appears when off the current week')
   assert.match(source, /const goToday = canGoToday && selectedDate !== todayKey \? <ReturnToCurrent label=\{t\('today'\)\} hint=\{t\('backToCurrentDay'\)\}/, 'the day chip only appears when off today')
-  assert.match(source, /const canGoCurrentWeek = !selectedCycle \|\| \(currentWeekKey >= weekKey\(selectedCycle\.startDate\) && currentWeekKey <= weekKey\(selectedCycle\.endDate\)\)/, 'the week chip needs the cycle-aware range check')
-  assert.match(source, /const canGoToday = !selectedCycle \|\| dateInRange\(todayKey, selectedCycle\.startDate, selectedCycle\.endDate\)/, 'the day chip needs the cycle-aware range check')
+  assert.match(source, /const canGoCurrentWeek = !navigationCycle \|\| \(currentWeekKey >= weekKey\(navigationCycle\.startDate\) && currentWeekKey <= weekKey\(navigationCycle\.endDate\)\)/, 'the week chip needs the cycle-aware navigation range check')
+  assert.match(source, /const canGoToday = !navigationCycle \|\| dateInRange\(todayKey, navigationCycle\.startDate, navigationCycle\.endDate\)/, 'the day chip includes existing out-of-range plans')
 
   // 渲染位置：面板头部之后、内容之前；TasksPanel 与 FocusPanel 都接 currentAction。
   assert.match(source, /currentAction\?: React\.ReactNode/, 'panels take the chip through a prop')
@@ -247,10 +247,10 @@ test('cycle duration scopes the week and day rails', async () => {
   const source = await appSource()
   assert.match(source, /weekKeysInRange/, 'the week rail must derive weeks from the cycle range')
   assert.match(source, /dateKeysInRange/, 'the day rail must derive dates from the cycle range')
-  assert.match(source, /cycle=\{selectedCycle\}/g, 'all calendar rails must receive the selected cycle')
+  assert.match(source, /cycle=\{navigationCycle\}/g, 'calendar rails must include existing out-of-range plans from this project')
   assert.match(source, /const selection = selectionForSnapshot\(nextSnapshot, preferredCycleId, preferredDate\)/, 'selection normalization must use one cycle-aware helper')
   assert.match(source, /const selectCycle = \(cycleId: string\) => reconcileSelection\(snapshot, cycleId, selectionRef\.current\.date\)/, 'switching cycles must preserve or clamp the selected date')
-  assert.match(source, /const date = dateForWeek\(key, selectedCycle, selectionRef\.current\.date\)/, 'selecting a week must choose an in-range date')
+  assert.match(source, /const date = dateForWeek\(key, navigationCycle, selectionRef\.current\.date\)/, 'selecting a week must choose a navigable date')
   assert.match(source, /const virtual = items\.length > RAIL_VIRTUAL_THRESHOLD/, 'long ranges must use a render window')
   assert.match(source, /visible: items\.slice\(start, end\)/, 'the render window must preserve scrollable endpoints with spacers')
   assert.match(source, /<div className="rail-spacer" style=\{\{ height: windowed\.paddingTop \}\}/, 'virtual rails need an upper spacer')

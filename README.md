@@ -43,7 +43,7 @@ cp .env.example .env.local
 pnpm dev
 ```
 
-后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`004` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。
+后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`005` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。已有部署须先执行 `005_project_task_scope.sql`，再发布前端。
 
 前端是纯静态产物，`pnpm build` 之后把 `dist/` 丢给任意静态托管都行。
 

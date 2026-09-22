@@ -8,7 +8,7 @@ const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
 const THIRD = '00000000-0000-0000-0000-000000000003'
 
-async function database(applyIndependentMigration = true, applyTextLimits = true, applyHistoryRemoval = true) {
+async function database(applyIndependentMigration = true, applyTextLimits = true, applyHistoryRemoval = true, applyProjectScope = true) {
   const db = new PGlite()
   await db.waitReady
   await db.exec(`
@@ -26,9 +26,59 @@ async function database(applyIndependentMigration = true, applyTextLimits = true
   if (applyIndependentMigration) await db.exec(await readFile(new URL('../supabase/migrations/002_independent_boards.sql', import.meta.url), 'utf8'))
   if (applyIndependentMigration && applyTextLimits) await db.exec(await readFile(new URL('../supabase/migrations/003_task_text_limits.sql', import.meta.url), 'utf8'))
   if (applyIndependentMigration && applyTextLimits && applyHistoryRemoval) await db.exec(await readFile(new URL('../supabase/migrations/004_remove_task_history.sql', import.meta.url), 'utf8'))
+  if (applyIndependentMigration && applyTextLimits && applyHistoryRemoval && applyProjectScope) await db.exec(await readFile(new URL('../supabase/migrations/005_project_task_scope.sql', import.meta.url), 'utf8'))
   await db.exec(`select set_config('request.jwt.claim.sub', '${OWNER}', false);`)
   return db
 }
+
+test('005 preserves legacy data and validates project ownership on both sides of CAS', async () => {
+  const now = '2025-01-15T12:00:00.000Z'
+  const cycles = ['A', 'B'].map((id) => ({ id, name: id, startDate: '2025-01-01', endDate: '2025-03-31', createdAt: now }))
+  const legacy = { ...emptySnapshot('UTC'), cycles, tasks: [
+    { ...createTask({ domain: 'long', title: 'Goal', cycleId: 'A' }, now), id: 'goal' },
+    { ...createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W03', upperTaskId: 'goal' }, now), id: 'week' },
+    { ...createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-15', upperTaskId: 'week' }, now), id: 'day' },
+    { ...createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-15', parentId: 'day' }, now), id: 'child' },
+    { ...createTask({ domain: 'weekly', title: 'Detached successor', weekKey: '2025-W04' }, now), id: 'successor' },
+  ] }
+  Object.assign(legacy.tasks[1], { archivedAt: now, archivedReason: 'rescheduled', rescheduledTo: 'successor' })
+  const db = await database(true, true, true, false)
+  try {
+    await db.query('select * from public.get_private_board()')
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(legacy)])
+    const canonical = validateSnapshot(legacy)
+    await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(canonical)]), /invalid/i)
+    await db.exec(await readFile(new URL('../supabase/migrations/005_project_task_scope.sql', import.meta.url), 'utf8'))
+    const preserved = await db.query<{ revision: number; snapshot: unknown }>('select * from public.get_private_board()')
+    assert.equal(Number(preserved.rows[0].revision), 1)
+    assert.deepEqual(preserved.rows[0].snapshot, JSON.parse(JSON.stringify(legacy)))
+    await db.exec('set role authenticated')
+    const saved = await db.query<{ revision: number; snapshot: unknown }>('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(canonical)])
+    assert.equal(Number(saved.rows[0].revision), 2)
+    assert.deepEqual(validateSnapshot(saved.rows[0].snapshot), canonical)
+    for (const [index, patch] of [
+      [1, { cycleId: 'B' }], [2, { cycleId: 'B' }], [3, { cycleId: 'B' }],
+      [4, { cycleId: 'missing' }], [4, { cycleId: null }], [4, { cycleId: 1 }],
+      [4, { weekKey: undefined }], [2, { dateKey: undefined }],
+    ] as const) {
+      const invalid = structuredClone(canonical)
+      Object.assign(invalid.tasks[index], patch)
+      assert.throws(() => validateSnapshot(invalid), /invalid/i)
+      await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [2, JSON.stringify(invalid)]), /invalid/i)
+    }
+    // 无上级的周/日任务也可以明确属于 B；专注块仍可关联另一项目的日任务。
+    const standalone = structuredClone(canonical)
+    standalone.tasks[4].cycleId = 'B'
+    standalone.tasks.push(createTask({ domain: 'daily', title: 'B day', cycleId: 'B', dateKey: '2025-01-15' }, now))
+    standalone.focusBlocks.push({ id: 'shared', title: 'Focus', dateKey: '2025-01-15', taskId: 'day', durationMinutes: 45, status: 'paused', elapsedMs: 0, createdAt: now })
+    validateSnapshot(standalone)
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [2, JSON.stringify(standalone)])
+    // 没有 cycleId 的旧快照仍可读取和保存；不会因为新校验而丢弃历史。
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [3, JSON.stringify(legacy)])
+  } finally {
+    await db.close()
+  }
+})
 
 test('task text limits migrate without touching existing data or other validation rules', async () => {
   const original = await readFile(new URL('../supabase/migrations/001_private_board.sql', import.meta.url), 'utf8')

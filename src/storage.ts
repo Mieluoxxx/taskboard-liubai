@@ -195,8 +195,7 @@ function demoSample(): StoredBoard {
     id: createId('focus'), dateKey, title: '深度工作 · 设计下一页 · Shape the next page', taskId: dailyTask.id, durationMinutes: 90, status: 'finished', elapsedMs: 90 * 60_000, finishedAt: now, createdAt: now,
   }
   const snapshot: BoardSnapshot = { schemaVersion: 1, settings: { timeZone: zone }, cycles: [cycle], tasks: [longTask, weeklyTask, dailyTask, subtask], focusBlocks: [block] }
-  validateSnapshot(snapshot)
-  return { revision: 1, snapshot }
+  return { revision: 1, snapshot: validateSnapshot(snapshot) }
 }
 
 export function createDemoBoardAdapter(): BoardAdapter {

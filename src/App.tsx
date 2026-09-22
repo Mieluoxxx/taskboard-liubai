@@ -4,6 +4,8 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-
 import { CSS } from '@dnd-kit/utilities'
 import {
   activeTasks,
+  tasksForPlacement,
+  cycleForNavigation,
   MAX_TASK_TITLE_LENGTH,
   MAX_TASK_NOTE_LENGTH,
   addCycle,
@@ -50,10 +52,12 @@ import './fonts.css'
 import './styles.css'
 
 const LANGUAGE_KEY = 'liubai-taskboard:language:v1'
+const UNASSIGNED_CYCLE_ID = '' // 空串不是合法项目 id，避免与已有项目碰撞。
+type TaskPlacement = Pick<Task, 'cycleId' | 'weekKey' | 'dateKey'>
 type Screen = 'setup' | 'auth' | 'loading' | 'workspace'
 type SaveState = 'saved' | 'pending' | 'saving' | 'error' | 'offline'
 type DialogState =
-  | { kind: 'task'; task?: Task; domain: Domain; parentId?: string; initial?: TaskInput }
+  | { kind: 'task'; task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement?: TaskPlacement }
   | { kind: 'cycle'; cycle?: GoalCycle; initial?: { name: string; startDate: string; endDate: string } }
   | { kind: 'focus'; block?: FocusBlock; initial?: FocusInput }
   | { kind: 'settings' }
@@ -76,7 +80,7 @@ type FocusInput = { title: string; durationMinutes: string; taskId?: string }
 // 冲突后绝不整板回写（会覆盖其他设备的新改动），而是让用户在新版本上重新编辑同一份输入。
 type DraftOrigin =
   | { kind: 'reorder'; taskId: string; direction: -1 | 1; domain: Domain }
-  | { kind: 'task'; input: TaskInput; taskId?: string; domain: Domain; parentId?: string }
+  | { kind: 'task'; input: TaskInput; taskId?: string; domain: Domain; parentId?: string; placement: TaskPlacement }
   | { kind: 'cycle'; input: { name: string; startDate: string; endDate: string }; cycleId?: string }
   | { kind: 'focus'; input: FocusInput; blockId?: string }
 
@@ -159,7 +163,8 @@ function dateForWeek(key: string, cycle: GoalCycle | undefined, preferredDate: s
 }
 
 function selectionForSnapshot(snapshot: BoardSnapshot, preferredCycleId: string | null, preferredDate: string): { cycleId: string | null; date: string; week: string } {
-  const cycle = snapshot.cycles.find((candidate) => candidate.id === preferredCycleId) || snapshot.cycles[0]
+  if (preferredCycleId === UNASSIGNED_CYCLE_ID) return { cycleId: preferredCycleId, date: preferredDate, week: weekKey(preferredDate) }
+  const cycle = cycleForNavigation(snapshot, snapshot.cycles.find((candidate) => candidate.id === preferredCycleId) || snapshot.cycles[0])
   const date = cycle ? dateForCycleSelection(preferredDate, cycle, todayInTimeZone(snapshot.settings.timeZone)) : preferredDate
   return { cycleId: cycle?.id || null, date, week: weekKey(date) }
 }
@@ -639,7 +644,9 @@ export default function App() {
       const existing = origin.taskId ? board.tasks.find((task) => task.id === origin.taskId) : undefined
       // 目标已被删除时不再静默改成「新建」：那会悄悄产生一个重复任务，改为明确告知并保留输入。
       if (origin.taskId && !existing) { setFlash(copy[language].draftTargetMissing); return }
-      setDialog({ kind: 'task', task: existing, domain: origin.domain, parentId: origin.parentId, initial: origin.input })
+      if (origin.placement.cycleId && !board.cycles.some((cycle) => cycle.id === origin.placement.cycleId)) { setFlash(copy[language].draftTargetMissing); return }
+      reconcileSelection(board, origin.placement.cycleId || UNASSIGNED_CYCLE_ID, origin.placement.dateKey || (origin.placement.weekKey ? weekRange(origin.placement.weekKey).start : selectionRef.current.date))
+      setDialog({ kind: 'task', task: existing, domain: origin.domain, parentId: origin.parentId, initial: origin.input, placement: origin.placement })
     } else if (origin.kind === 'cycle') {
       const existing = origin.cycleId ? board.cycles.find((cycle) => cycle.id === origin.cycleId) : undefined
       if (origin.cycleId && !existing) { setFlash(copy[language].draftTargetMissing); return }
@@ -649,7 +656,7 @@ export default function App() {
       if (origin.blockId && !existing) { setFlash(copy[language].draftTargetMissing); return }
       setDialog({ kind: 'focus', block: existing, initial: origin.input })
     }
-  }, [language, reloadLatest])
+  }, [language, reloadLatest, reconcileSelection])
 
   const openDemo = useCallback(() => {
     void openBoard(createDemoBoardAdapter())
@@ -747,10 +754,15 @@ export default function App() {
     }
   }
 
-  const submitTask = (input: TaskInput, existing?: Task, domain?: Domain, parentId?: string) => {
+  const submitTask = (input: TaskInput, existing?: Task, domain?: Domain, parentId?: string, placement?: TaskPlacement) => {
     const current = storedRef.current
     if (!current) return
     const targetDomain = domain || existing?.domain || 'daily'
+    const targetPlacement = placement || {
+      cycleId: existing ? existing.cycleId : selectedCycle?.id,
+      weekKey: targetDomain === 'weekly' ? existing?.weekKey || selectedWeek : undefined,
+      dateKey: targetDomain === 'daily' ? existing?.dateKey || selectedDate : undefined,
+    }
     if (!existing && targetDomain !== 'long' && selectedCycle && !dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)) {
       setFlash(t('selectionOutsideCycle'))
       return
@@ -766,11 +778,9 @@ export default function App() {
           color: input.color,
           parentId: parentId || input.parentId,
           upperTaskId: parentId || input.parentId ? undefined : input.upperTaskId,
-          cycleId: targetDomain === 'long' ? selectedCycle?.id : undefined,
-          weekKey: targetDomain === 'weekly' ? selectedWeek : undefined,
-          dateKey: targetDomain === 'daily' ? selectedDate : undefined,
+          ...targetPlacement,
         }))
-      if (commitSnapshot(next, draft, { kind: 'task', input, taskId: existing?.id, domain: targetDomain, parentId })) setDialog(null)
+      if (commitSnapshot(next, draft, { kind: 'task', input, taskId: existing?.id, domain: targetDomain, parentId, placement: targetPlacement })) setDialog(null)
     } catch (caught) {
       setSaveState('error')
       setSaveMessage(errorNotice(caught, 'noticeTaskSaveFailed'))
@@ -842,15 +852,16 @@ export default function App() {
   }
 
   const snapshot = stored.snapshot
-  const selectedCycle = snapshot.cycles.find((cycle) => cycle.id === selectedCycleId) || snapshot.cycles[0]
+  const selectedCycle = selectedCycleId === UNASSIGNED_CYCLE_ID ? undefined : snapshot.cycles.find((cycle) => cycle.id === selectedCycleId) || snapshot.cycles[0]
+  const navigationCycle = cycleForNavigation(snapshot, selectedCycle)
   const selectCycle = (cycleId: string) => reconcileSelection(snapshot, cycleId, selectionRef.current.date)
   const selectWeek = (key: string) => {
-    const date = dateForWeek(key, selectedCycle, selectionRef.current.date)
-    applySelection({ cycleId: selectedCycle?.id || null, date, week: key })
+    const date = dateForWeek(key, navigationCycle, selectionRef.current.date)
+    applySelection({ cycleId: selectedCycle?.id || UNASSIGNED_CYCLE_ID, date, week: key })
   }
   const setDate = (date: string, allowOutsideCycle = false) => {
-    const nextDate = !allowOutsideCycle && selectedCycle ? clampDate(date, selectedCycle.startDate, selectedCycle.endDate) : date
-    applySelection({ cycleId: selectedCycle?.id || null, date: nextDate, week: weekKey(nextDate) })
+    const nextDate = !allowOutsideCycle && navigationCycle ? clampDate(date, navigationCycle.startDate, navigationCycle.endDate) : date
+    applySelection({ cycleId: selectedCycle?.id || UNASSIGNED_CYCLE_ID, date: nextDate, week: weekKey(nextDate) })
   }
   const panelRef = (index: number) => (element: HTMLElement | null) => { panelRefs.current[index] = element }
   const registerRow = (id: string) => (element: HTMLElement | null) => {
@@ -858,17 +869,13 @@ export default function App() {
     else rowRefs.current.delete(id)
   }
 
-  const panelTasks = (domain: Domain) => activeTasks(snapshot, domain).filter((task) => {
-    if (domain === 'long') return task.cycleId === selectedCycle?.id
-    if (domain === 'weekly') return task.weekKey === selectedWeek
-    return task.dateKey === selectedDate
-  })
+  const panelTasks = (domain: Domain) => tasksForPlacement(snapshot, domain, { cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate })
   // 过去未完成的任务不再用顶部提示条确认：周任务在载入时已经自动顺延（见 openBoard），
   // 日任务保留面板提示与行内“建议重新安排”作为手动入口。
 
   // 「回到当前」只在今天/本周仍在所选周期范围内、且已离开当前周期时出现。
-  const canGoCurrentWeek = !selectedCycle || (currentWeekKey >= weekKey(selectedCycle.startDate) && currentWeekKey <= weekKey(selectedCycle.endDate))
-  const canGoToday = !selectedCycle || dateInRange(todayKey, selectedCycle.startDate, selectedCycle.endDate)
+  const canGoCurrentWeek = !navigationCycle || (currentWeekKey >= weekKey(navigationCycle.startDate) && currentWeekKey <= weekKey(navigationCycle.endDate))
+  const canGoToday = !navigationCycle || dateInRange(todayKey, navigationCycle.startDate, navigationCycle.endDate)
   const goCurrentWeek = canGoCurrentWeek && selectedWeek !== currentWeekKey ? <ReturnToCurrent label={t('thisWeek')} hint={t('backToCurrentWeek')} onClick={() => selectWeek(currentWeekKey)} /> : null
   const goToday = canGoToday && selectedDate !== todayKey ? <ReturnToCurrent label={t('today')} hint={t('backToCurrentDay')} onClick={() => setDate(todayKey)} /> : null
 
@@ -911,14 +918,14 @@ export default function App() {
             onSort={sortTask}
             panelRef={panelRef(0)} domain="long" title={t('long')} hint={t('longHint')} language={language} t={t}
             tasks={panelTasks('long')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycle?.id} language={language} t={t} onSelect={selectCycle} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} />}
+            rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycleId ?? undefined} hasUnassigned={snapshot.tasks.some((task) => !task.cycleId) || selectedCycleId === UNASSIGNED_CYCLE_ID} language={language} t={t} onSelect={selectCycle} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} />}
             canAdd={Boolean(selectedCycle)} onAdd={() => setDialog({ kind: 'task', domain: 'long' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'long' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'long', parentId: task.id })} />
           <TaskPanel
             onSort={sortTask}
             panelRef={panelRef(1)} domain="weekly" title={t('weekly')} hint={t('weeklyHint')} language={language} t={t}
             tasks={panelTasks('weekly')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={selectedCycle} language={language} t={t} onSelect={selectWeek} />}
+            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={navigationCycle} language={language} t={t} onSelect={selectWeek} />}
             currentAction={goCurrentWeek}
             canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
@@ -926,13 +933,13 @@ export default function App() {
             onSort={sortTask}
             panelRef={panelRef(2)} domain="daily" title={`${t('daily')} · ${weekdayLabel(selectedDate, language)}`} hint={t('dailyHint')} language={language} t={t}
             tasks={panelTasks('daily')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={navigationCycle} language={language} t={t} onSelect={setDate} />}
             currentAction={goToday}
             canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'daily' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'daily', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
           <FocusPanel
             panelRef={panelRef(3)} blocks={snapshot.focusBlocks.filter((block) => block.dateKey === selectedDate)} allTasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} now={now}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={selectedCycle} language={language} t={t} onSelect={setDate} />}
+            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={navigationCycle} language={language} t={t} onSelect={setDate} />}
             currentAction={goToday}
             canAdd={canCreateInCycle} onAdd={() => setDialog({ kind: 'focus' })} onEdit={(block) => setDialog({ kind: 'focus', block })} onDelete={deleteFocusWithConfirm} onCommand={focusCommand}
           />
@@ -940,7 +947,7 @@ export default function App() {
       </main>
       <footer className="app-footer"><span>{t('keyboard')}</span><span>{t('shortcuts')}</span>{adapter?.mode === 'demo' ? <span>{t('demoNote')}</span> : <span>{t('cloudNote')}</span>}</footer>
       {flash ? <div className="toast" role="status">{flash}</div> : null}
-      {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={{ cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} tasks={activeTasks(snapshot)} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId)} /> : null}
+      {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={dialog.placement || { cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} tasks={activeTasks(snapshot)} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId, dialog.placement)} /> : null}
       {dialog?.kind === 'cycle' ? <CycleDialog key={dialog.cycle?.id || 'new'} cycle={dialog.cycle} initial={dialog.initial} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitCycle(input, dialog.cycle)} /> : null}
       {dialog?.kind === 'focus' ? <FocusDialog key={dialog.block?.id || 'new'} block={dialog.block} initial={dialog.initial} tasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitFocus(input, dialog.block)} /> : null}
       {dialog?.kind === 'settings' ? <SettingsDialog zone={snapshot.settings.timeZone} language={language} t={t} onClose={() => setDialog(null)} onLanguage={setLanguage} onSubmit={(zone) => { updateSettings(zone); setDialog(null) }} /> : null}
@@ -1046,8 +1053,8 @@ function Header({ language, setLanguage, t, mode, email, saveState, saveMessage,
   </header>
 }
 
-function CycleRail({ cycles, selectedId, language, t, onSelect, onAdd, onEdit }: { cycles: GoalCycle[]; selectedId?: string; language: Language; t: (key: CopyKey) => string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (cycle: GoalCycle) => void }) {
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('cycles')}</div><div className="rail-items">{cycles.map((cycle) => <div className="rail-item-wrap" key={cycle.id}><button className={`rail-item ${selectedId === cycle.id ? 'selected' : ''}`} aria-current={selectedId === cycle.id ? 'page' : undefined} onClick={() => onSelect(cycle.id)}><span>{cycle.name}</span><small>{cycle.startDate.slice(5)}</small></button>{selectedId === cycle.id ? <button className="rail-edit" aria-label={t('editCycle')} onClick={() => onEdit(cycle)}><Icon name="edit" /></button> : null}</div>)}</div><button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('addCycle')}</button></aside>
+function CycleRail({ cycles, selectedId, hasUnassigned, language, t, onSelect, onAdd, onEdit }: { cycles: GoalCycle[]; selectedId?: string; hasUnassigned: boolean; language: Language; t: (key: CopyKey) => string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (cycle: GoalCycle) => void }) {
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('cycles')}</div><div className="rail-items">{cycles.map((cycle) => <div className="rail-item-wrap" key={cycle.id}><button className={`rail-item ${selectedId === cycle.id ? 'selected' : ''}`} aria-current={selectedId === cycle.id ? 'page' : undefined} onClick={() => onSelect(cycle.id)}><span>{cycle.name}</span><small>{cycle.startDate.slice(5)}</small></button>{selectedId === cycle.id ? <button className="rail-edit" aria-label={t('editCycle')} onClick={() => onEdit(cycle)}><Icon name="edit" /></button> : null}</div>)}{hasUnassigned ? <button className={`rail-item ${selectedId === UNASSIGNED_CYCLE_ID ? 'selected' : ''}`} aria-current={selectedId === UNASSIGNED_CYCLE_ID ? 'page' : undefined} onClick={() => onSelect(UNASSIGNED_CYCLE_ID)}>{t('unassignedPlans')}</button> : null}</div><button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('addCycle')}</button></aside>
 }
 
 // 周、日的导航范围来自选中的长期周期；没有周期时保留独立的当前窗口，方便空板继续使用。
@@ -1154,7 +1161,7 @@ function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone
     {rail}<div className="paper-panel"><div className="panel-top"><div><div className="eyebrow">{domain === 'long' ? '01' : domain === 'weekly' ? '02' : '03'}</div><h2 id={`panel-${domain}`}>{title}</h2><p>{hint}</p></div><button className="add-button" onClick={onAdd} disabled={!addEnabled}><Icon name="plus" />{t('addTask')}</button></div>
       {currentAction}
       {(domain === 'daily' || domain === 'weekly') && tasks.some((task) => isPastPlacement(task, snapshot.settings.timeZone)) ? <div className="past-note">{t('reschedule')}</div> : null}
-      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list"><SortableTaskList key={topLevel[0].cycleId || topLevel[0].weekKey || topLevel[0].dateKey} tasks={topLevel} t={t} onSort={onSort}>{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} carrySource={carrySource} />)}</SortableTaskList></div>}
+      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list"><SortableTaskList key={JSON.stringify([topLevel[0].cycleId, topLevel[0].weekKey, topLevel[0].dateKey])} tasks={topLevel} t={t} onSort={onSort}>{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} carrySource={carrySource} />)}</SortableTaskList></div>}
       <div className="paper-space" />
     </div>
   </section>
@@ -1330,13 +1337,13 @@ function TaskDialog({ task, domain, parentId, initial, placement, tasks, t, onCl
   const [upperTaskId, setUpperTaskId] = useState(initial?.upperTaskId || task?.upperTaskId || '')
   const [selectedParent, setSelectedParent] = useState(initial?.parentId || parentId || task?.parentId || '')
   // 候选必须与新任务落在同一放置位置，否则校验必然失败（用户会看到无法保存的选项）。
-  // 每个域只带一个放置键，因此一次只比较“候选所在域”的那个键：
+  // 项目归属与日期分别比较，再比较“候选所在域”的日历放置键：
   // 上级候选属于另一个域（周←长期、日←周），要用该域的键（周期 / 周），不能拿子任务自己的键去比。
   const valueFor = (valueDomain: Domain, source: { cycleId?: string; weekKey?: string; dateKey?: string }) =>
     valueDomain === 'long' ? source.cycleId : valueDomain === 'weekly' ? source.weekKey : source.dateKey
   const selectedPlacement = placement
   const ownPlacement = {
-    cycleId: task?.cycleId ?? selectedPlacement.cycleId,
+    cycleId: task ? task.cycleId : selectedPlacement.cycleId,
     weekKey: task?.weekKey ?? selectedPlacement.weekKey,
     dateKey: task?.dateKey ?? selectedPlacement.dateKey,
   }
@@ -1346,8 +1353,10 @@ function TaskDialog({ task, domain, parentId, initial, placement, tasks, t, onCl
   // 下拉自身的值优先，其次是已存任务的关联，最后是保留草稿的关联；三者都列进候选才不会显示空白。
   const keptUpperId = upperTaskId || task?.upperTaskId || initial?.upperTaskId
   const upperOptions = tasks.filter((candidate) => !candidate.parentId && !candidate.archivedAt && candidate.domain === upperDomain && candidate.id !== task?.id &&
+    candidate.cycleId === ownPlacement.cycleId &&
     (candidate.id === keptUpperId || valueFor(upperDomain, candidate) === valueFor(upperDomain, selectedPlacement)))
   const parentOptions = tasks.filter((candidate) => !candidate.parentId && !candidate.archivedAt && candidate.domain === domain && candidate.id !== task?.id &&
+    candidate.cycleId === ownPlacement.cycleId &&
     valueFor(domain, candidate) === valueFor(domain, ownPlacement))
   return <Dialog closeLabel={t('close')} title={task ? t('edit') : parentId ? t('addSubtask') : t('addTask')} onClose={onClose} initialFocus="task-title">
     <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (!title.trim()) return; onSubmit({ title, note, color, upperTaskId: selectedParent ? undefined : upperTaskId || undefined, parentId: selectedParent || undefined }) }}>
