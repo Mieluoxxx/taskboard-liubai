@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { addTask, carryForwardTasks, createTask, cycleForNavigation, deleteTask, emptySnapshot, mergeSnapshots, reorderSiblingTo, rescheduleDailyTask, rescheduleWeeklyTask, tasksForPlacement, updateTask, validateSnapshot } from '../src/domain'
+import { addTask, carryForwardTasks, createTask, cycleForNavigation, deleteCycle, deleteTask, emptySnapshot, mergeSnapshots, reorderSiblingTo, rescheduleDailyTask, rescheduleWeeklyTask, tasksForPlacement, updateTask, validateSnapshot } from '../src/domain'
 import type { BoardSnapshot } from '../src/types'
 
 const NOW = '2025-01-15T12:00:00.000Z'
@@ -14,6 +14,73 @@ function projectBoard(): BoardSnapshot {
   ])
   return { ...emptySnapshot('UTC'), cycles, tasks }
 }
+
+test('deleting a project removes all its plans and archives while preserving shared focus and unrelated data', () => {
+  let board = validateSnapshot(projectBoard())
+  board = addTask(board, { ...createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-15', parentId: 'day-A' }, NOW), id: 'child-A' })
+  board = rescheduleDailyTask(board, 'day-A', '2025-01-16', NOW)
+  const orphan = { ...createTask({ domain: 'daily', title: 'Unassigned', dateKey: '2025-01-15' }, NOW), id: 'orphan' }
+  board = addTask(board, orphan)
+  // 旧历史允许跨项目的顺延指针；删除时只清理引用，不删除链另一端的任务。
+  board.tasks.push({ ...board.tasks.find((task) => task.id === 'week-B')!, id: 'archive-B', archivedAt: NOW, archivedReason: 'rescheduled', rescheduledTo: 'week-A' })
+  board.focusBlocks = [
+    { id: 'running', title: 'Shared running', dateKey: '2025-01-15', taskId: 'day-A', durationMinutes: 45, status: 'running', startedAt: NOW, elapsedMs: 5000, createdAt: NOW },
+    { id: 'finished', title: 'Shared finished', dateKey: '2025-01-15', taskId: 'child-A', durationMinutes: 45, status: 'finished', finishedAt: NOW, elapsedMs: 12000, createdAt: NOW },
+    { id: 'other', title: 'Other project', dateKey: '2025-01-15', taskId: 'day-B', durationMinutes: 45, status: 'paused', elapsedMs: 0, createdAt: NOW },
+  ]
+  board = validateSnapshot(board)
+  const before = structuredClone(board)
+  const next = deleteCycle(board, 'A', NOW)
+  assert.deepEqual(board, before, 'the input must not be mutated')
+  assert.deepEqual(next.cycles, [before.cycles[1]])
+  assert.equal(next.tasks.some((task) => task.cycleId === 'A'), false)
+  assert.deepEqual(next.tasks.filter((task) => task.id !== 'archive-B'), before.tasks.filter((task) => task.cycleId !== 'A' && task.id !== 'archive-B'))
+  const oldArchive = before.tasks.find((task) => task.id === 'archive-B')!
+  const { rescheduledTo, ...unlinkedArchive } = oldArchive
+  assert.equal(rescheduledTo, 'week-A')
+  assert.deepEqual(next.tasks.find((task) => task.id === 'archive-B'), unlinkedArchive)
+  assert.deepEqual(next.focusBlocks, before.focusBlocks.map((block) => {
+    const { taskId, ...timer } = block
+    return block.id === 'other' ? block : timer
+  }))
+  validateSnapshot(next)
+})
+
+test('project deletion handles legacy ownership, empty and last projects, but never deletes unassigned plans', () => {
+  const legacy = projectBoard()
+  legacy.tasks = legacy.tasks.filter((task) => task.cycleId === 'A')
+  for (const task of legacy.tasks) {
+    if (task.domain === 'long') continue
+    delete task.cycleId
+    task.upperTaskId = task.domain === 'weekly' ? 'goal-A' : 'week-A'
+  }
+  legacy.tasks.push(createTask({ domain: 'daily', title: 'Unassigned', dateKey: '2025-01-15' }, NOW))
+  const withoutEmpty = deleteCycle(legacy, 'B', NOW)
+  assert.equal(withoutEmpty.tasks.length, 4)
+  const lastDeleted = deleteCycle(withoutEmpty, 'A', NOW)
+  assert.deepEqual(lastDeleted.cycles, [])
+  assert.deepEqual(lastDeleted.tasks.map((task) => task.title), ['Unassigned'])
+  for (const id of ['', 'missing', 'A']) {
+    assert.throws(() => deleteCycle(lastDeleted, id, NOW), (error: { code?: string }) => error.code === 'noticeCycleMissing')
+  }
+})
+
+test('a project deletion never silently expands to concurrent additions or overrides remote edits', () => {
+  const base = validateSnapshot(projectBoard())
+  const deleted = deleteCycle(base, 'A', NOW)
+  const added = addTask(base, createTask({ domain: 'daily', title: 'New A plan', cycleId: 'A', dateKey: '2025-01-15' }, NOW))
+  const edited = updateTask(base, 'day-A', { title: 'Remote edit' }, NOW)
+  for (const remote of [added, edited]) {
+    const merged = mergeSnapshots(base, deleted, remote)
+    assert.ok(merged.conflicts.length)
+    assert.deepEqual(merged.snapshot, remote, 'preserve the remote project for renewed confirmation')
+  }
+  const unrelated = updateTask(base, 'day-B', { title: 'Remote B edit' }, NOW)
+  const merged = mergeSnapshots(base, deleted, unrelated)
+  assert.deepEqual(merged.conflicts, [])
+  assert.equal(merged.snapshot.cycles.some((cycle) => cycle.id === 'A'), false)
+  assert.equal(merged.snapshot.tasks.find((task) => task.id === 'day-B')?.title, 'Remote B edit')
+})
 
 test('overlapping projects isolate every task domain, including standalone tasks', () => {
   let board = validateSnapshot(projectBoard())

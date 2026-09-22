@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFile } from 'node:fs/promises'
 import { PGlite } from '@electric-sql/pglite'
-import { addCycle, addFocusBlock, addTask, createTask, emptySnapshot, rescheduleDailyTask, rescheduleWeeklyTask, safeTimeZone, validateSnapshot } from '../src/domain'
+import { addCycle, addFocusBlock, addTask, createTask, deleteCycle, emptySnapshot, rescheduleDailyTask, rescheduleWeeklyTask, safeTimeZone, validateSnapshot } from '../src/domain'
 
 const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
@@ -355,6 +355,17 @@ test('a snapshot produced by the client always passes the database validator', a
     // JSONB drops keys whose value was `undefined`, so compare the normalized JSON form.
     const loaded = await db.query<{ snapshot: unknown }>('select * from public.get_private_board()')
     assert.deepEqual(JSON.parse(JSON.stringify(validateSnapshot(loaded.rows[0].snapshot))), JSON.parse(JSON.stringify(snapshot)))
+    // 整项目删除沿用同一个 CAS，无需迁移；归档、子任务全部删除，运行计时器只解除引用。
+    const deleted = deleteCycle(snapshot, cycleId, now)
+    const result = await db.query<{ revision: number; snapshot: unknown }>('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(deleted)])
+    assert.equal(Number(result.rows[0].revision), 2)
+    const roundTrip = validateSnapshot(result.rows[0].snapshot)
+    assert.deepEqual(roundTrip.tasks, [])
+    assert.deepEqual(roundTrip.cycles, [])
+    const { taskId, ...runningTimer } = snapshot.focusBlocks[0]
+    assert.equal(taskId, daily.id)
+    assert.deepEqual(roundTrip.focusBlocks, [runningTimer])
+    await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(deleted)]), /revision conflict/i)
   } finally {
     await db.close()
   }

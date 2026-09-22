@@ -9,6 +9,7 @@ import {
   MAX_TASK_TITLE_LENGTH,
   MAX_TASK_NOTE_LENGTH,
   addCycle,
+  deleteCycle,
   addFocusBlock,
   addTask,
   addDays,
@@ -948,7 +949,7 @@ export default function App() {
       <footer className="app-footer"><span>{t('keyboard')}</span><span>{t('shortcuts')}</span>{adapter?.mode === 'demo' ? <span>{t('demoNote')}</span> : <span>{t('cloudNote')}</span>}</footer>
       {flash ? <div className="toast" role="status">{flash}</div> : null}
       {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={dialog.placement || { cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} tasks={activeTasks(snapshot)} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId, dialog.placement)} /> : null}
-      {dialog?.kind === 'cycle' ? <CycleDialog key={dialog.cycle?.id || 'new'} cycle={dialog.cycle} initial={dialog.initial} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitCycle(input, dialog.cycle)} /> : null}
+      {dialog?.kind === 'cycle' ? <CycleDialog key={dialog.cycle?.id || 'new'} cycle={dialog.cycle} initial={dialog.initial} board={stored} deleteBlocked={!online || saveState !== 'saved'} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitCycle(input, dialog.cycle)} onDelete={deleteCycleConfirmed} /> : null}
       {dialog?.kind === 'focus' ? <FocusDialog key={dialog.block?.id || 'new'} block={dialog.block} initial={dialog.initial} tasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitFocus(input, dialog.block)} /> : null}
       {dialog?.kind === 'settings' ? <SettingsDialog zone={snapshot.settings.timeZone} language={language} t={t} onClose={() => setDialog(null)} onLanguage={setLanguage} onSubmit={(zone) => { updateSettings(zone); setDialog(null) }} /> : null}
       {dialog?.kind === 'reschedule' ? <RescheduleDialog task={dialog.task} language={language} t={t} zone={currentZone} onClose={() => setDialog(null)} onSubmit={(date) => { rescheduleTask(dialog.task, date); setDialog(null) }} /> : null}
@@ -967,6 +968,27 @@ export default function App() {
     if (!window.confirm(message)) return
     updateSnapshot((snapshot) => deleteTask(snapshot, task.id), `${t('delete')}: ${task.title}`)
     if (selectedTaskId === task.id) setSelectedTaskId(null)
+  }
+
+  function deleteCycleConfirmed(cycle: GoalCycle, confirmedBoard: StoredBoard) {
+    const current = storedRef.current
+    if (!current) return
+    // 不吞掉尚未保存的改动，也不把旧确认扩大成对最新任务集合的删除。
+    if (!navigator.onLine || saveInFlightRef.current || pendingJobRef.current || failedJobRef.current) {
+      setFlash(t('deleteCycleBlocked'))
+      return
+    }
+    if (current !== confirmedBoard) { setFlash(t('deleteCycleChanged')); return }
+    try {
+      const next = deleteCycle(current.snapshot, cycle.id)
+      if (commitSnapshot(next, `${t('deleteCycle')}: ${cycle.name}`)) {
+        reconcileSelection(next, next.cycles[0]?.id || UNASSIGNED_CYCLE_ID)
+        setSelectedTaskId(null)
+        setDialog(null)
+      }
+    } catch (caught) {
+      setFlash(noticeLabel(errorNotice(caught, 'noticeOperationFailed')))
+    }
   }
 
   function reorderTask(task: Task, direction: -1 | 1) {
@@ -1370,14 +1392,34 @@ function TaskDialog({ task, domain, parentId, initial, placement, tasks, t, onCl
   </Dialog>
 }
 
-function CycleDialog({ cycle, initial, language, t, onClose, onSubmit }: { cycle?: GoalCycle; initial?: { name: string; startDate: string; endDate: string }; language: Language; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: { name: string; startDate: string; endDate: string }) => void }) {
+function CycleDialog({ cycle, initial, board, deleteBlocked, language, t, onClose, onSubmit, onDelete }: { cycle?: GoalCycle; initial?: { name: string; startDate: string; endDate: string }; board: StoredBoard; deleteBlocked: boolean; language: Language; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: { name: string; startDate: string; endDate: string }) => void; onDelete: (cycle: GoalCycle, confirmedBoard: StoredBoard) => void }) {
   const today = todayInTimeZone(safeTimeZone())
   const [name, setName] = useState(initial?.name || cycle?.name || '')
   const [startDate, setStartDate] = useState(initial?.startDate || cycle?.startDate || today)
   const [endDate, setEndDate] = useState(initial?.endDate || cycle?.endDate || addDays(today, 30))
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const savedCycle = board.snapshot.cycles.find((candidate) => candidate.id === cycle?.id)
+  // 同一个弹窗切换确认页，取消后仍保留编辑中的字段；远端版本变化则清空名称确认。
+  if (confirmingDelete && cycle) return <DeleteCycleDialog key={board.revision} cycle={savedCycle || cycle} taskCount={board.snapshot.tasks.filter((task) => task.cycleId === cycle.id).length} blocked={deleteBlocked || !savedCycle} t={t} onClose={() => setConfirmingDelete(false)} onSubmit={() => onDelete(savedCycle || cycle, board)} />
   return <Dialog closeLabel={t('close')} title={cycle ? t('editCycle') : t('addCycle')} onClose={onClose} initialFocus="cycle-name"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit({ name, startDate, endDate }) }}>
-    <label>{t('cycleName')}<input id="cycle-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={160} required /></label><div className="field-row"><label>{t('startDate')}<input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} required /></label><label>{t('endDate')}<input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} required /></label></div><p className="form-hint">{t('rangeHint')}</p><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div>
+    <label>{t('cycleName')}<input id="cycle-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={160} required /></label><div className="field-row"><label>{t('startDate')}<input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} required /></label><label>{t('endDate')}<input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} required /></label></div><p className="form-hint">{t('rangeHint')}</p>
+    {cycle && deleteBlocked ? <p className="form-hint" role="status">{t('deleteCycleBlocked')}</p> : null}
+    <div className="dialog-actions cycle-dialog-actions">{cycle ? <button type="button" className="text-button cycle-delete-entry" disabled={deleteBlocked || !savedCycle} onClick={() => setConfirmingDelete(true)}>{t('deleteCycle')}</button> : null}<button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div>
   </form></Dialog>
+}
+
+function DeleteCycleDialog({ cycle, taskCount, blocked, t, onClose, onSubmit }: { cycle: GoalCycle; taskCount: number; blocked: boolean; t: (key: CopyKey) => string; onClose: () => void; onSubmit: () => void }) {
+  const [confirmation, setConfirmation] = useState('')
+  const canDelete = !blocked && (taskCount === 0 || confirmation === cycle.name)
+  return <Dialog closeLabel={t('close')} title={t('deleteCycleTitle').replace('{name}', cycle.name)} onClose={onClose} initialFocus={taskCount ? 'delete-cycle-name' : 'cancel-cycle-delete'}>
+    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (canDelete) onSubmit() }}>
+      <div className="cycle-delete-summary" id="cycle-delete-summary"><p>{t('deleteCycleSummary').replace('{count}', String(taskCount))}</p><p>{t('deleteCycleKeepFocus')}</p></div>
+      <p className="cycle-delete-warning" id="cycle-delete-warning">{t('deleteCycleWarning')}</p>
+      {taskCount ? <label>{t('deleteCycleConfirmName')}<strong className="cycle-delete-name">{cycle.name}</strong><input id="delete-cycle-name" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} aria-describedby="cycle-delete-summary cycle-delete-warning" autoComplete="off" spellCheck={false} maxLength={160} required /></label> : null}
+      {blocked ? <p className="form-hint" role="status">{t('deleteCycleBlocked')}</p> : null}
+      <div className="dialog-actions"><button id="cancel-cycle-delete" type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button danger-button" type="submit" disabled={!canDelete}>{t('permanentlyDelete')}</button></div>
+    </form>
+  </Dialog>
 }
 
 function FocusDialog({ block, initial, tasks, selectedDate, language, t, onClose, onSubmit }: { block?: FocusBlock; initial?: FocusInput; tasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: FocusInput) => void }) {

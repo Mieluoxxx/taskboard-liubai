@@ -387,6 +387,23 @@ export function deleteTask(snapshot: BoardSnapshot, taskId: string, now = new Da
     }
   }
   if (!next.tasks.some((task) => task.id === taskId && !task.archivedAt)) throw new BoardError('noticeTaskMissing', 'Task no longer exists')
+  removeTasks(next, removed, now)
+  validateSnapshot(next)
+  return next
+}
+
+export function deleteCycle(snapshot: BoardSnapshot, cycleId: string, now = new Date().toISOString()): BoardSnapshot {
+  // 先规范化旧任务归属，再删除项目；否则旧周/日计划会意外流入「未归属计划」。
+  const next = validateSnapshot(snapshot)
+  if (!next.cycles.some((cycle) => cycle.id === cycleId)) throw new BoardError('noticeCycleMissing', 'Cycle no longer exists')
+  const removed = new Set(next.tasks.filter((task) => task.cycleId === cycleId).map((task) => task.id))
+  next.cycles = next.cycles.filter((cycle) => cycle.id !== cycleId)
+  removeTasks(next, removed, now)
+  return validateSnapshot(next)
+}
+
+/** 单任务和整项目删除共用引用清理；专注块仅解除引用，不改变计时状态。 */
+function removeTasks(next: BoardSnapshot, removed: Set<string>, now: string): void {
   // 删除任务只解除跨域下级关联，不在域之间级联。
   for (const task of next.tasks) {
     if (task.upperTaskId && removed.has(task.upperTaskId)) {
@@ -405,8 +422,6 @@ export function deleteTask(snapshot: BoardSnapshot, taskId: string, now = new Da
   for (const block of next.focusBlocks) {
     if (block.taskId && removed.has(block.taskId)) block.taskId = undefined
   }
-  validateSnapshot(next)
-  return next
 }
 
 export function linkedChainIds(snapshot: BoardSnapshot, taskId: string): Set<string> {

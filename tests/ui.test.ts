@@ -242,6 +242,21 @@ test('dialog initial focus runs once while the keyboard handler tracks the lates
   assert.match(source, /onKeyDown=\{onKeyDown\}/, 'keyboard handling must stay on the dialog')
 })
 
+test('project deletion lives in the editor footer and requires a safe in-app confirmation', async () => {
+  const source = await appSource()
+  const css = await cssSource()
+  const dialogs = source.slice(source.indexOf('function CycleDialog'), source.indexOf('function FocusDialog'))
+  assert.match(dialogs, /className="dialog-actions cycle-dialog-actions"/)
+  assert.match(dialogs, /className="text-button cycle-delete-entry"/)
+  assert.match(css, /\.cycle-delete-entry \{[^}]*margin-right: auto;[^}]*min-height: 44px;/)
+  assert.match(dialogs, /if \(confirmingDelete && cycle\) return <DeleteCycleDialog key=\{board.revision\}/, 'a new revision must reset the confirmation')
+  assert.match(dialogs, /taskCount === 0 \|\| confirmation === cycle.name/)
+  assert.match(dialogs, /if \(canDelete\) onSubmit\(\)/, 'Enter must not bypass the confirmation')
+  assert.match(dialogs, /initialFocus=\{taskCount \? 'delete-cycle-name' : 'cancel-cycle-delete'\}/)
+  assert.doesNotMatch(dialogs, /window.confirm/, 'confirmation uses the existing accessible dialog')
+  assert.match(source, /if \(current !== confirmedBoard\)/, 'stale confirmations cannot delete a different snapshot')
+})
+
 
 test('cycle duration scopes the week and day rails', async () => {
   const source = await appSource()
