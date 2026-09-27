@@ -31,6 +31,7 @@ import {
   linkedChainIds,
   isoDay,
   moveDailyTask,
+  moveWeeklyTask,
   reorderSibling,
   reorderSiblingTo,
   rescheduleDailyTask,
@@ -71,8 +72,9 @@ type TaskInput = {
   title: string
   note: string
   color: TaskColor
-  // 只有日任务的表单会给出日期；其余域保持放置不变，因此不写进 input。
+  // 日任务给日期、周任务给周次；其余域保持放置不变，因此不写进 input。
   dateKey?: string
+  weekKey?: string
   upperTaskId?: string
   parentId?: string
 }
@@ -769,11 +771,20 @@ export default function App() {
       weekKey: targetDomain === 'weekly' ? existing?.weekKey || selectedWeek : undefined,
       dateKey: targetDomain === 'daily' ? existing?.dateKey || selectedDate : undefined,
     }
-    // 表单里的日期优先于当前选中的日期：用户可以在编辑器里直接把日任务改到另一天。
-    const targetPlacement: TaskPlacement = targetDomain === 'daily' && input.dateKey ? { ...base, dateKey: input.dateKey } : base
-    if (!existing && targetDomain !== 'long' && selectedCycle && !dateInRange(targetPlacement.dateKey || selectedDate, selectedCycle.startDate, selectedCycle.endDate)) {
-      setFlash(t('selectionOutsideCycle'))
-      return
+    // 表单里的放置优先于当前选中的日期/周：用户可以在编辑器里直接改期。
+    const targetPlacement: TaskPlacement = targetDomain === 'daily' && input.dateKey
+      ? { ...base, dateKey: input.dateKey }
+      : targetDomain === 'weekly' && input.weekKey
+        ? { ...base, weekKey: input.weekKey }
+        : base
+    if (!existing && targetDomain !== 'long' && selectedCycle) {
+      const placeable = targetDomain === 'weekly'
+        ? (targetPlacement.weekKey || selectedWeek) >= weekKey(selectedCycle.startDate) && (targetPlacement.weekKey || selectedWeek) <= weekKey(selectedCycle.endDate)
+        : dateInRange(targetPlacement.dateKey || selectedDate, selectedCycle.startDate, selectedCycle.endDate)
+      if (!placeable) {
+        setFlash(t('selectionOutsideCycle'))
+        return
+      }
     }
     const draft = `${t('title')}: ${input.title.trim()}`
     const now = new Date().toISOString()
@@ -781,8 +792,9 @@ export default function App() {
       let next: BoardSnapshot
       if (existing) {
         next = updateTask(current.snapshot, existing.id, { title: input.title, note: input.note, color: input.color, upperTaskId: input.parentId ? undefined : input.upperTaskId, parentId: input.parentId }, now)
-        // 改日期单独走重排：它会带上子任务，并拒绝超出项目周期的日期。
+        // 改日期/周单独走重排：它会带上子任务，并拒绝超出项目周期的放置。
         if (input.dateKey && input.dateKey !== existing.dateKey) next = moveDailyTask(next, existing.id, input.dateKey, now)
+        if (input.weekKey && input.weekKey !== existing.weekKey) next = moveWeeklyTask(next, existing.id, input.weekKey, now)
       } else {
         next = addTask(current.snapshot, createTask({
           domain: targetDomain,
@@ -1413,13 +1425,19 @@ function TaskDialog({ task, domain, parentId, initial, placement, cycle, tasks, 
   const [color, setColor] = useState<TaskColor>(initial?.color || task?.color || 'ink')
   const [upperTaskId, setUpperTaskId] = useState(initial?.upperTaskId || task?.upperTaskId || '')
   const [selectedParent, setSelectedParent] = useState(initial?.parentId || parentId || task?.parentId || '')
-  // 子任务的日期由父任务决定，只有顶层日任务能改日期。
+  // 子任务的放置由父任务决定，只有顶层任务能改日期（日）或周次（周）。
   const canEditDate = domain === 'daily' && !parentId && !task?.parentId
+  const canEditWeek = domain === 'weekly' && !parentId && !task?.parentId
   const [dateKey, setDateKey] = useState(initial?.dateKey || task?.dateKey || placement.dateKey || '')
-  // 日期变了，原先选中的父任务可能已不在同一天；留着它提交必然被校验拒绝，所以直接清掉。
+  const [weekValue, setWeekValue] = useState(initial?.weekKey || task?.weekKey || placement.weekKey || '')
+  // 放置变了，原先选中的父任务可能已不在同一格；留着它提交必然被校验拒绝，所以直接清掉。
   const changeDate = (value: string) => {
     setDateKey(value)
     if (selectedParent && tasks.find((candidate) => candidate.id === selectedParent)?.dateKey !== value) setSelectedParent('')
+  }
+  const changeWeek = (value: string) => {
+    setWeekValue(value)
+    if (selectedParent && tasks.find((candidate) => candidate.id === selectedParent)?.weekKey !== value) setSelectedParent('')
   }
   // 候选必须与新任务落在同一放置位置，否则校验必然失败（用户会看到无法保存的选项）。
   // 项目归属与日期分别比较，再比较“候选所在域”的日历放置键：
@@ -1427,10 +1445,12 @@ function TaskDialog({ task, domain, parentId, initial, placement, cycle, tasks, 
   const valueFor = (valueDomain: Domain, source: { cycleId?: string; weekKey?: string; dateKey?: string }) =>
     valueDomain === 'long' ? source.cycleId : valueDomain === 'weekly' ? source.weekKey : source.dateKey
   // 改日期会同时换掉所在周，上级（周任务）候选必须跟着换，否则下拉里会没有可选项。
-  const selectedPlacement = canEditDate && dateKey ? { ...placement, weekKey: weekKey(dateKey), dateKey } : placement
+  const selectedPlacement = canEditDate && dateKey
+    ? { ...placement, weekKey: weekKey(dateKey), dateKey }
+    : canEditWeek && weekValue ? { ...placement, weekKey: weekValue } : placement
   const ownPlacement = {
     cycleId: task ? task.cycleId : selectedPlacement.cycleId,
-    weekKey: task?.weekKey ?? selectedPlacement.weekKey,
+    weekKey: canEditWeek ? weekValue : task?.weekKey ?? selectedPlacement.weekKey,
     dateKey: canEditDate ? dateKey : task?.dateKey ?? selectedPlacement.dateKey,
   }
   const upperDomain: Domain = domain === 'weekly' ? 'long' : 'weekly'
@@ -1444,15 +1464,19 @@ function TaskDialog({ task, domain, parentId, initial, placement, cycle, tasks, 
   const parentOptions = tasks.filter((candidate) => !candidate.parentId && !candidate.archivedAt && candidate.domain === domain && candidate.id !== task?.id &&
     candidate.cycleId === ownPlacement.cycleId &&
     valueFor(domain, candidate) === valueFor(domain, ownPlacement))
-  // 旧版可能把任务顺延到周期外：只有停在那个原日期时才豁免原生 min/max，一旦改日期就恢复周期范围，
+  // 旧版可能把任务顺延到周期外：只有停在那个原放置时才豁免原生 min/max，一旦改了它就恢复周期范围，
   // 否则凭当前输入值扩张边界，等于把越界限制整个放开了。
   const keepsLegacyDate = Boolean(cycle && task?.dateKey && dateKey === task.dateKey && (task.dateKey < cycle.startDate || task.dateKey > cycle.endDate))
   const dateMin = keepsLegacyDate ? undefined : cycle?.startDate
   const dateMax = keepsLegacyDate ? undefined : cycle?.endDate
+  const keepsLegacyWeek = Boolean(cycle && task?.weekKey && weekValue === task.weekKey && (task.weekKey < weekKey(cycle.startDate) || task.weekKey > weekKey(cycle.endDate)))
+  const weekMin = keepsLegacyWeek || !cycle ? undefined : weekKey(cycle.startDate)
+  const weekMax = keepsLegacyWeek || !cycle ? undefined : weekKey(cycle.endDate)
   return <Dialog closeLabel={t('close')} title={task ? t('edit') : parentId ? t('addSubtask') : t('addTask')} onClose={onClose} initialFocus="task-title">
-    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (!title.trim()) return; onSubmit({ title, note, color, dateKey: canEditDate ? dateKey || undefined : undefined, upperTaskId: selectedParent ? undefined : upperTaskId || undefined, parentId: selectedParent || undefined }) }}>
+    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (!title.trim()) return; onSubmit({ title, note, color, dateKey: canEditDate ? dateKey || undefined : undefined, weekKey: canEditWeek ? weekValue || undefined : undefined, upperTaskId: selectedParent ? undefined : upperTaskId || undefined, parentId: selectedParent || undefined }) }}>
       <label>{t('title')}<input id="task-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={MAX_TASK_TITLE_LENGTH} required /></label>
       {canEditDate ? <label>{t('date')}<input id="task-date" type="date" value={dateKey} min={dateMin} max={dateMax} onChange={(event) => changeDate(event.target.value)} required /></label> : null}
+      {canEditWeek ? <label>{t('week')}<input id="task-week" type="week" value={weekValue} min={weekMin} max={weekMax} onChange={(event) => changeWeek(event.target.value)} required /></label> : null}
       <label>{t('note')}<textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={MAX_TASK_NOTE_LENGTH} rows={5} /></label>
       <fieldset className="color-field"><legend>{t('color')}</legend><div className="color-picker">{([['ink', 'colorInk'], ['blue', 'colorBlue'], ['orange', 'colorOrange'], ['green', 'colorGreen'], ['violet', 'colorViolet']] as const).map(([value, label]) => <label className={`color-choice color-${value}`} key={value} title={t(label)}><input type="radio" name="task-color" value={value} checked={color === value} onChange={() => setColor(value)} /><span className="color-swatch" aria-hidden="true" /><span className="sr-only">{t(label)}</span></label>)}</div></fieldset>
       {!parentId && domain !== 'long' ? <TaskChoice id="task-association" label={t('association')} value={upperTaskId} noneLabel={t('none')} options={upperOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setUpperTaskId(value); if (value) setSelectedParent('') }} /> : null}

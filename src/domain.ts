@@ -373,23 +373,33 @@ export function updateTask(snapshot: BoardSnapshot, taskId: string, patch: Parti
   return next
 }
 
-/** 在表单里改日期＝把整棵子树搬到新的一天：子任务的放置必须与父任务一致，只动顶层会被校验整批拒绝。 */
-export function moveDailyTask(snapshot: BoardSnapshot, taskId: string, dateKey: string, now = new Date().toISOString()): BoardSnapshot {
+function movePlannedTask(snapshot: BoardSnapshot, taskId: string, domain: 'daily' | 'weekly', key: 'dateKey' | 'weekKey', target: string, now: string): BoardSnapshot {
   const next = cloneSnapshot(snapshot)
   const task = next.tasks.find((candidate) => candidate.id === taskId)
-  if (!task || task.archivedAt || task.domain !== 'daily') throw new BoardError('noticeTaskMissing', 'Task no longer exists')
-  if (!isDateKey(dateKey)) throw new BoardError('noticeTaskSaveFailed', 'Invalid daily placement')
-  if (task.dateKey === dateKey) return snapshot
-  // 越界日期先拒绝：否则任务会被移到项目周期之外，导航范围与新建限制就再也回不来了。
-  if (!placementWithinCycle(next, task, dateKey)) throw new BoardError('noticeRescheduleOutsideCycle', 'Target date is outside the task cycle')
+  if (!task || task.archivedAt || task.domain !== domain) throw new BoardError('noticeTaskMissing', 'Task no longer exists')
+  if (task[key] === target) return snapshot
+  // 越界先拒绝：否则任务会被移到项目周期之外，导航范围与新建限制就再也回不来了。
+  if (!placementWithinCycle(next, task, target)) throw new BoardError('noticeRescheduleOutsideCycle', 'Target placement is outside the task cycle')
   const moving = new Set([task.id, ...next.tasks.filter((candidate) => candidate.parentId === task.id).map((candidate) => candidate.id)])
   for (const candidate of next.tasks) {
     if (!moving.has(candidate.id)) continue
-    candidate.dateKey = dateKey
+    candidate[key] = target
     candidate.updatedAt = now
   }
   validateSnapshot(next)
   return next
+}
+
+/** 在表单里改日期＝把整棵子树搬到新的一天：子任务的放置必须与父任务一致，只动顶层会被校验整批拒绝。 */
+export function moveDailyTask(snapshot: BoardSnapshot, taskId: string, dateKey: string, now = new Date().toISOString()): BoardSnapshot {
+  if (!isDateKey(dateKey)) throw new BoardError('noticeTaskSaveFailed', 'Invalid daily placement')
+  return movePlannedTask(snapshot, taskId, 'daily', 'dateKey', dateKey, now)
+}
+
+/** 本周同理：子任务跟着父任务一起换周，越界的周不写。 */
+export function moveWeeklyTask(snapshot: BoardSnapshot, taskId: string, week: string, now = new Date().toISOString()): BoardSnapshot {
+  if (!validWeekKey(week)) throw new BoardError('noticeTaskSaveFailed', 'Invalid weekly placement')
+  return movePlannedTask(snapshot, taskId, 'weekly', 'weekKey', week, now)
 }
 
 export function deleteTask(snapshot: BoardSnapshot, taskId: string, now = new Date().toISOString()): BoardSnapshot {

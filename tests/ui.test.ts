@@ -306,13 +306,18 @@ test('each panel offers exactly one add entry, so no action is duplicated', asyn
   assert.equal((source.match(/<DayRail[^>]*onAdd=/g) || []).length, 0, 'DayRail call sites must not pass onAdd')
 })
 
-test('the daily task editor exposes a cycle-bounded date field', async () => {
+test('the task editor exposes a cycle-bounded date or week field', async () => {
   const source = await appSource()
   const editor = source.slice(source.indexOf('function TaskDialog'), source.indexOf('function CycleDialog'))
-  // 子任务的日期由父任务决定，只有顶层日任务能改日期。
+  // 子任务的放置由父任务决定，只有顶层任务能改日期或周次。
   assert.match(editor, /const canEditDate = domain === 'daily' && !parentId && !task\?\.parentId/, 'only top-level daily tasks may change the day')
   assert.match(editor, /id="task-date" type="date"/, 'the daily form needs a date input')
   assert.match(editor, /const dateMin = keepsLegacyDate \? undefined : cycle\?\.startDate/, 'a legacy out-of-cycle date must stay editable')
   assert.match(editor, /dateKey !== value\) setSelectedParent\(''\)/, 'a parent on another day must be cleared when the day changes')
+  assert.match(editor, /const canEditWeek = domain === 'weekly' && !parentId && !task\?\.parentId/, 'only top-level weekly tasks may change the week')
+  assert.match(editor, /id="task-week" type="week"/, 'the weekly form needs a week input')
+  assert.match(editor, /const weekMin = keepsLegacyWeek \|\| !cycle \? undefined : weekKey\(cycle\.startDate\)/, 'a legacy out-of-cycle week must stay editable')
+  assert.match(editor, /weekKey !== value\) setSelectedParent\(''\)/, 'a parent in another week must be cleared when the week changes')
   assert.match(source, /next = moveDailyTask\(next, existing\.id, input\.dateKey, now\)/, 'changing the date must move the task and its subtasks through the shared helper')
+  assert.match(source, /next = moveWeeklyTask\(next, existing\.id, input\.weekKey, now\)/, 'changing the week must move the task and its subtasks through the shared helper')
 })

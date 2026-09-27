@@ -13,6 +13,7 @@ import {
   cloneSnapshot,
   mergeSnapshots,
   moveDailyTask,
+  moveWeeklyTask,
   reapplyReorder,
   reorderOrigin,
   reorderCycleTo,
@@ -157,6 +158,26 @@ test('changing a daily task date in the editor moves its subtasks and never leav
     () => moveDailyTask(snapshot, root.id, addDays(cycle.endDate, 1), NOW),
     (error: unknown) => error instanceof BoardError && error.code === 'noticeRescheduleOutsideCycle',
     'a date outside the project cycle must be rejected instead of silently written',
+  )
+})
+
+test('changing a weekly task week in the editor moves its subtasks and never leaves the project cycle', () => {
+  const base = withCycle(board())
+  const cycle = base.cycles[0]
+  const root = createTask({ domain: 'weekly', title: 'root', weekKey: '2025-W02', cycleId: cycle.id }, NOW)
+  const child = createTask({ domain: 'weekly', title: 'child', weekKey: '2025-W02', cycleId: cycle.id, parentId: root.id }, NOW)
+  const snapshot = addTask(addTask(base, root), child)
+
+  const moved = moveWeeklyTask(snapshot, root.id, '2025-W05', NOW)
+  const find = (id: string) => moved.tasks.find((candidate) => candidate.id === id)
+  assert.equal(find(root.id)?.weekKey, '2025-W05')
+  assert.equal(find(child.id)?.weekKey, '2025-W05', 'a subtask rides along, so its placement must match the parent')
+  validateSnapshot(moved)
+  assert.equal(moveWeeklyTask(snapshot, root.id, '2025-W02', NOW), snapshot, 'moving onto the same week is a no-op')
+  assert.throws(
+    () => moveWeeklyTask(snapshot, root.id, '2025-W20', NOW),
+    (error: unknown) => error instanceof BoardError && error.code === 'noticeRescheduleOutsideCycle',
+    'a week outside the project cycle must be rejected instead of silently written',
   )
 })
 
