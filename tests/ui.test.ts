@@ -194,7 +194,11 @@ test('unfinished weekly tasks are carried forward automatically, without a confi
   assert.match(css, /\.task-row \{[^}]*flex-wrap: wrap;[^}]*row-gap: 0;/, 'rows must be able to wrap so the action area can take its own line')
   assert.match(css, /\.task-title \{[^}]*flex: 1 1 0;/, 'a zero basis keeps the title on the first line instead of being pushed by its own max-content width')
   assert.match(css, /\.row-break \{ display: block; flex: 0 0 100%; height: 0; \}/, 'the zero-height break element is what starts the action line')
-  assert.match(css, /@media \(min-width: 851px\) \{\s*\.row-break \{ display: none; \}\s*\.row-actions \{ position: absolute;[^}]*\}/, 'wide screens keep one line by floating the action buttons')
+  assert.match(css, /@media \(min-width: 851px\) and \(hover: hover\) \{\s*\.row-break \{ display: none; \}\s*\.row-actions \{ position: absolute;[^}]*\}/, 'only hover-capable wide screens keep one line by floating the action buttons')
+  assert.doesNotMatch(css, /\.row-actions \{[^}]*background/, 'the floating toolbar must stay transparent over the row tint')
+  assert.match(css, /\.task-row:hover \.task-title[^{]*\{[^}]*mask-image/, 'the transparent toolbar must fade the title tail instead of painting a background')
+  assert.match(await appSource(), /\$\{isPast && onReschedule \? 'is-past' : ''\}/, 'overdue rows need their own class')
+  assert.match(css, /\.task-row\.is-past \.row-actions \{ position: static;/, 'an overdue row keeps its action line so the reschedule button stays clickable')
   assert.match(source, /<span className="row-break" aria-hidden="true" \/>/, 'the break element must stay out of the accessibility tree')
 
   // 专注块面板与卡片：网格项 min-width: auto 会被 nowrap 内容撑开，卡片会溢出深色面板。

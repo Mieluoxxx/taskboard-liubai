@@ -1252,7 +1252,7 @@ function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selec
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: task.id })
   const isPast = isPastPlacement(task, timeZone)
   const carriedFrom = carrySource.get(task.id)
-  return <div className={`task-tree ${isDragging ? 'is-dragging' : ''}`} ref={setNodeRef} style={{ transform: CSS.Translate.toString(transform), transition }}><div className={`task-row ${selectedId === task.id ? 'selected' : ''} ${selectedChain.has(task.id) ? 'is-linked' : ''} ${task.checked ? 'is-checked' : ''}`} data-task-id={task.id} ref={registerRow(task.id)}>
+  return <div className={`task-tree ${isDragging ? 'is-dragging' : ''}`} ref={setNodeRef} style={{ transform: CSS.Translate.toString(transform), transition }}><div className={`task-row ${selectedId === task.id ? 'selected' : ''} ${selectedChain.has(task.id) ? 'is-linked' : ''} ${task.checked ? 'is-checked' : ''} ${isPast && onReschedule ? 'is-past' : ''}`} data-task-id={task.id} ref={registerRow(task.id)}>
     <button type="button" className="drag-handle" ref={setActivatorNodeRef} {...attributes} {...listeners} aria-roledescription={t('dragTask')} aria-label={`${t('dragTask')}: ${task.title}`} title={t('dragInstructions')}><Icon name="grip" /></button>
     <button className="task-select" onClick={() => onSelect(task.id)} aria-label={`${t('taskDetails')}: ${task.title}`}><span className={`task-stroke stroke-${task.color}`} /></button>
     <input type="checkbox" checked={task.checked} onChange={() => onToggle(task)} aria-label={`${task.title} · ${task.checked ? t('taskChecked') : t('taskUnchecked')}`} />

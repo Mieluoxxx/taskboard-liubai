@@ -145,10 +145,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* 强制断行点：零高度、占满一行，把后面的按钮区推到第二行（窄屏用，见下方宽屏覆盖）。 */
 .row-break { display: block; flex: 0 0 100%; height: 0; }
 .row-actions { display: flex; flex: 1 1 auto; align-items: center; justify-content: flex-end; opacity: 0; transition: opacity .15s ease; }
-/* 宽屏保持单行：操作按钮改为浮层，不参与布局，标题因此能拿满整行（hover 才浮现）。 */
-@media (min-width: 851px) {
+/* 宽屏且支持悬停时才把操作按钮浮层化以保持单行（触屏没有 hover，浮层常显会直接压住文字，
+   所以大屏触控仍用上面的两行排布）。浮层不铺底色（在选中／关联行的着色底上盖白块会切出断层）：
+   改用遮罩让标题在图标区前淡出、区内彻底透明，并在图标显现时隐藏关联标记与顺延标签；
+   遮罩／隐藏都不改布局，所以 hover 不会重排。子任务行少了「加子任务」按钮，遮罩宽度相应窄一截。 */
+@media (min-width: 851px) and (hover: hover) {
   .row-break { display: none; }
-  .row-actions { position: absolute; top: 50%; right: 4px; transform: translateY(-50%); flex: 0 0 auto; padding-left: 26px; background: #fff; }
+  .row-actions { position: absolute; top: 50%; right: 4px; transform: translateY(-50%); flex: 0 0 auto; padding-left: 26px; }
+  .task-row:hover .task-title, .task-row:focus-within .task-title, .task-row.selected .task-title {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 188px), transparent calc(100% - 156px));
+    mask-image: linear-gradient(to right, #000 calc(100% - 188px), transparent calc(100% - 156px));
+  }
+  .subtask-list .task-row:hover .task-title, .subtask-list .task-row:focus-within .task-title, .subtask-list .task-row.selected .task-title {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 158px), transparent calc(100% - 126px));
+    mask-image: linear-gradient(to right, #000 calc(100% - 158px), transparent calc(100% - 126px));
+  }
+  .task-row:hover .link-mark, .task-row:focus-within .link-mark, .task-row.selected .link-mark,
+  .task-row:hover .carry-tag, .task-row:focus-within .carry-tag, .task-row.selected .carry-tag { visibility: hidden; }
+  /* 逾期行带「建议重新安排」按钮，它是要点。浮层会盖住并吃掉点击，所以该行退回两行排布。 */
+  .task-row.is-past .row-break { display: block; }
+  .task-row.is-past .row-actions { position: static; top: auto; right: auto; transform: none; flex: 1 1 auto; padding-left: 0; }
+  .task-row.is-past .task-title, .subtask-list .task-row.is-past .task-title { -webkit-mask-image: none; mask-image: none; }
+  .task-row.is-past .link-mark, .task-row.is-past .carry-tag { visibility: visible; }
 }
 /* 无悬停能力的设备（触屏）不能只靠 hover 显示操作按钮。 */
 @media (hover: none) { .row-actions { opacity: 1; } }
