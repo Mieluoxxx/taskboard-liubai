@@ -12,6 +12,7 @@ import {
   focusDisplayStatus,
   cloneSnapshot,
   mergeSnapshots,
+  moveDailyTask,
   reapplyReorder,
   reorderOrigin,
   reorderCycleTo,
@@ -29,6 +30,7 @@ import {
   deleteTask,
 } from '../src/domain'
 import type { BoardSnapshot, Task } from '../src/types'
+import { BoardError } from '../src/notices'
 
 const NOW = '2025-01-15T12:00:00.000Z'
 function board(): BoardSnapshot {
@@ -125,15 +127,37 @@ test('weekly rescheduling carries an unfinished week forward and keeps the origi
   assert.ok(archived.every((task) => task.weekKey === '2025-W03' && task.archivedReason === 'rescheduled'))
   const nextRoot = active.find((task) => task.title === 'Carry me')!
   assert.equal(archived.find((task) => task.title === 'Carry me')?.rescheduledTo, nextRoot.id)
-  // 子任务跟随父任务一起顺延，并指向新的父任务。
+  // 子任务必须跟着父任务一起搬并改指新父任务，否则会挂在已归档的旧父任务上断开关联。
   assert.equal(active.find((task) => task.title === 'Child')?.parentId, nextRoot.id)
   validateSnapshot(snapshot)
   assert.throws(() => rescheduleWeeklyTask(snapshot, nextRoot.id, '2025-W04'), /different/i)
   assert.throws(() => rescheduleWeeklyTask(snapshot, nextRoot.id, '2025-13'), /valid target/i)
-  // 周顺延只接受周任务，日任务走 rescheduleDailyTask。
+  // 两个顺延函数按域分流：传错域必须报错，避免生成跨域的顺延副本。
   const daily = createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-15' }, NOW)
   snapshot = addTask(snapshot, daily)
   assert.throws(() => rescheduleWeeklyTask(snapshot, daily.id, '2025-W05'), /weekly/i)
+})
+
+test('changing a daily task date in the editor moves its subtasks and never leaves the project cycle', () => {
+  const base = withCycle(board())
+  const cycle = base.cycles[0]
+  const root = createTask({ domain: 'daily', title: 'root', dateKey: cycle.startDate, cycleId: cycle.id }, NOW)
+  const child = createTask({ domain: 'daily', title: 'child', dateKey: cycle.startDate, cycleId: cycle.id, parentId: root.id }, NOW)
+  const sibling = createTask({ domain: 'daily', title: 'sibling', dateKey: cycle.startDate, cycleId: cycle.id }, NOW)
+  const snapshot = addTask(addTask(addTask(base, root), child), sibling)
+
+  const moved = moveDailyTask(snapshot, root.id, cycle.endDate, NOW)
+  const find = (id: string) => moved.tasks.find((candidate) => candidate.id === id)
+  assert.equal(find(root.id)?.dateKey, cycle.endDate)
+  assert.equal(find(child.id)?.dateKey, cycle.endDate, 'a subtask rides along, so its placement must match the parent')
+  assert.equal(find(sibling.id)?.dateKey, cycle.startDate, 'other tasks on the same day stay put')
+  validateSnapshot(moved)
+  assert.equal(moveDailyTask(snapshot, root.id, cycle.startDate, NOW), snapshot, 'moving onto the same day is a no-op')
+  assert.throws(
+    () => moveDailyTask(snapshot, root.id, addDays(cycle.endDate, 1), NOW),
+    (error: unknown) => error instanceof BoardError && error.code === 'noticeRescheduleOutsideCycle',
+    'a date outside the project cycle must be rejected instead of silently written',
+  )
 })
 
 test('carryForwardTasks moves every unfinished past week into the current week once', () => {
@@ -146,10 +170,10 @@ test('carryForwardTasks moves every unfinished past week into the current week o
   const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
 
   const active = carried.tasks.filter((task) => !task.archivedAt)
-  // 副本追加在末尾，因此按标题排序后再比较。
+  // 副本追加在列表末尾，数组顺序不稳定，所以按标题而不是位置比较。
   const placement = (task: Task) => [task.title, task.weekKey]
   assert.deepEqual(active.map(placement).sort(), [['Carry me', '2025-W03'], ['Child', '2025-W03'], ['Done', '2025-W01']])
-  // 已完成的旧任务不动；原周条目归档并留下可审阅的来源指针。
+  // 只有未完成的才搬：已完成留在原处，搬走的旧条目归档并留下可追溯的来源指针。
   const archived = carried.tasks.filter((task) => task.archivedReason === 'rescheduled')
   assert.deepEqual(archived.map((task) => task.title), ['Carry me', 'Child'])
   validateSnapshot(carried)
@@ -170,7 +194,7 @@ test('carryForwardTasks also carries unfinished past daily tasks to today, and f
   snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === done.id ? { ...task, checked: true } : task) }
   const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
 
-  // 副本追加在末尾，因此按标题取用而不是比数组顺序。
+  // 副本追加在列表末尾，数组顺序不稳定，所以按标题取用而不是比数组顺序。
   const byTitle = new Map(carried.tasks.filter((task) => !task.archivedAt).map((task) => [task.title, task]))
   assert.deepEqual([...byTitle.keys()].sort(), ['Carry me', 'Child', 'Done', 'Today', 'Week'])
   assert.equal(byTitle.get('Carry me')?.dateKey, '2025-01-15')
@@ -183,7 +207,7 @@ test('carryForwardTasks also carries unfinished past daily tasks to today, and f
   // 关联改指周任务现有的副本，而不是停在已归档的旧周上（旧周已不在行内，会断线）。
   assert.equal(byTitle.get('Carry me')?.upperTaskId, byTitle.get('Week')?.id)
   assert.equal(byTitle.get('Today')?.upperTaskId, byTitle.get('Week')?.id, 'an untouched daily task needs the same repair')
-  // 归档的旧日任务保留当时的历史关联。
+  // 归档的旧日任务保留当时的历史关联，否则会丢掉「它原本挂在哪个周」这条线索。
   const archivedDaily = carried.tasks.find((task) => task.title === 'Carry me' && task.archivedAt)
   assert.equal(archivedDaily?.upperTaskId, weekly.id)
   assert.ok(archivedDaily?.rescheduledTo)

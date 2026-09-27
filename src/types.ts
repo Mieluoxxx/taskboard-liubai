@@ -17,7 +17,7 @@ export interface Task {
   color: TaskColor
   createdAt: string
   updatedAt: string
-  cycleId?: string // 三个任务域共用的项目归属；缺省仅表示未归属计划。
+  cycleId?: string // 项目归属挂在所有域上，周/日任务才能按项目隔离；缺省表示未归属计划。
   weekKey?: string
   dateKey?: string
   parentId?: string

@@ -201,7 +201,7 @@ function optionalString(record: Record<string, unknown>, key: string): string | 
   return value
 }
 
-/** 所有外部快照先验证，再进入 React 或变更辅助函数。 */
+/** 外部快照不可信，先验证再交给 React 或变更函数：非法形状一旦渗进状态层，报错点会离根因很远。 */
 export function validateSnapshot(value: unknown): BoardSnapshot {
   if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.settings)) {
     throw new BoardError('noticeInvalidState', 'Board snapshot has an unsupported shape')
@@ -373,6 +373,25 @@ export function updateTask(snapshot: BoardSnapshot, taskId: string, patch: Parti
   return next
 }
 
+/** 在表单里改日期＝把整棵子树搬到新的一天：子任务的放置必须与父任务一致，只动顶层会被校验整批拒绝。 */
+export function moveDailyTask(snapshot: BoardSnapshot, taskId: string, dateKey: string, now = new Date().toISOString()): BoardSnapshot {
+  const next = cloneSnapshot(snapshot)
+  const task = next.tasks.find((candidate) => candidate.id === taskId)
+  if (!task || task.archivedAt || task.domain !== 'daily') throw new BoardError('noticeTaskMissing', 'Task no longer exists')
+  if (!isDateKey(dateKey)) throw new BoardError('noticeTaskSaveFailed', 'Invalid daily placement')
+  if (task.dateKey === dateKey) return snapshot
+  // 越界日期先拒绝：否则任务会被移到项目周期之外，导航范围与新建限制就再也回不来了。
+  if (!placementWithinCycle(next, task, dateKey)) throw new BoardError('noticeRescheduleOutsideCycle', 'Target date is outside the task cycle')
+  const moving = new Set([task.id, ...next.tasks.filter((candidate) => candidate.parentId === task.id).map((candidate) => candidate.id)])
+  for (const candidate of next.tasks) {
+    if (!moving.has(candidate.id)) continue
+    candidate.dateKey = dateKey
+    candidate.updatedAt = now
+  }
+  validateSnapshot(next)
+  return next
+}
+
 export function deleteTask(snapshot: BoardSnapshot, taskId: string, now = new Date().toISOString()): BoardSnapshot {
   const next = cloneSnapshot(snapshot)
   const removed = new Set<string>([taskId])
@@ -402,9 +421,10 @@ export function deleteCycle(snapshot: BoardSnapshot, cycleId: string, now = new 
   return validateSnapshot(next)
 }
 
-/** 单任务和整项目删除共用引用清理；专注块仅解除引用，不改变计时状态。 */
+/** 删除必须共用同一条引用清理：否则被删任务会留下悬空的上级关联、顺延指针与专注块引用，
+ * 快照校验会拒绝整次删除；专注块只解除引用，不改变计时状态。 */
 function removeTasks(next: BoardSnapshot, removed: Set<string>, now: string): void {
-  // 删除任务只解除跨域下级关联，不在域之间级联。
+  // 删除只解除跨域下级关联而不级联：级联会顺着关联吃掉别的域里用户没打算删的计划。
   for (const task of next.tasks) {
     if (task.upperTaskId && removed.has(task.upperTaskId)) {
       task.upperTaskId = undefined
@@ -456,7 +476,8 @@ export function reorderOrigin(task: Task, direction: -1 | 1): { kind: 'reorder';
   return { kind: 'reorder', taskId: task.id, direction, domain: task.domain }
 }
 
-/** 恢复一次「上移/下移」：尽力而为——目标任务若已不存在（被他端删除）则原样返回。 */
+/** 重放顺序改动时目标可能已被他端删除：这时原样返回而不是抛错，
+ * 否则一次无害的恢复会中断整条冲突恢复流程。 */
 export function reapplyReorder(snapshot: BoardSnapshot, taskId: string, direction: -1 | 1): BoardSnapshot {
   if (!snapshot.tasks.some((task) => task.id === taskId && !task.archivedAt)) return snapshot
   return reorderSibling(snapshot, taskId, direction)
@@ -475,7 +496,8 @@ function siblingTasks(snapshot: BoardSnapshot, task: Task): Task[] {
     candidate.parentId === task.parentId && candidate.cycleId === task.cycleId && candidate.weekKey === task.weekKey && candidate.dateKey === task.dateKey)
 }
 
-/** 一次性移到目标同级位置；无效或过期落点不写入，也不改变任务内容与其他列表的位置。 */
+/** 拖拽落点可能已过期（列表重渲染、任务被删）：无效就原样返回，
+ * 避免把旧拖拽意图写进新快照或误动其他列表。 */
 export function reorderSiblingTo(snapshot: BoardSnapshot, taskId: string, targetId: string): BoardSnapshot {
   const task = snapshot.tasks.find((candidate) => candidate.id === taskId && !candidate.archivedAt)
   if (!task || taskId === targetId) return snapshot
@@ -767,7 +789,7 @@ export function mergeSnapshots(base: BoardSnapshot, local: BoardSnapshot, remote
   const conflicts: string[] = []
   const merged = cloneSnapshot(remote)
 
-  // 时区：本地相对 base 改过就用本地，否则跟随云端。
+  // 时区也是用户改动，和实体一样比对 base：本地没改就跟随云端，别让旧时区覆盖另一台设备刚改的设置。
   merged.settings.timeZone = local.settings.timeZone !== base.settings.timeZone ? local.settings.timeZone : remote.settings.timeZone
 
   const mergeList = <T extends { id: string }>(baseList: T[], localList: T[], remoteList: T[]): T[] => {
@@ -776,7 +798,7 @@ export function mergeSnapshots(base: BoardSnapshot, local: BoardSnapshot, remote
     const remoteItems = new Map(remoteList.map((item) => [item.id, item]))
     const result: T[] = []
 
-    // 保持云端顺序；云端已删除但本地改过的实体视为冲突。
+    // 以已确认的最新云端列表为骨架：云端已删但本地改过的实体不能静默丢弃，记为冲突交给用户。
     for (const remoteItem of remoteList) {
       const id = remoteItem.id
       const baseJson = baseItems.get(id)
@@ -800,7 +822,7 @@ export function mergeSnapshots(base: BoardSnapshot, local: BoardSnapshot, remote
       result.push(remoteItem)
     }
 
-    // 云端没有的实体：base 里也没有 → 本地新增，加入；base 里有 → 云端删除了它。
+    // 云端没有的实体：base 里也没有说明是本地新增，必须保留；base 里有说明云端删除了它，未改本地就服从删除。
     for (const localItem of localList) {
       const id = localItem.id
       if (remoteItems.has(id)) continue

@@ -30,6 +30,7 @@ import {
   formatDateKey,
   linkedChainIds,
   isoDay,
+  moveDailyTask,
   reorderSibling,
   reorderSiblingTo,
   rescheduleDailyTask,
@@ -70,6 +71,8 @@ type TaskInput = {
   title: string
   note: string
   color: TaskColor
+  // 只有日任务的表单会给出日期；其余域保持放置不变，因此不写进 input。
+  dateKey?: string
   upperTaskId?: string
   parentId?: string
 }
@@ -198,7 +201,8 @@ export default function App() {
   const [authError, setAuthError] = useState('')
   const [stored, setStored] = useState<StoredBoard | null>(null)
   const storedRef = useRef<StoredBoard | null>(null)
-  // 最近一次与后端一致的快照（成功加载/保存后的版本），三方合并的 base。
+  // 三方合并的 base 必须是「上次与后端一致」的版本：若拿含本地改动的 stored 当 base，
+  // mergeSnapshots 会把这些改动当成「本地没改」而直接采用云端，静默丢失。
   const baselineRef = useRef<BoardSnapshot | null>(null)
   const [boardLoadToken, setBoardLoadToken] = useState(0)
   const [saveState, setSaveState] = useState<SaveState>('saved')
@@ -229,7 +233,7 @@ export default function App() {
   const [flash, setFlash] = useState('')
 
   const t = useCallback((key: CopyKey) => copy[language][key], [language])
-  // 保存提示可能是 notice code（可本地化），也可能是无 code 的诊断文本。
+  // 提示不总是 notice code：适配器返回的诊断文本没有 code，不能假定它一定能本地化。
   const noticeLabel = useCallback((value: string) => (isNoticeCode(value) ? copy[language][value] : value), [language])
   const applySelection = useCallback((selection: SelectionState) => {
     selectionRef.current = selection
@@ -760,20 +764,27 @@ export default function App() {
     const current = storedRef.current
     if (!current) return
     const targetDomain = domain || existing?.domain || 'daily'
-    const targetPlacement = placement || {
+    const base = placement || {
       cycleId: existing ? existing.cycleId : selectedCycle?.id,
       weekKey: targetDomain === 'weekly' ? existing?.weekKey || selectedWeek : undefined,
       dateKey: targetDomain === 'daily' ? existing?.dateKey || selectedDate : undefined,
     }
-    if (!existing && targetDomain !== 'long' && selectedCycle && !dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)) {
+    // 表单里的日期优先于当前选中的日期：用户可以在编辑器里直接把日任务改到另一天。
+    const targetPlacement: TaskPlacement = targetDomain === 'daily' && input.dateKey ? { ...base, dateKey: input.dateKey } : base
+    if (!existing && targetDomain !== 'long' && selectedCycle && !dateInRange(targetPlacement.dateKey || selectedDate, selectedCycle.startDate, selectedCycle.endDate)) {
       setFlash(t('selectionOutsideCycle'))
       return
     }
     const draft = `${t('title')}: ${input.title.trim()}`
+    const now = new Date().toISOString()
     try {
-      const next = existing
-        ? updateTask(current.snapshot, existing.id, { title: input.title, note: input.note, color: input.color, upperTaskId: input.parentId ? undefined : input.upperTaskId, parentId: input.parentId }, new Date().toISOString())
-        : addTask(current.snapshot, createTask({
+      let next: BoardSnapshot
+      if (existing) {
+        next = updateTask(current.snapshot, existing.id, { title: input.title, note: input.note, color: input.color, upperTaskId: input.parentId ? undefined : input.upperTaskId, parentId: input.parentId }, now)
+        // 改日期单独走重排：它会带上子任务，并拒绝超出项目周期的日期。
+        if (input.dateKey && input.dateKey !== existing.dateKey) next = moveDailyTask(next, existing.id, input.dateKey, now)
+      } else {
+        next = addTask(current.snapshot, createTask({
           domain: targetDomain,
           title: input.title,
           note: input.note,
@@ -782,6 +793,7 @@ export default function App() {
           upperTaskId: parentId || input.parentId ? undefined : input.upperTaskId,
           ...targetPlacement,
         }))
+      }
       if (commitSnapshot(next, draft, { kind: 'task', input, taskId: existing?.id, domain: targetDomain, parentId, placement: targetPlacement })) setDialog(null)
     } catch (caught) {
       setSaveState('error')
@@ -883,6 +895,10 @@ export default function App() {
 
   const taskForFocus = activeTasks(snapshot, 'daily')
   const canCreateInCycle = !selectedCycle || dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)
+  // 日期选择的上限来自任务自己的项目；未归属任务没有周期，因此不限制。
+  const taskDialogCycle = dialog?.kind === 'task'
+    ? (dialog.task ? snapshot.cycles.find((entry) => entry.id === dialog.task?.cycleId) : selectedCycle)
+    : undefined
 
   return (
     <div className="app-shell">
@@ -949,7 +965,7 @@ export default function App() {
       </main>
       <footer className="app-footer"><span>{t('keyboard')}</span><span>{t('shortcuts')}</span>{adapter?.mode === 'demo' ? <span>{t('demoNote')}</span> : <span>{t('cloudNote')}</span>}</footer>
       {flash ? <div className="toast" role="status">{flash}</div> : null}
-      {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={dialog.placement || { cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} tasks={activeTasks(snapshot)} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId, dialog.placement)} /> : null}
+      {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={dialog.placement || { cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} cycle={taskDialogCycle} tasks={activeTasks(snapshot)} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId, dialog.placement)} /> : null}
       {dialog?.kind === 'cycle' ? <CycleDialog key={dialog.cycle?.id || 'new'} cycle={dialog.cycle} initial={dialog.initial} board={stored} deleteBlocked={!online || saveState !== 'saved'} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitCycle(input, dialog.cycle)} onDelete={deleteCycleConfirmed} /> : null}
       {dialog?.kind === 'focus' ? <FocusDialog key={dialog.block?.id || 'new'} block={dialog.block} initial={dialog.initial} tasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitFocus(input, dialog.block)} /> : null}
       {dialog?.kind === 'settings' ? <SettingsDialog zone={snapshot.settings.timeZone} language={language} t={t} onClose={() => setDialog(null)} onLanguage={setLanguage} onSubmit={(zone) => { updateSettings(zone); setDialog(null) }} /> : null}
@@ -1391,22 +1407,31 @@ function TaskChoice({ id, label, value, noneLabel, options, onChange }: { id: st
   </div>
 }
 
-function TaskDialog({ task, domain, parentId, initial, placement, tasks, t, onClose, onSubmit }: { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement: { cycleId?: string; weekKey?: string; dateKey?: string }; tasks: Task[]; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: TaskInput) => void }) {
+function TaskDialog({ task, domain, parentId, initial, placement, cycle, tasks, t, onClose, onSubmit }: { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement: { cycleId?: string; weekKey?: string; dateKey?: string }; cycle?: GoalCycle; tasks: Task[]; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: TaskInput) => void }) {
   const [title, setTitle] = useState(initial?.title || task?.title || '')
   const [note, setNote] = useState(initial?.note ?? task?.note ?? '')
   const [color, setColor] = useState<TaskColor>(initial?.color || task?.color || 'ink')
   const [upperTaskId, setUpperTaskId] = useState(initial?.upperTaskId || task?.upperTaskId || '')
   const [selectedParent, setSelectedParent] = useState(initial?.parentId || parentId || task?.parentId || '')
+  // 子任务的日期由父任务决定，只有顶层日任务能改日期。
+  const canEditDate = domain === 'daily' && !parentId && !task?.parentId
+  const [dateKey, setDateKey] = useState(initial?.dateKey || task?.dateKey || placement.dateKey || '')
+  // 日期变了，原先选中的父任务可能已不在同一天；留着它提交必然被校验拒绝，所以直接清掉。
+  const changeDate = (value: string) => {
+    setDateKey(value)
+    if (selectedParent && tasks.find((candidate) => candidate.id === selectedParent)?.dateKey !== value) setSelectedParent('')
+  }
   // 候选必须与新任务落在同一放置位置，否则校验必然失败（用户会看到无法保存的选项）。
   // 项目归属与日期分别比较，再比较“候选所在域”的日历放置键：
   // 上级候选属于另一个域（周←长期、日←周），要用该域的键（周期 / 周），不能拿子任务自己的键去比。
   const valueFor = (valueDomain: Domain, source: { cycleId?: string; weekKey?: string; dateKey?: string }) =>
     valueDomain === 'long' ? source.cycleId : valueDomain === 'weekly' ? source.weekKey : source.dateKey
-  const selectedPlacement = placement
+  // 改日期会同时换掉所在周，上级（周任务）候选必须跟着换，否则下拉里会没有可选项。
+  const selectedPlacement = canEditDate && dateKey ? { ...placement, weekKey: weekKey(dateKey), dateKey } : placement
   const ownPlacement = {
     cycleId: task ? task.cycleId : selectedPlacement.cycleId,
     weekKey: task?.weekKey ?? selectedPlacement.weekKey,
-    dateKey: task?.dateKey ?? selectedPlacement.dateKey,
+    dateKey: canEditDate ? dateKey : task?.dateKey ?? selectedPlacement.dateKey,
   }
   const upperDomain: Domain = domain === 'weekly' ? 'long' : 'weekly'
   // 校验只要求上级是同域顶层任务，不限制其放置位置；编辑时若当前选中的周期/周与已存在的关联不同，
@@ -1419,9 +1444,15 @@ function TaskDialog({ task, domain, parentId, initial, placement, tasks, t, onCl
   const parentOptions = tasks.filter((candidate) => !candidate.parentId && !candidate.archivedAt && candidate.domain === domain && candidate.id !== task?.id &&
     candidate.cycleId === ownPlacement.cycleId &&
     valueFor(domain, candidate) === valueFor(domain, ownPlacement))
+  // 旧版可能把任务顺延到周期外：只有停在那个原日期时才豁免原生 min/max，一旦改日期就恢复周期范围，
+  // 否则凭当前输入值扩张边界，等于把越界限制整个放开了。
+  const keepsLegacyDate = Boolean(cycle && task?.dateKey && dateKey === task.dateKey && (task.dateKey < cycle.startDate || task.dateKey > cycle.endDate))
+  const dateMin = keepsLegacyDate ? undefined : cycle?.startDate
+  const dateMax = keepsLegacyDate ? undefined : cycle?.endDate
   return <Dialog closeLabel={t('close')} title={task ? t('edit') : parentId ? t('addSubtask') : t('addTask')} onClose={onClose} initialFocus="task-title">
-    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (!title.trim()) return; onSubmit({ title, note, color, upperTaskId: selectedParent ? undefined : upperTaskId || undefined, parentId: selectedParent || undefined }) }}>
+    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (!title.trim()) return; onSubmit({ title, note, color, dateKey: canEditDate ? dateKey || undefined : undefined, upperTaskId: selectedParent ? undefined : upperTaskId || undefined, parentId: selectedParent || undefined }) }}>
       <label>{t('title')}<input id="task-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={MAX_TASK_TITLE_LENGTH} required /></label>
+      {canEditDate ? <label>{t('date')}<input id="task-date" type="date" value={dateKey} min={dateMin} max={dateMax} onChange={(event) => changeDate(event.target.value)} required /></label> : null}
       <label>{t('note')}<textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={MAX_TASK_NOTE_LENGTH} rows={5} /></label>
       <fieldset className="color-field"><legend>{t('color')}</legend><div className="color-picker">{([['ink', 'colorInk'], ['blue', 'colorBlue'], ['orange', 'colorOrange'], ['green', 'colorGreen'], ['violet', 'colorViolet']] as const).map(([value, label]) => <label className={`color-choice color-${value}`} key={value} title={t(label)}><input type="radio" name="task-color" value={value} checked={color === value} onChange={() => setColor(value)} /><span className="color-swatch" aria-hidden="true" /><span className="sr-only">{t(label)}</span></label>)}</div></fieldset>
       {!parentId && domain !== 'long' ? <TaskChoice id="task-association" label={t('association')} value={upperTaskId} noneLabel={t('none')} options={upperOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setUpperTaskId(value); if (value) setSelectedParent('') }} /> : null}
@@ -1476,7 +1507,7 @@ function SettingsDialog({ zone, language, t, onClose, onLanguage, onSubmit }: { 
    return <Dialog closeLabel={t('close')} title={t('settings')} onClose={onClose} initialFocus="timezone"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit(value) }}><label>{t('timezone')}<input id="timezone" list="timezone-options" value={value} onChange={(event) => setValue(event.target.value)} maxLength={100} required /><datalist id="timezone-options"><option value="UTC" /><option value="Asia/Shanghai" /><option value="Asia/Tokyo" /><option value="America/New_York" /><option value="America/Los_Angeles" /><option value="Europe/London" /></datalist></label><p className="form-hint">{t('timezoneHint')}</p><div className="setting-language"><span>{t('language')}</span><div className="language-switch"><button type="button" className={language === 'zh' ? 'active' : ''} onClick={() => onLanguage('zh')}>{t('chinese')}</button><button type="button" className={language === 'en' ? 'active' : ''} onClick={() => onLanguage('en')}>{t('english')}</button></div></div><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div></form></Dialog>
 }
 
-// 日任务默认次日、周任务默认下周；输入框用 min 只允许选更晚的一档，默认值直接确认即可完成顺延。
+// 顺延只允许往后：min 挡住选了也必然失败的过去日期，默认值取次日/下周让用户直接确认。
 function nextRescheduleTarget(task: Task, zone: string): { value: string; kind: 'date' | 'week' } {
   if (task.domain === 'weekly') return { value: weekKey(addDays(weekRange(task.weekKey || weekKey(todayInTimeZone(zone))).start, 7)), kind: 'week' }
   return { value: addDays(task.dateKey || todayInTimeZone(zone), 1), kind: 'date' }

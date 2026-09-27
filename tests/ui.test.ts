@@ -305,3 +305,14 @@ test('each panel offers exactly one add entry, so no action is duplicated', asyn
   assert.doesNotMatch(source, /<WeekRail[^>]*onAdd=/, 'WeekRail call site must not pass onAdd')
   assert.equal((source.match(/<DayRail[^>]*onAdd=/g) || []).length, 0, 'DayRail call sites must not pass onAdd')
 })
+
+test('the daily task editor exposes a cycle-bounded date field', async () => {
+  const source = await appSource()
+  const editor = source.slice(source.indexOf('function TaskDialog'), source.indexOf('function CycleDialog'))
+  // 子任务的日期由父任务决定，只有顶层日任务能改日期。
+  assert.match(editor, /const canEditDate = domain === 'daily' && !parentId && !task\?\.parentId/, 'only top-level daily tasks may change the day')
+  assert.match(editor, /id="task-date" type="date"/, 'the daily form needs a date input')
+  assert.match(editor, /const dateMin = keepsLegacyDate \? undefined : cycle\?\.startDate/, 'a legacy out-of-cycle date must stay editable')
+  assert.match(editor, /dateKey !== value\) setSelectedParent\(''\)/, 'a parent on another day must be cleared when the day changes')
+  assert.match(source, /next = moveDailyTask\(next, existing\.id, input\.dateKey, now\)/, 'changing the date must move the task and its subtasks through the shared helper')
+})
