@@ -55,12 +55,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .language-switch button { min-height: 30px; border: 0; padding: 0 9px; color: var(--muted); background: transparent; font-size: 11px; }
 .language-switch button.active { color: var(--ink); background: #fff; box-shadow: 0 1px 3px rgba(30,40,35,.08); }
 .workspace-scroll { flex: 1 1 auto; overflow-x: auto; overflow-y: auto; overscroll-behavior-x: contain; scroll-behavior: smooth; padding: 38px 36px 56px; }
-/* 宽度由四列下限与视口决定，不让长文本的固有宽度撑大所有列。 */
-.workspace-stage { position: relative; display: grid; grid-template-columns: repeat(4, minmax(520px, 1fr)); gap: 24px; min-width: calc(4 * 520px + 3 * 24px); min-height: calc(100vh - 180px); align-items: start; }
+/* 宽度由四列下限与视口决定，不让长文本的固有宽度撑大所有列。
+   同时四块面板必须底边对齐：行高取四列中最高的内容，其余列拉伸填满。 */
+.workspace-stage { position: relative; display: grid; grid-template-columns: repeat(4, minmax(520px, 1fr)); gap: 24px; min-width: calc(4 * 520px + 3 * 24px); min-height: calc(100vh - 180px); align-items: stretch; }
 .connector-layer { position: absolute; inset: 0; z-index: 3; pointer-events: none; overflow: visible; }
 .connector { fill: none; stroke: rgba(102,148,226,.38); stroke-width: 1.25; vector-effect: non-scaling-stroke; }
 .connector.active { stroke: rgba(69,125,220,.86); stroke-width: 1.8; }
-.panel-shell { min-width: 520px; display: grid; grid-template-columns: 96px minmax(0,1fr); align-items: start; position: relative; z-index: 2; }
+.panel-shell { min-width: 520px; display: grid; grid-template-columns: 96px minmax(0,1fr); align-items: stretch; position: relative; z-index: 2; }
 .period-rail { min-height: 620px; padding: 12px 9px 0 0; color: var(--muted); }
 .rail-heading { padding: 0 8px 13px; color: #9ba19c; font: 600 10px/1 "Maple Mono CN", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; letter-spacing: .16em; text-transform: uppercase; }
 .rail-items { display: flex; flex-direction: column; gap: 4px; }
