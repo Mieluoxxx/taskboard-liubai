@@ -14,6 +14,7 @@ import {
   mergeSnapshots,
   reapplyReorder,
   reorderOrigin,
+  reorderCycleTo,
   reorderSibling,
   reorderSiblingTo,
   rescheduleDailyTask,
@@ -554,4 +555,21 @@ test('drag sorting limits subtasks to the same parent and ignores stale or inval
   assert.equal(reorderSiblingTo(scopes, long.id, otherCycle.id), scopes)
   assert.equal(reorderSiblingTo(scopes, weekly.id, otherWeek.id), scopes)
   assert.equal(reorderSibling(snapshot, a.id, -1), snapshot)
+})
+
+test('drag sorting reorders projects without touching their contents or other scopes', () => {
+  const first = addCycle(board(), 'first', '2025-01-01', '2025-03-31', NOW)
+  const second = addCycle(first, 'second', '2025-04-01', '2025-06-30', NOW)
+  const third = addCycle(second, 'third', '2025-07-01', '2025-09-30', NOW)
+  const original = cloneSnapshot(third)
+  const [a, b, c] = third.cycles
+
+  const moved = reorderCycleTo(third, a.id, c.id)
+  assert.deepEqual(moved.cycles.map((cycle) => cycle.id), [b.id, c.id, a.id])
+  assert.deepEqual(reorderCycleTo(moved, a.id, b.id), third, 'moving back restores the original order')
+  assert.deepEqual(third, original, 'sorting must not mutate its input')
+  assert.equal(reorderCycleTo(third, a.id, a.id), third, 'a drop on itself is a no-op')
+  assert.equal(reorderCycleTo(third, a.id, 'deleted'), third, 'a stale target is a no-op')
+  assert.equal(reorderCycleTo(third, 'deleted', b.id), third, 'a stale source is a no-op')
+  validateSnapshot(moved)
 })

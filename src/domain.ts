@@ -677,6 +677,18 @@ export function addCycle(snapshot: BoardSnapshot, name: string, startDate: strin
   return next
 }
 
+/** 项目顺序也是快照内容（三方合并按数组位置比对该次改动），而任务归属由 cycleId 决定：
+ * 所以重排只动 cycles 的数组顺序，绝不能借此改动任何任务的项目归属或日期。 */
+export function reorderCycleTo(snapshot: BoardSnapshot, cycleId: string, targetId: string): BoardSnapshot {
+  const from = snapshot.cycles.findIndex((cycle) => cycle.id === cycleId)
+  const to = snapshot.cycles.findIndex((cycle) => cycle.id === targetId)
+  if (from < 0 || to < 0 || from === to) return snapshot
+  const cycles = [...snapshot.cycles]
+  const [moved] = cycles.splice(from, 1)
+  cycles.splice(to, 0, moved)
+  return { ...snapshot, cycles }
+}
+
 
 
 export function validateStoredBoard(value: unknown): StoredBoardLike {

@@ -80,6 +80,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .rail-edit { margin-left: -37px; min-width: 32px; min-height: 40px; padding: 8px; border: 0; background: transparent; color: var(--faint); }
 .rail-edit:hover { color: var(--ink); }
 .rail-edit .icon { width: 13px; height: 13px; }
+/* 项目轨道只有 96px：手柄做窄才不会把项目名挤到读不出来。触屏命中区不靠加宽按钮，
+   而是用 ::after 外扩补回到 24px，避免为此牺牲名称宽度。 */
+.rail-grip { position: relative; display: grid; place-items: center; flex: 0 0 12px; width: 12px; height: 44px; padding: 0; border: 0; color: var(--faint); background: transparent; cursor: grab; touch-action: none; }
+.rail-grip::after { content: ''; position: absolute; inset: 0 -6px; }
+.rail-grip:hover, .rail-grip:focus-visible { color: var(--ink); }
+.rail-grip .icon { width: 12px; height: 12px; }
+/* 「未归属计划」没有手柄，用同宽占位对齐到项目名，否则它比其余条目少缩进一截。 */
+.rail-grip-spacer { flex: 0 0 12px; }
+.rail-item-wrap.is-dragging { position: relative; z-index: 5; background: rgba(255,255,255,.9); box-shadow: 0 6px 16px rgba(39,48,42,.16); }
+.rail-item-wrap.is-dragging > .rail-grip { cursor: grabbing; }
+/* 手柄占位后名称宽度变窄，收窄条目左右内边距补回来，否则「项目 B」这种短名也会折行。 */
+.rail-item-wrap > .rail-item { padding-left: 2px; padding-right: 2px; }
 .rail-add { display: flex; align-items: center; gap: 5px; margin: 12px 4px 0; padding: 7px 4px; color: var(--muted); border: 0; background: transparent; font-size: 11px; white-space: nowrap; }
 .rail-add:hover { color: var(--ink); }
 .rail-add .icon { width: 13px; height: 13px; }

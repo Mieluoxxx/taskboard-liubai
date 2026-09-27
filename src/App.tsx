@@ -17,6 +17,7 @@ import {
   mergeSnapshots,
   reapplyReorder,
   reorderOrigin,
+  reorderCycleTo,
   compareDateKeys,
   createFocusBlock,
   createTask,
@@ -919,7 +920,7 @@ export default function App() {
             onSort={sortTask}
             panelRef={panelRef(0)} domain="long" title={t('long')} hint={t('longHint')} language={language} t={t}
             tasks={panelTasks('long')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycleId ?? undefined} hasUnassigned={snapshot.tasks.some((task) => !task.cycleId) || selectedCycleId === UNASSIGNED_CYCLE_ID} language={language} t={t} onSelect={selectCycle} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} />}
+            rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycleId ?? undefined} hasUnassigned={snapshot.tasks.some((task) => !task.cycleId) || selectedCycleId === UNASSIGNED_CYCLE_ID} language={language} t={t} onSelect={selectCycle} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} onSort={sortCycle} />}
             canAdd={Boolean(selectedCycle)} onAdd={() => setDialog({ kind: 'task', domain: 'long' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'long' })}
             onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'long', parentId: task.id })} />
           <TaskPanel
@@ -1000,6 +1001,10 @@ export default function App() {
     updateSnapshot((current) => reorderSiblingTo(current, task.id, targetId), `${t('dragTask')}: ${task.title}`)
   }
 
+  function sortCycle(cycle: GoalCycle, targetId: string) {
+    updateSnapshot((current) => reorderCycleTo(current, cycle.id, targetId), `${t('dragCycle')}: ${cycle.name}`)
+  }
+
   function deleteFocusWithConfirm(block: FocusBlock) {
     if (!window.confirm(t('confirmDeleteFocus'))) return
     updateSnapshot((current) => deleteFocusBlock(current, block.id), `${t('delete')}: ${block.title}`)
@@ -1075,8 +1080,42 @@ function Header({ language, setLanguage, t, mode, email, saveState, saveMessage,
   </header>
 }
 
-function CycleRail({ cycles, selectedId, hasUnassigned, language, t, onSelect, onAdd, onEdit }: { cycles: GoalCycle[]; selectedId?: string; hasUnassigned: boolean; language: Language; t: (key: CopyKey) => string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (cycle: GoalCycle) => void }) {
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('cycles')}</div><div className="rail-items">{cycles.map((cycle) => <div className="rail-item-wrap" key={cycle.id}><button className={`rail-item ${selectedId === cycle.id ? 'selected' : ''}`} aria-current={selectedId === cycle.id ? 'page' : undefined} onClick={() => onSelect(cycle.id)}><span>{cycle.name}</span><small>{cycle.startDate.slice(5)}</small></button>{selectedId === cycle.id ? <button className="rail-edit" aria-label={t('editCycle')} onClick={() => onEdit(cycle)}><Icon name="edit" /></button> : null}</div>)}{hasUnassigned ? <button className={`rail-item ${selectedId === UNASSIGNED_CYCLE_ID ? 'selected' : ''}`} aria-current={selectedId === UNASSIGNED_CYCLE_ID ? 'page' : undefined} onClick={() => onSelect(UNASSIGNED_CYCLE_ID)}>{t('unassignedPlans')}</button> : null}</div><button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('addCycle')}</button></aside>
+function CycleRail({ cycles, selectedId, hasUnassigned, language, t, onSelect, onAdd, onEdit, onSort }: { cycles: GoalCycle[]; selectedId?: string; hasUnassigned: boolean; language: Language; t: (key: CopyKey) => string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (cycle: GoalCycle) => void; onSort: (cycle: GoalCycle, targetId: string) => void }) {
+  const keyboardCoordinates: KeyboardCoordinateGetter = (event, { active, context }) => {
+    if (event.code !== 'ArrowUp' && event.code !== 'ArrowDown') return
+    event.preventDefault()
+    const index = cycles.findIndex((cycle) => cycle.id === (context.over?.id ?? active))
+    const target = cycles[index + (event.code === 'ArrowDown' ? 1 : -1)]
+    const rect = target && context.droppableRects.get(target.id)
+    const current = context.collisionRect
+    if (index < 0 || !rect || !current) return
+    return { x: rect.left + (rect.width - current.width) / 2, y: rect.top + (rect.height - current.height) / 2 }
+  }
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: keyboardCoordinates, scrollBehavior: 'auto' }),
+  )
+  const position = (id: string | number) => `${t('dragPosition')}: ${cycles.findIndex((cycle) => cycle.id === id) + 1} / ${cycles.length}`
+  const announcements: Announcements = {
+    onDragStart: ({ active }) => `${t('dragCycleStarted')}: ${cycles.find((cycle) => cycle.id === active.id)?.name || ''}. ${position(active.id)}`,
+    onDragOver: ({ over }) => over ? position(over.id) : t('dragCycleOutside'),
+    onDragEnd: ({ over }) => over ? t('dragEnded') : t('dragCancelled'),
+    onDragCancel: () => t('dragCancelled'),
+  }
+  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('cycles')}</div>
+    <DndContext sensors={sensors} collisionDetection={(args) => args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)} accessibility={{ screenReaderInstructions: { draggable: t('dragCycleInstructions') }, announcements }} onDragEnd={({ active, over }) => { if (!over || active.id === over.id) return; const cycle = cycles.find((candidate) => candidate.id === active.id); if (cycle && cycles.some((candidate) => candidate.id === over.id)) onSort(cycle, String(over.id)) }}>
+      <SortableContext items={cycles} strategy={verticalListSortingStrategy}><div className="rail-items">{cycles.map((cycle) => <SortableCycleItem key={cycle.id} cycle={cycle} selected={selectedId === cycle.id} t={t} onSelect={onSelect} onEdit={onEdit} />)}{hasUnassigned ? <div className="rail-item-wrap"><span className="rail-grip-spacer" aria-hidden="true" /><button className={`rail-item ${selectedId === UNASSIGNED_CYCLE_ID ? 'selected' : ''}`} aria-current={selectedId === UNASSIGNED_CYCLE_ID ? 'page' : undefined} onClick={() => onSelect(UNASSIGNED_CYCLE_ID)}>{t('unassignedPlans')}</button></div> : null}</div></SortableContext>
+    </DndContext>
+    <button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('addCycle')}</button></aside>
+}
+
+function SortableCycleItem({ cycle, selected, t, onSelect, onEdit }: { cycle: GoalCycle; selected: boolean; t: (key: CopyKey) => string; onSelect: (id: string) => void; onEdit: (cycle: GoalCycle) => void }) {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: cycle.id })
+  return <div className={`rail-item-wrap ${isDragging ? 'is-dragging' : ''}`} ref={setNodeRef} style={{ transform: CSS.Translate.toString(transform), transition }}>
+    <button type="button" className="rail-grip" ref={setActivatorNodeRef} {...attributes} {...listeners} aria-roledescription={t('dragCycle')} aria-label={`${t('dragCycle')}: ${cycle.name}`} title={t('dragCycleInstructions')}><Icon name="grip" /></button>
+    <button className={`rail-item ${selected ? 'selected' : ''}`} aria-current={selected ? 'page' : undefined} onClick={() => onSelect(cycle.id)}><span>{cycle.name}</span><small>{cycle.startDate.slice(5)}</small></button>
+    {selected ? <button className="rail-edit" aria-label={t('editCycle')} onClick={() => onEdit(cycle)}><Icon name="edit" /></button> : null}
+  </div>
 }
 
 // 周、日的导航范围来自选中的长期周期；没有周期时保留独立的当前窗口，方便空板继续使用。
