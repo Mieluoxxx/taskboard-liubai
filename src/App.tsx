@@ -22,6 +22,7 @@ import {
   createFocusBlock,
   createTask,
   carryForwardTasks,
+  carriedFromLabels,
   dateKeysInRange,
   deleteFocusBlock,
   deleteTask,
@@ -148,18 +149,6 @@ function isPastPlacement(task: Task, timeZone: string): boolean {
   if (task.domain === 'daily') return Boolean(task.dateKey && task.dateKey < today)
   if (task.domain === 'weekly') return Boolean(task.weekKey && task.weekKey < weekKey(today))
   return false
-}
-
-// 顺延标签：归档条目上的 rescheduledTo 指向新任务，反查即可知道「它是从哪个周期顺延过来的」。
-// 不新增快照字段：旧数据同样能标出标签，也不需要新的数据库校验。
-function carriedFromLabels(snapshot: BoardSnapshot): Map<string, string> {
-  const labels = new Map<string, string>()
-  for (const task of snapshot.tasks) {
-    if (task.archivedReason !== 'rescheduled' || !task.rescheduledTo) continue
-    const placement = task.domain === 'weekly' ? task.weekKey : task.dateKey
-    if (placement) labels.set(task.rescheduledTo, placement)
-  }
-  return labels
 }
 
 function dateForWeek(key: string, cycle: GoalCycle | undefined, preferredDate: string): string {

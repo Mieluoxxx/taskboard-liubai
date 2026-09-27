@@ -6,6 +6,7 @@ import {
   addFocusBlock,
   addTask,
   carryForwardTasks,
+  carriedFromLabels,
   elapsedMsAt,
   emptySnapshot,
   MAX_ELAPSED_MS,
@@ -179,6 +180,29 @@ test('changing a weekly task week in the editor moves its subtasks and never lea
     (error: unknown) => error instanceof BoardError && error.code === 'noticeRescheduleOutsideCycle',
     'a week outside the project cycle must be rejected instead of silently written',
   )
+})
+
+test('the carry tag follows the reschedule chain back to the original placement', () => {
+  const base = withCycle(board())
+  const cycle = base.cycles[0]
+  const entry = (id: string, domain: 'daily' | 'weekly', extra: Partial<Task> = {}): Task => ({
+    ...createTask(domain === 'daily' ? { domain, title: id, dateKey: '2025-01-16', cycleId: cycle.id } : { domain, title: id, weekKey: '2025-W03', cycleId: cycle.id }, NOW),
+    id,
+    ...extra,
+  })
+  const snapshot: BoardSnapshot = { ...base, tasks: [
+    entry('orig', 'daily', { dateKey: '2025-01-02', archivedAt: NOW, archivedReason: 'rescheduled', rescheduledTo: 'mid' }),
+    entry('mid', 'daily', { dateKey: '2025-01-09', archivedAt: NOW, archivedReason: 'rescheduled', rescheduledTo: 'live' }),
+    entry('live', 'daily', { dateKey: '2025-01-16' }),
+    entry('plain', 'daily'),
+    entry('w-orig', 'weekly', { weekKey: '2025-W01', archivedAt: NOW, archivedReason: 'rescheduled', rescheduledTo: 'w-live' }),
+    entry('w-live', 'weekly', { weekKey: '2025-W03' }),
+  ] }
+
+  const labels = carriedFromLabels(snapshot)
+  assert.equal(labels.get('live'), '2025-01-02', 'the label must be the earliest placement, not the previous hop')
+  assert.equal(labels.get('w-live'), '2025-W01', 'weekly labels use the week key')
+  assert.equal(labels.has('plain'), false, 'a task with no archive pointer gets no tag')
 })
 
 test('carryForwardTasks moves every unfinished past week into the current week once', () => {

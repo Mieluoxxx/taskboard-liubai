@@ -480,6 +480,32 @@ export function linkedChainIds(snapshot: BoardSnapshot, taskId: string): Set<str
   return related
 }
 
+/** 顺延标签的来源：沿 rescheduledTo 链回溯到最早那条归档记录，标签写它当时的放置，才是任务的「原日期」。
+ *  只看上一跳会把多轮顺延的中间放置当成原日期；不新增快照字段，旧数据也能标出来。 */
+export function carriedFromLabels(snapshot: BoardSnapshot): Map<string, string> {
+  const sourceOf = new Map<string, Task>()
+  for (const task of snapshot.tasks) {
+    if (task.archivedReason === 'rescheduled' && task.rescheduledTo) sourceOf.set(task.rescheduledTo, task)
+  }
+  const labels = new Map<string, string>()
+  for (const task of snapshot.tasks) {
+    if (task.archivedAt) continue
+    let source = sourceOf.get(task.id)
+    if (!source) continue
+    // 链可能成环（异常数据），用 seen 兜底停在原地，不无限回溯。
+    const seen = new Set<string>([task.id, source.id])
+    while (true) {
+      const previous = sourceOf.get(source.id)
+      if (!previous || seen.has(previous.id)) break
+      seen.add(previous.id)
+      source = previous
+    }
+    const placement = source.domain === 'weekly' ? source.weekKey : source.dateKey
+    if (placement) labels.set(task.id, placement)
+  }
+  return labels
+}
+
 // 顺序变更也是用户改动，需要能被「重新打开编辑器」重放：返回本次移动的领域与方向，
 // 恢复时对同一任务再执行一次同样的移动即可（而不是把旧整板写回去）。
 export function reorderOrigin(task: Task, direction: -1 | 1): { kind: 'reorder'; taskId: string; direction: -1 | 1; domain: Domain } {

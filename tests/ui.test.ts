@@ -181,10 +181,7 @@ test('unfinished weekly tasks are carried forward automatically, without a confi
   assert.match(source, /task\.domain === 'weekly' \? rescheduleWeeklyTask\(current, task\.id, target\) : rescheduleDailyTask\(current, task\.id, target\)/, 'the shared dialog must dispatch by domain')
   assert.match(source, /onAddSubtask=\{\(task\) => setDialog\(\{ kind: 'task', domain: 'weekly', parentId: task\.id \}\)\} onReschedule=/, 'weekly rows need the reschedule action')
 
-  // 顺延标签：从归档条目的 rescheduledTo 反查来源周期，不需要新增快照字段。
-  assert.match(source, /function carriedFromLabels\(snapshot: BoardSnapshot\): Map<string, string>/, 'carry tags must be derived from the archive pointers')
-  assert.match(source, /if \(task\.archivedReason !== 'rescheduled' \|\| !task\.rescheduledTo\) continue/, 'only rescheduled archive entries name a source')
-  assert.match(source, /const placement = task\.domain === 'weekly' \? task\.weekKey : task\.dateKey/, 'the source label is the domain placement key')
+  // 顺延标签：来源由领域层沿 rescheduledTo 链回溯到原放置（有领域单测），App 只负责只建一次查找表与渲染。
   assert.match(source, /const carrySource = carriedFromLabels\(snapshot\)/, 'the panel must build the lookup once')
   assert.match(source, /className="carry-tag"/, 'the tag needs its own styleable element')
   assert.match(source, /title=\{`\$\{t\('carriedFrom'\)\} \$\{carriedFrom\}`\}/, 'the tag explains itself on hover')
