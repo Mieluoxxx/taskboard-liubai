@@ -11,8 +11,7 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/**/*.test.ts",
-    "test:agent": "tsx --test tests/agent.test.ts tests/mcp-protocol.test.ts",
-    "skill:package": "cd skills && zip -qr ../public/liubai-taskboard-skill.zip liubai-taskboard"
+    "test:agent": "tsx --test tests/agent.test.ts tests/mcp-protocol.test.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

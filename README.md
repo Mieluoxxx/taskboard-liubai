@@ -59,16 +59,4 @@ pnpm dev
 
 部署与最小验证见 [`docs/MCP.md`](docs/MCP.md)。
 
-## Agent Skill
-
-[`skills/liubai-taskboard/SKILL.md`](skills/liubai-taskboard/SKILL.md) 包含 MCP 操作规范，并附带网页与本地使用说明。Claude 可上传 [Skill ZIP](https://taskboard-liubai.vercel.app/liubai-taskboard-skill.zip)；修改 Skill 后运行 `pnpm skill:package` 重新打包。
-
-在仓库根目录用 Pi 显式加载（根目录 `skills/` 不属于默认自动发现位置）：
-
-```bash
-pi --skill ./skills/liubai-taskboard
-```
-
-会话中使用 `/skill:liubai-taskboard`，例如 `/skill:liubai-taskboard 指导使用本地演示板并创建今天的计划`；修改已加载的 Skill 后执行 `/reload`。
-
 [MIT](LICENSE)
