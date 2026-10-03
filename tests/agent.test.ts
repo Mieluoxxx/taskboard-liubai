@@ -72,7 +72,7 @@ test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audien
       insert into auth.users values ('${owner}'), ('${other}');
       insert into auth.sessions values ('${session}', '${owner}', null, null), ('${oauthSession}', '${owner}', '${clientId}', null);
     `)
-    for (const migration of ['001_private_board', '002_independent_boards', '003_task_text_limits', '004_remove_task_history', '005_project_task_scope', '006_agent_access']) {
+    for (const migration of ['001_private_board', '002_independent_boards', '003_task_text_limits', '004_remove_task_history', '005_project_task_scope', '006_agent_access', '007_mcp_rate_limit']) {
       await db.exec(await readFile(new URL(`../supabase/migrations/${migration}.sql`, import.meta.url), 'utf8'))
     }
     const identity = async (userId: string, oauth = false, audience: string[] = ['authenticated', resource]) => {
@@ -96,6 +96,16 @@ test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audien
     await db.query('insert into auth.oauth_consents(user_id, client_id) values ($1, $2)', [owner, clientId])
     await db.exec('set role authenticated')
     await identity(owner, true)
+    for (let i = 0; i < 120; i++) {
+      const quota = await db.query<{ value: { allowed: boolean } }>('select public.consume_mcp_request_budget() as value')
+      assert.equal(quota.rows[0].value.allowed, true)
+    }
+    const denied = await db.query<{ value: { allowed: boolean; retryAfterSeconds: number } }>('select public.consume_mcp_request_budget() as value')
+    assert.equal(denied.rows[0].value.allowed, false)
+    assert(denied.rows[0].value.retryAfterSeconds >= 1 && denied.rows[0].value.retryAfterSeconds <= 60)
+    await assert.rejects(db.query('select * from private.mcp_request_budgets'), /permission denied/)
+    await db.exec("reset role; update private.mcp_request_budgets set window_started = now() - interval '2 minutes'; set role authenticated")
+    assert.equal((await db.query<{ value: { allowed: boolean; remaining: number } }>('select public.consume_mcp_request_budget() as value')).rows[0].value.remaining, 119)
     await assert.rejects(db.query('select public.purge_board_trash($1)', [trash[0].id]), /direct user/)
     const restored = restoreTrash(deleted, trash[0])
     const requestId = crypto.randomUUID()
@@ -116,6 +126,7 @@ test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audien
     await db.query('update auth.oauth_consents set revoked_at = now() where user_id = $1', [owner])
     await db.exec('set role authenticated')
     await assert.rejects(db.query('select * from public.get_private_board()'), /revoked/)
+    await assert.rejects(db.query('select public.consume_mcp_request_budget()'), /revoked/)
     await assert.rejects(db.query('select * from public.cas_save_private_board(3, $1::jsonb)', [JSON.stringify(base)]), /revoked/)
     await identity(owner)
     await db.query('select * from public.cas_save_private_board(3, $1::jsonb)', [JSON.stringify(deleted)])

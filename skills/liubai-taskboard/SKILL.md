@@ -8,7 +8,7 @@ description: 使用留白（Liubai Taskboard）管理长期目标、周计划、
 ## 连接与身份
 
 - 看板：<https://taskboard-liubai.vercel.app>。
-- 远程 MCP：`https://taskboard-liubai.vercel.app/api/mcp`；用户自部署时使用其提供的地址。
+- 远程 MCP：`https://taskboard-liubai.vercel.app/api/mcp`；用户自部署时使用其提供的地址。支持 2026-07-28 正式协议，并保留 2025-11-25 等旧版兼容；协议头和 `_meta` 由连接器处理，不自行伪造握手。
 - Claude Chat：在连接器中添加 MCP 地址，用户在留白页面登录并批准访问自己的看板。密码只输入留白登录页，不输入聊天、不写进 Skill。
 - 账号由管理员提供；不同账号有独立看板。新建一个 Agent 账号不会获得原账号的数据。
 - 授权持续到用户在留白 `/account` 页面主动撤销。连接器不具备永久清除回收站或管理其他授权的工具。
@@ -42,6 +42,7 @@ description: 使用留白（Liubai Taskboard）管理长期目标、周计划、
 4. 网络超时且不知道是否成功时，重试**完全相同的 requestId、readToken 和 actions**；服务端在 24 小时内去重。不要换 ID 重复创建。
 5. 若明确返回冲突，重新读取并核对用户意图，必要时询问用户，然后用新 requestId 提交。不要盲目重做、强制覆盖或扩大项目删除范围。
 6. readToken 过期时重新读取，不篡改或拼接读票。一次批量操作原子化，不代表整场聊天可以自动回滚。
+7. 每个用户与授权客户端每分钟最多 120 次 MCP 请求。收到 HTTP 429 时按 `Retry-After` 等待，不紧密循环重试；等待后保持原 requestId，读票已过期则先核实结果再重新规划。
 
 可用 `op`：
 

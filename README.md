@@ -43,7 +43,7 @@ cp .env.example .env.local
 pnpm dev
 ```
 
-后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`006` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。已有部署先补齐迁移，再发布前端。
+后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`007` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。已有部署先补齐迁移，再发布前端。
 
 看板前端可以静态托管；MCP 连接器还需要 `api/` 中的 Node 24 服务端函数，推荐部署完整仓库到 Vercel。
 
@@ -53,7 +53,7 @@ pnpm dev
 
 ## Claude Chat / MCP
 
-在 Claude 连接器中添加 `https://taskboard-liubai.vercel.app/api/mcp`，登录留白后授权自己的看板。支持其他兼容 MCP 客户端，不需要在聊天中提供密码或 API Key。
+在 Claude 连接器中添加 `https://taskboard-liubai.vercel.app/api/mcp`，登录留白后授权自己的看板。支持 MCP 2026-07-28，并兼容 2025-11-25 等旧版客户端；不需要在聊天中提供密码或 API Key。
 
 云端网页与 Agent 共用 30 天回收站和 90 天审计；完整读写、原子批量操作和冲突保护共用现有领域规则。看板设置中的「授权、回收站与审计」可撤销授权、恢复数据；永久清除仅允许网页用户操作。
 
