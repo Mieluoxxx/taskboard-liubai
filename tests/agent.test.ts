@@ -72,9 +72,10 @@ test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audien
       insert into auth.users values ('${owner}'), ('${other}');
       insert into auth.sessions values ('${session}', '${owner}', null, null), ('${oauthSession}', '${owner}', '${clientId}', null);
     `)
-    for (const migration of ['001_private_board', '002_independent_boards', '003_task_text_limits', '004_remove_task_history', '005_project_task_scope', '006_agent_access', '007_mcp_rate_limit']) {
+    for (const migration of ['001_private_board', '002_independent_boards', '003_task_text_limits', '004_remove_task_history', '005_project_task_scope', '006_agent_access', '007_mcp_rate_limit', '008_mcp_database_gateway']) {
       await db.exec(await readFile(new URL(`../supabase/migrations/${migration}.sql`, import.meta.url), 'utf8'))
     }
+    await db.exec("update private.agent_config set oauth_issuer = 'https://example.supabase.co/auth/v1'")
     const identity = async (userId: string, oauth = false, audience: string[] = ['authenticated', resource]) => {
       await db.query("select set_config('request.jwt.claims', $1, false)", [JSON.stringify({ sub: userId, session_id: oauth ? oauthSession : session, ...(oauth ? { client_id: clientId } : {}), aud: audience })])
     }
@@ -119,6 +120,22 @@ test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audien
     assert.equal((await db.query('select * from public.get_board_trash()')).rows.length, 0)
     const audit = (await db.query<{ action: string }>('select * from public.get_board_audit()')).rows
     assert(audit.some((row) => row.action === 'restore')); assert(!JSON.stringify(audit).includes('Parent'))
+    const principal = { sub: owner, client_id: clientId, session_id: oauthSession, role: 'authenticated', aud: [resource], iss: 'https://example.supabase.co/auth/v1', exp: Math.floor(Date.now() / 1000) + 3600 }
+    const dispatch = (claims: unknown, method = 'get_private_board') => db.query<{ data: Array<{ revision: number }> }>('select public.mcp_dispatch($1::jsonb, $2, $3::jsonb) as data', [JSON.stringify(claims), method, '{}'])
+    await assert.rejects(dispatch(principal), /permission denied/)
+    await db.exec('reset role; set role liubai_mcp_gateway')
+    await assert.rejects(db.query('select * from private.personal_boards'), /permission denied/)
+    await assert.rejects(db.query('select * from public.get_private_board()'), /permission denied/)
+    const previousClaims = (await db.query<{ value: string }>("select current_setting('request.jwt.claims') as value")).rows[0].value
+    assert.equal(Number((await dispatch(principal)).rows[0].data[0].revision), 3)
+    assert.equal((await db.query<{ value: string }>("select current_setting('request.jwt.claims') as value")).rows[0].value, previousClaims, 'pool context must not leak to the next query')
+    await assert.rejects(dispatch(principal, 'purge_board_trash'), /not available/)
+    await assert.rejects(dispatch({ ...principal, sub: other }), /revoked/)
+    await assert.rejects(dispatch({ ...principal, client_id: '' }), /Invalid gateway/)
+    await assert.rejects(dispatch({ ...principal, iss: 'https://other.example' }), /Invalid gateway/)
+    await assert.rejects(dispatch({ ...principal, aud: ['authenticated'] }), /revoked/)
+    await assert.rejects(dispatch({ ...principal, exp: 1 }), /expired/)
+    await db.exec('reset role; set role authenticated')
     await identity(owner, true, ['authenticated'])
     await assert.rejects(db.query('select * from public.get_private_board()'), /revoked/)
     await identity(owner, true)
@@ -128,6 +145,9 @@ test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audien
     await assert.rejects(db.query('select * from public.get_private_board()'), /revoked/)
     await assert.rejects(db.query('select public.consume_mcp_request_budget()'), /revoked/)
     await assert.rejects(db.query('select * from public.cas_save_private_board(3, $1::jsonb)', [JSON.stringify(base)]), /revoked/)
+    await db.exec('reset role; set role liubai_mcp_gateway')
+    await assert.rejects(dispatch(principal), /revoked/)
+    await db.exec('reset role; set role authenticated')
     await identity(owner)
     await db.query('select * from public.cas_save_private_board(3, $1::jsonb)', [JSON.stringify(deleted)])
     const second = (await db.query<TrashEntry>('select * from public.get_board_trash()')).rows[0]

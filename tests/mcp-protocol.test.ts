@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { generateKeyPairSync, sign } from 'node:crypto'
 import { createServer, type IncomingMessage } from 'node:http'
-import type { SupabaseClient } from '@supabase/supabase-js'
+import pg from 'pg'
+import type { BoardRpc } from '../server/store'
 import { createTaskboardHandler } from '../server/mcp'
 import { emptySnapshot } from '../src/domain'
 import mcpHandler from '../api/mcp'
@@ -14,12 +15,12 @@ const META_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities'
 const board = { revision: 0, snapshot: emptySnapshot('UTC') }
 function fixture() {
   const calls: string[] = []
-  const client = { rpc: async (name: string) => {
+  const client: BoardRpc = { rpc: async (name: string) => {
     calls.push(name)
     if (name === 'get_private_board') return { data: [board], error: null }
     if (name === 'record_board_failure') return { data: null, error: null }
     throw new Error(`Unexpected RPC: ${name}`)
-  } } as unknown as SupabaseClient
+  } }
   return { handler: createTaskboardHandler(client, { userId: 'owner', clientId: 'client' }, 'x'.repeat(64)), calls }
 }
 function message(method: string, params: Record<string, unknown> = {}, version = VERSION) {
@@ -120,26 +121,40 @@ test('Node HTTP boundary: signed JWT, Vercel parsed bodies, modern CORS, OAuth c
   const before = { ...process.env }
   const baseUrl = 'https://mcp-compliance.supabase.co'
   const resource = 'https://taskboard.test/api/mcp'
-  Object.assign(process.env, { TASKBOARD_MCP_URL: resource, TASKBOARD_MCP_SECRET: 'x'.repeat(64), SUPABASE_URL: baseUrl, SUPABASE_PUBLISHABLE_KEY: 'test-public-key' })
+  Object.assign(process.env, { TASKBOARD_MCP_URL: resource, TASKBOARD_MCP_SECRET: 'x'.repeat(64), SUPABASE_URL: baseUrl, SUPABASE_PUBLISHABLE_KEY: 'test-public-key', TASKBOARD_DATABASE_URL: 'postgresql://liubai_mcp_gateway:test@localhost/test' })
   const keys = generateKeyPairSync('ec', { namedCurve: 'P-256' })
   const jwk = { ...keys.publicKey.export({ format: 'jwk' }), kid: 'protocol-test', alg: 'ES256', use: 'sig' }
+  const issuedTokens: string[] = []
   const jwt = (audience: string, expires = Math.floor(Date.now() / 1000) + 300) => {
     const head = Buffer.from(JSON.stringify({ alg: 'ES256', kid: jwk.kid })).toString('base64url')
-    const claims = Buffer.from(JSON.stringify({ iss: `${baseUrl}/auth/v1`, sub: 'owner', role: 'authenticated', client_id: 'client', aud: ['authenticated', audience], exp: expires })).toString('base64url')
+    const claims = Buffer.from(JSON.stringify({ iss: `${baseUrl}/auth/v1`, sub: 'owner', role: 'authenticated', client_id: 'client', session_id: 'session', aud: ['authenticated', audience], exp: expires })).toString('base64url')
     const payload = `${head}.${claims}`
-    return `${payload}.${sign('sha256', Buffer.from(payload), { key: keys.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url')}`
+    const token = `${payload}.${sign('sha256', Buffer.from(payload), { key: keys.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url')}`
+    issuedTokens.push(token)
+    return token
   }
   let limited = false
   let revoked = false
   const fetch = globalThis.fetch
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
-    if (!url.startsWith(baseUrl)) return fetch(input, init)
-    if (url.endsWith('/.well-known/jwks.json')) return Response.json({ keys: [jwk] })
-    if (url.endsWith('/rpc/consume_mcp_request_budget')) return revoked
-      ? Response.json({ code: '42501', message: 'Access revoked' }, { status: 403 })
-      : Response.json({ allowed: !limited, retryAfterSeconds: 7 })
-    throw new Error(`Unexpected upstream path: ${new URL(url).pathname}`)
+    if (new URL(url).hostname === '127.0.0.1') return fetch(input, init)
+    if (url.endsWith('/.well-known/jwks.json')) {
+      assert.equal(new Headers(init?.headers).get('authorization'), null, 'public JWKS fetch must not receive the MCP token')
+      return Response.json({ keys: [jwk] })
+    }
+    throw new Error(`Unexpected upstream HTTP path: ${new URL(url).pathname}`)
+  })
+  t.mock.method(pg.Pool.prototype, 'query', async (...args: unknown[]) => {
+    assert.equal(args[0], 'select public.mcp_dispatch($1::jsonb, $2::text, $3::jsonb) as data')
+    const values = args[1] as string[]
+    for (const token of issuedTokens) assert(!JSON.stringify(values).includes(token), 'do not forward MCP bearer tokens to the database')
+    const claims = JSON.parse(values[0])
+    assert.equal(claims.sub, 'owner'); assert.equal(claims.client_id, 'client')
+    assert.deepEqual(claims.aud, [resource])
+    assert.equal(values[1], 'consume_mcp_request_budget')
+    if (revoked) throw Object.assign(new Error('Access revoked'), { code: '42501' })
+    return { rows: [{ data: { allowed: !limited, retryAfterSeconds: 7 } }], rowCount: 1, command: 'SELECT', oid: 0, fields: [] }
   })
   const server = createServer(async (req: IncomingMessage & { body?: unknown }, res) => {
     if (req.url === '/metadata') { metadataHandler(req, res); return }
@@ -181,7 +196,7 @@ test('Node HTTP boundary: signed JWT, Vercel parsed bodies, modern CORS, OAuth c
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()))
     t.mock.restoreAll()
-    for (const name of ['TASKBOARD_MCP_URL', 'TASKBOARD_MCP_SECRET', 'SUPABASE_URL', 'SUPABASE_PUBLISHABLE_KEY']) {
+    for (const name of ['TASKBOARD_MCP_URL', 'TASKBOARD_MCP_SECRET', 'SUPABASE_URL', 'SUPABASE_PUBLISHABLE_KEY', 'TASKBOARD_DATABASE_URL']) {
       if (before[name] === undefined) delete process.env[name]; else process.env[name] = before[name]
     }
   }

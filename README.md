@@ -43,7 +43,7 @@ cp .env.example .env.local
 pnpm dev
 ```
 
-后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`007` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。已有部署先补齐迁移，再发布前端。
+后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`008` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。已有部署先补齐迁移，再发布前端。
 
 看板前端可以静态托管；MCP 连接器还需要 `api/` 中的 Node 24 服务端函数，推荐部署完整仓库到 Vercel。
 

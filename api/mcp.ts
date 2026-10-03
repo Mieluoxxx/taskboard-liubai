@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { createClient } from '@supabase/supabase-js'
+import { invalidAccessToken, verifyMcpToken } from '../server/auth.js'
+import { createMcpStore, type BoardRpc } from '../server/store.js'
 import { toNodeHandler } from '@modelcontextprotocol/node'
 import { createTaskboardHandler, MCP_MAX_BODY_BYTES } from '../server/mcp.js'
 import { mcpConfig } from '../server/config.js'
@@ -24,14 +25,12 @@ export default async function handler(req: IncomingMessage & { body?: unknown },
   const header = req.headers.authorization
   if (typeof header !== 'string' || header.length > 16000 || !/^Bearer [^\s]+$/i.test(header)) { challenge(Boolean(header)); return }
   const token = header.slice(7)
-  const client = createClient(config.supabaseUrl, config.key, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }, global: { headers: { Authorization: header } } })
+  let client: BoardRpc
   let caller: { userId: string; clientId: string }
   try {
-    const { data, error } = await client.auth.getClaims(token)
-    const claims = data?.claims
-    const audiences = Array.isArray(claims?.aud) ? claims.aud : [claims?.aud]
-    if (error && (error.name === 'AuthRetryableFetchError' || (error.status ?? 0) >= 500)) { fail(503, 'Authorization service is temporarily unavailable'); return }
-    if (error || !claims || claims.iss !== `${config.supabaseUrl}/auth/v1` || claims.role !== 'authenticated' || typeof claims.sub !== 'string' || typeof claims.client_id !== 'string' || !claims.client_id || !audiences.includes(config.resource)) { challenge(true); return }
+    const claims = await verifyMcpToken(token, config.supabaseUrl, config.resource)
+    if (!claims) { challenge(true); return }
+    client = createMcpStore(config.databaseUrl, claims)
     // 签名验证后在数据库原子核对撤销与调用额度；不依赖单个 serverless 实例的内存计数。
     const access = await client.rpc('consume_mcp_request_budget')
     if (access.error) {
@@ -39,14 +38,19 @@ export default async function handler(req: IncomingMessage & { body?: unknown },
       else fail(503, 'Board authorization check is temporarily unavailable')
       return
     }
-    if (typeof access.data?.allowed !== 'boolean') { fail(503, 'Invalid authorization budget response'); return }
-    if (!access.data.allowed) {
-      res.setHeader('Retry-After', String(Math.max(1, Math.min(60, Math.ceil(Number(access.data.retryAfterSeconds) || 60)))))
+    const budget = access.data as { allowed?: unknown; retryAfterSeconds?: unknown } | null
+    if (typeof budget?.allowed !== 'boolean') { fail(503, 'Invalid authorization budget response'); return }
+    if (!budget.allowed) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.min(60, Math.ceil(Number(budget.retryAfterSeconds) || 60)))))
       fail(429, 'MCP request limit reached; retry after the indicated delay')
       return
     }
     caller = { userId: claims.sub, clientId: claims.client_id }
-  } catch { fail(503, 'Authorization service is temporarily unavailable'); return }
+  } catch (error) {
+    if (invalidAccessToken(error)) challenge(true)
+    else fail(503, 'Authorization service is temporarily unavailable')
+    return
+  }
   // SDK 对原始流设大小上限；Vercel 已解析的 body 仍需在交给 SDK 前单独检查。
   if (Number(req.headers['content-length']) > MCP_MAX_BODY_BYTES || (req.body !== undefined && Buffer.byteLength(typeof req.body === 'string' ? req.body : JSON.stringify(req.body)) > MCP_MAX_BODY_BYTES)) { fail(413, 'Request too large'); return }
   const handler = createTaskboardHandler(client, caller, config.secret)

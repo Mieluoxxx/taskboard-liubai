@@ -17,11 +17,11 @@ Supabase 当前未声明 CIMD 和 RFC 9207 的 `iss` 回调能力：它们是规
 
 ## 部署顺序
 
-生产部署需要 Supabase 管理权限及 Vercel 项目权限。先迁移数据库，再发布应用；不要把 secret/service-role key 提供给客户端。当前 MCP 服务完全使用调用者的用户 token，不需要 service-role key。
+生产部署需要 Supabase 管理权限及 Vercel 项目权限。先迁移数据库，再发布应用；不要把 secret/service-role key 提供给客户端。MCP 入口仅用调用者 token 在本地验证签名与权限；数据访问使用独立的最小权限 PostgreSQL 角色，不转发 MCP token 给 Supabase HTTP API，也不使用 service-role key。
 
 ### 1. 数据库
 
-按顺序执行 `supabase/migrations/001`–`007`。已有 `006` 部署只需要 `007_mcp_rate_limit.sql`，必须先于新版 MCP 函数发布。迁移不改写现有快照或 revision；网页旧版 CAS 写入也会进入统一的删除捕获和审计触发器。
+按顺序执行 `supabase/migrations/001`–`008`。已有 `007` 部署再执行 `008_mcp_database_gateway.sql`，并完成下述专用角色配置，必须先于新版 MCP 函数发布。迁移不改写现有快照或 revision；网页旧版 CAS 写入也会进入统一的删除捕获和审计触发器。
 
 先启用 Cron 扩展，`006` 会安排每小时清理到期数据：
 
@@ -43,6 +43,24 @@ select cron.schedule('liubai-agent-retention', '17 * * * *', 'select private.cle
 update private.agent_config set resource_url = 'https://YOUR_DOMAIN/api/mcp' where singleton;
 ```
 
+### 专用数据库通道
+
+008 创建 `liubai_mcp_gateway`（默认 NOLOGIN、NOINHERIT），只授予 `public.mcp_dispatch` 执行权。该函数接受经过入口验证的最少主体上下文，只分派固定的看板操作，再检查活动 session、consent、issuer、audience 和过期时间。没有读表、永久清除、修改授权或执行任意 SQL 的入口；主体上下文仅在一条数据库事务内生效。
+
+1. 管理员为该角色开启 LOGIN 并设置强随机密码；建议使用 `psql` 的 `\password liubai_mcp_gateway`，不要把明文密码保存到 SQL 文件、聊天或 Git。不要重置既有 postgres 用户密码。
+2. 配置实际 Supabase 授权 issuer：
+
+   ```sql
+   update private.agent_config set oauth_issuer = 'https://YOUR_PROJECT.supabase.co/auth/v1' where singleton;
+   alter role liubai_mcp_gateway login;
+   grant connect on database postgres to liubai_mcp_gateway;
+   ```
+
+3. 从 Supabase Connect 面板复制 Shared Transaction Pooler 的主机与 6543 端口，用户名改为 `liubai_mcp_gateway.YOUR_PROJECT`。不要自行拼猜 pooler 主机。将 URI 保存为 Vercel 的 `TASKBOARD_DATABASE_URL` Secret；禁止使用 postgres 管理员或 service-role 凭据代替。
+4. 从 **Database Settings → Download certificate** 获取可信根证书，将 PEM 保存为 `TASKBOARD_DATABASE_CA`。驱动始终验证 TLS 证书和主机名；不能用 `rejectUnauthorized: false` 绕过证书错误。
+
+通道使用一个进程级连接池、最多 1 条连接与无命名参数化查询，兼容事务池。原始 MCP token 既不进入数据库参数，也不发送到用户信息接口；公开 JWKS 请求不带 Authorization。
+
 ### 2. Supabase Auth
 
 - Authentication → OAuth Server：启用 OAuth 2.1 Server（Beta）及 Dynamic Client Registration。
@@ -58,6 +76,8 @@ update private.agent_config set resource_url = 'https://YOUR_DOMAIN/api/mcp' whe
 ```dotenv
 TASKBOARD_MCP_URL=https://taskboard-liubai.vercel.app/api/mcp
 TASKBOARD_MCP_SECRET=<至少32字符的高强度随机值>
+TASKBOARD_DATABASE_URL=postgresql://liubai_mcp_gateway.YOUR_PROJECT:YOUR_PASSWORD@YOUR_POOLER:6543/postgres
+TASKBOARD_DATABASE_CA=<从 Supabase 控制台取得的可信 PEM 根证书>
 ```
 
 `TASKBOARD_MCP_SECRET` 用于签名短期读票，不是提供给用户的个人 API Key。不得加 `VITE_` 前缀。生成后存入托管平台的 Secret 环境变量，不提交 Git：
@@ -98,6 +118,6 @@ curl -fsS https://YOUR_DOMAIN/.well-known/oauth-protected-resource/api/mcp
 
 ## 快速验证范围
 
-`pnpm test:agent` 覆盖领域操作、Postgres 权限／回收／限流、真实签名 JWT 的 HTTP 边界，以及新旧两代 MCP 的协议回归；`pnpm build` 同时做类型检查。没有新增测试框架，不执行慢速全量浏览器回归。
+`pnpm test:agent` 覆盖领域操作、Postgres 权限／回收／限流／受限数据库通道、真实签名 JWT 的 HTTP 边界，以及新旧两代 MCP 的协议回归；`pnpm build` 同时做类型检查。没有新增测试框架，不执行慢速全量浏览器回归。
 
 OAuth 管理依赖 Supabase Beta。迁移、Hook、签名算法及客户端联调必须都完成，不能把本地构建通过当作已经上线。

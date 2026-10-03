@@ -22,7 +22,8 @@
 | 工具错误 | 可修正的输入／业务错误应为 isError，协议结构错误为 JSON-RPC error | 验证越界参数返回 complete/isError，协议错误不会调用业务代码。 |
 | HTTP 传输 | POST 单消息；通知被接受时 202 无正文；解析与方法状态规范化 | 删除自写解析分支，交给官方 handler 与 Node 适配器；支持 Vercel 预解析 body，保留 2 MB 限制。 |
 | 跨域互操作 | 原 CORS 不允许新头，浏览器读不到挑战，发现文档无 CORS | 允许 Mcp-Method/Mcp-Name，暴露 WWW-Authenticate 与 Retry-After；公共资源元数据允许跨域 GET/HEAD。 |
-| 鉴权 | 每请求 Bearer，验证签名、过期、issuer、目标 audience，无效令牌 401 | 使用 Supabase 验签和数据库 session/consent 检查；无效令牌携带 invalid_token challenge；上游暂不可用返回 503。 |
+| 鉴权 | 每请求 Bearer，验证签名、过期、issuer、目标 audience，无效令牌 401 | 使用公开 JWKS 在入口本地验证签名和标准 JWT 声明，数据库再检查 session/consent；无效令牌携带 invalid_token challenge；上游暂不可用返回 503。 |
+| 不转发访问令牌 | 授权安全章节明确 MUST NOT 把 MCP 入站 token 传给上游 API；原实现使用同一 Bearer 调用 Supabase HTTP RPC | 移除该路径。JOSE 本地验签；独立最小权限 PostgreSQL 角色调用固定分派函数，只携带已验证的最少主体上下文，不携带原 token。测试拒绝任何上游 HTTP token 传递，验证角色不能读表、直接调用普通 RPC 或永久清除。 |
 | 调用限流 | 工具安全章节要求 MUST rate limit；原实现仅限制输入大小和失败日志 | 007 迁移按用户 + OAuth 客户端原子计数，每分钟 120 次 MCP 请求，跨 serverless 实例有效；超额 429 + Retry-After。 |
 | 授权页面安全 | 防止点击劫持，避免 URL 中的授权信息经 Referer 泄露 | 托管层配置 frame-ancestors none、X-Frame-Options DENY、Referrer-Policy no-referrer。 |
 | 显式应用状态 | 新版不能依赖协议会话关联业务调用 | readToken 是绑定用户／客户端、限时签名的工具参数，不是协议会话，也不是独立访问凭据。 |
@@ -35,6 +36,7 @@
 - [服务发现](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
 - [工具、错误与安全要求](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
 - [授权](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
+- [授权安全要求：Access Token Privilege Restriction](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations)
 - [安全最佳实践](https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices)
 
 ## 不能夸大为全部覆盖的项目
@@ -49,6 +51,6 @@
 
 ## 验证与发布要求
 
-`pnpm test:agent` 运行 6 组集中检查，包括新版正反例、旧版兼容、真实测试密钥签发 JWT 的 HTTP 边界、跨域发现、限流与撤销；Postgres 测试验证第 121 次请求拒绝和窗口恢复。没有引入新测试框架。
+`pnpm test:agent` 运行 6 组集中检查，包括新版正反例、旧版兼容、真实测试密钥签发 JWT 的 HTTP 边界、跨域发现、限流与撤销；Postgres 测试验证第 121 次请求拒绝、窗口恢复、数据库通道 ACL、主体上下文不串线、过期与撤销；HTTP 测试只允许公开 JWKS 网络请求，断言数据库参数没有原 MCP token。没有引入新测试框架。
 
-上线前必须先执行 `007_mcp_rate_limit.sql`，再部署新函数。构建后应在生产上用临时授权验证 `server/discover`、新版 tools/list／只读调用、旧版 initialize／tools/list 和坏镜像头拒绝；验证不修改真实任务，临时授权和客户端随后撤销／清理。
+上线前必须执行 007、008 迁移并配置专用数据库角色、issuer、连接 Secret 与可信 CA，再部署新函数。构建后应在生产上用临时授权验证 `server/discover`、新版 tools/list／只读调用、旧版 initialize／tools/list 和坏镜像头拒绝；验证不修改真实任务，临时授权和客户端随后撤销／清理。

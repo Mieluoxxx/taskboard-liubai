@@ -37,6 +37,6 @@ pnpm install
 VITE_SUPABASE_URL= VITE_SUPABASE_PUBLISHABLE_KEY= pnpm dev
 ```
 
-云端部署按仓库 `docs/MCP.md` 操作；`.env.local` 只在不存在时从 `.env.example` 复制，禁止覆盖既有凭据。数据库按顺序执行迁移至 `007_mcp_rate_limit.sql`，再部署前端与 MCP 函数。MCP 不是纯静态文件，单独托管 `dist/` 不会提供连接器。
+云端部署按仓库 `docs/MCP.md` 操作；`.env.local` 只在不存在时从 `.env.example` 复制，禁止覆盖既有凭据。数据库按顺序执行迁移至 `008_mcp_database_gateway.sql`，并按部署文档配置独立的受限数据库通道，再部署前端与 MCP 函数。MCP 不是纯静态文件，单独托管 `dist/` 不会提供连接器。
 
 最小验证：`pnpm test:agent` 和 `pnpm build`。不要为提供使用说明擅自执行数据库迁移、创建测试任务或停止真实计时器。
