@@ -6,8 +6,24 @@ import pg from 'pg'
 import type { BoardRpc } from '../server/store'
 import { createTaskboardHandler } from '../server/mcp'
 import { emptySnapshot } from '../src/domain'
+import { createAuthorizationLoader } from '../src/auth-flow'
 import mcpHandler from '../api/mcp'
 import metadataHandler from '../api/oauth-protected-resource'
+
+test('authorization details are consumed once across cancelled and replacement subscriptions', async () => {
+  let calls = 0
+  const load = createAuthorizationLoader(async () => {
+    calls++
+    if (calls > 1) throw new Error('authorization request cannot be processed')
+    return { redirect_url: 'https://client.test/callback?code=test' }
+  })
+  const abandoned = load('authorization-1')
+  const replacement = load('authorization-1')
+  void replacement.catch(() => {})
+  assert.equal(calls, 1)
+  assert.strictEqual(replacement, abandoned)
+  assert((await replacement).redirect_url)
+})
 
 const VERSION = '2026-07-28'
 const META_VERSION = 'io.modelcontextprotocol/protocolVersion'

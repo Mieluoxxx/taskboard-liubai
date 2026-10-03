@@ -39,6 +39,12 @@
 - [授权安全要求：Access Token Privilege Restriction](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations)
 - [安全最佳实践](https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices)
 
+## 额外发现的授权重连故障
+
+真实浏览器记录显示：同一授权详情先返回 200/redirect，再返回 400/validation_failed。原因是数据库客户端就绪改变了刷新回调，连带重跑授权 effect；第一个自动批准回调被清理标志丢弃，第二次已不能再次消费请求。
+
+授权加载与账户刷新已分离，且每个用户页面对同一 authorization_id 复用同一个 Promise，覆盖 effect 重订阅和开发模式双执行。回归先复现了调用次数 2 而非 1，再验证去重和回调交付。
+
 ## 不能夸大为全部覆盖的项目
 
 - **CIMD**：规范为 SHOULD。实测 Supabase 元数据未声明 `client_id_metadata_document_supported`，仍提供 DCR endpoint。DCR 已被弃用，但当前规范仍以 MAY 保留，明确用于兼容不支持 CIMD 的授权服务器。本次不另外实现高风险 OAuth 代理；后续随授权服务升级。
@@ -51,6 +57,6 @@
 
 ## 验证与发布要求
 
-`pnpm test:agent` 运行 6 组集中检查，包括新版正反例、旧版兼容、真实测试密钥签发 JWT 的 HTTP 边界、跨域发现、限流与撤销；Postgres 测试验证第 121 次请求拒绝、窗口恢复、数据库通道 ACL、主体上下文不串线、过期与撤销；HTTP 测试只允许公开 JWKS 网络请求，断言数据库参数没有原 MCP token。没有引入新测试框架。
+`pnpm test:agent` 运行集中检查，包括新版正反例、旧版兼容、真实测试密钥签发 JWT 的 HTTP 边界、跨域发现、限流与撤销；Postgres 测试验证第 121 次请求拒绝、窗口恢复、数据库通道 ACL、主体上下文不串线、过期与撤销；HTTP 测试只允许公开 JWKS 网络请求，断言数据库参数没有原 MCP token。没有引入新测试框架。
 
 上线前必须执行 007、008 迁移并配置专用数据库角色、issuer、连接 Secret 与可信 CA，再部署新函数。构建后应在生产上用临时授权验证 `server/discover`、新版 tools/list／只读调用、旧版 initialize／tools/list 和坏镜像头拒绝；验证不修改真实任务，临时授权和客户端随后撤销／清理。

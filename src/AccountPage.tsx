@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { OAuthAuthorizationDetails, OAuthGrant, SupabaseClient, User } from '@supabase/supabase-js'
 import { createSupabaseBoardAdapter, getSupabaseConfig, type SupabaseBoardAdapter } from './storage'
 import { copy, type CopyKey } from './i18n'
+import { createAuthorizationLoader } from './auth-flow'
 import { validateStoredBoard } from './domain'
 import { restoreTrash, type RestoreTarget, type TrashEntry } from './agent-operations'
 import type { Language, StoredBoard } from './types'
@@ -70,6 +71,7 @@ export default function AccountPage() {
 function AccountContent({ cloud, user, t }: { cloud: SupabaseBoardAdapter; user: User; t: Translate }) {
   const authorizationId = useMemo(() => new URLSearchParams(window.location.search).get('authorization_id'), [])
   const consentRoute = window.location.pathname === '/oauth/consent'
+  const [loadAuthorization] = useState(() => createAuthorizationLoader((id: string) => cloud.client.auth.oauth.getAuthorizationDetails(id)))
   const [details, setDetails] = useState<OAuthAuthorizationDetails | null>(null)
   const [client, setClient] = useState<SupabaseClient | null>(null)
   const [board, setBoard] = useState<StoredBoard | null>(null)
@@ -110,21 +112,22 @@ function AccountContent({ cloud, user, t }: { cloud: SupabaseBoardAdapter; user:
     setBoard(validateStoredBoard(rows[0])); setGrants(grantsResult.data); setTrash(trashRows); setAudit(auditRows)
   }, [client, cloud, trashOffset, auditOffset, currentUser])
   useEffect(() => {
-    if (consentRoute) {
-      if (!authorizationId || authorizationId.length > 400) { setStatus('accountAuthorizationInvalid'); return }
-      let active = true
-      void cloud.client.auth.oauth.getAuthorizationDetails(authorizationId).then(async ({ data, error }) => {
-        if (!active) return
-        if (error || !data) { setStatus('accountAuthorizationInvalid'); return }
-        await currentUser()
-        if (!active) return
-        if ('authorization_id' in data) setDetails(data)
-        else redirectToClient(data.redirect_url)
-      }).catch(report)
-      return () => { active = false }
-    }
-    void refresh().catch(report)
-  }, [consentRoute, authorizationId, cloud, currentUser, refresh, report])
+    if (!consentRoute) void refresh().catch(report)
+  }, [consentRoute, refresh, report])
+  useEffect(() => {
+    if (!consentRoute) return
+    if (!authorizationId || authorizationId.length > 400) { setStatus('accountAuthorizationInvalid'); return }
+    let active = true
+    void loadAuthorization(authorizationId).then(async ({ data, error }) => {
+      if (!active) return
+      if (error || !data) { setStatus('accountAuthorizationInvalid'); return }
+      await currentUser()
+      if (!active) return
+      if ('authorization_id' in data) setDetails(data)
+      else redirectToClient(data.redirect_url)
+    }).catch((error) => { if (active) report(error) })
+    return () => { active = false }
+  }, [consentRoute, authorizationId, loadAuthorization, currentUser, report])
   async function run(work: () => Promise<void>) {
     if (busy) return
     setBusy(true); setStatus(null)

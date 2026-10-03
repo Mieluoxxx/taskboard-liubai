@@ -1,3 +1,12 @@
+/** 已同意的授权请求可能在读取时签发一次性回调；同一页面重订阅不能重复消费它。 */
+export function createAuthorizationLoader<T>(load: (id: string) => Promise<T>): (id: string) => Promise<T> {
+  let current: { id: string; promise: Promise<T> } | undefined
+  return (id) => {
+    if (current?.id !== id) current = { id, promise: load(id) }
+    return current.promise
+  }
+}
+
 export interface AuthIdentity {
   id: string
   email?: string
