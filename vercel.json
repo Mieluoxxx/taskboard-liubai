@@ -1,5 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": { "api/mcp.ts": { "maxDuration": 60 } },
+  "rewrites": [
+    { "source": "/oauth/consent", "destination": "/index.html" },
+    { "source": "/account", "destination": "/index.html" },
+    { "source": "/.well-known/oauth-protected-resource", "destination": "/api/oauth-protected-resource" },
+    { "source": "/.well-known/oauth-protected-resource/api/mcp", "destination": "/api/oauth-protected-resource" }
+  ],
   "headers": [
     {
       "source": "/fonts/(.*)",

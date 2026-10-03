@@ -1,5 +1,8 @@
-import { StrictMode } from 'react'
+import { lazy, StrictMode, Suspense } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
 
-createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>)
+const AccountPage = lazy(() => import('./AccountPage'))
+const accountRoute = ['/account', '/oauth/consent'].includes(window.location.pathname)
+
+createRoot(document.getElementById('root')!).render(<StrictMode><Suspense fallback={<div role="status">…</div>}>{accountRoute ? <AccountPage /> : <App />}</Suspense></StrictMode>)

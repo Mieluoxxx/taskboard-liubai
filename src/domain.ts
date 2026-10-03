@@ -1,4 +1,4 @@
-import { BoardError } from './notices'
+import { BoardError } from './notices.js'
 import type { BoardSnapshot, Domain, FocusBlock, FocusStatus, GoalCycle, Task, TaskColor } from './types'
 
 export const MAX_BOARD_BYTES = 900_000

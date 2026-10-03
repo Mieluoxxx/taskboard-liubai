@@ -43,12 +43,32 @@ cp .env.example .env.local
 pnpm dev
 ```
 
-后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`005` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。已有部署须先执行 `005_project_task_scope.sql`，再发布前端。
+后端用 Supabase：邮箱密码登录，每个账号只能看到自己的板。`supabase/migrations/` 里的 `001`–`006` 依次执行，再把 `VITE_SUPABASE_URL` 与 publishable key 填进 `.env.local`。已有部署先补齐迁移，再发布前端。
 
-前端是纯静态产物，`pnpm build` 之后把 `dist/` 丢给任意静态托管都行。
+看板前端可以静态托管；MCP 连接器还需要 `api/` 中的 Node 24 服务端函数，推荐部署完整仓库到 Vercel。
 
 界面字体是自托管的 Maple Mono NF CN，不请求任何第三方 CDN。
 
 设计取舍与不变量见 [`docs/SPEC.md`](docs/SPEC.md)。
+
+## Claude Chat / MCP
+
+在 Claude 连接器中添加 `https://taskboard-liubai.vercel.app/api/mcp`，登录留白后授权自己的看板。支持其他兼容 MCP 客户端，不需要在聊天中提供密码或 API Key。
+
+云端网页与 Agent 共用 30 天回收站和 90 天审计；完整读写、原子批量操作和冲突保护共用现有领域规则。看板设置中的「授权、回收站与审计」可撤销授权、恢复数据；永久清除仅允许网页用户操作。
+
+部署与最小验证见 [`docs/MCP.md`](docs/MCP.md)。
+
+## Agent Skill
+
+[`skills/liubai-taskboard/SKILL.md`](skills/liubai-taskboard/SKILL.md) 包含 MCP 操作规范，并附带网页与本地使用说明。Claude 可上传 [Skill ZIP](https://taskboard-liubai.vercel.app/liubai-taskboard-skill.zip)；修改 Skill 后运行 `pnpm skill:package` 重新打包。
+
+在仓库根目录用 Pi 显式加载（根目录 `skills/` 不属于默认自动发现位置）：
+
+```bash
+pi --skill ./skills/liubai-taskboard
+```
+
+会话中使用 `/skill:liubai-taskboard`，例如 `/skill:liubai-taskboard 指导使用本地演示板并创建今天的计划`；修改已加载的 Skill 后执行 `/reload`。
 
 [MIT](LICENSE)
