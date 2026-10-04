@@ -1,38 +1,29 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { DndContext, KeyboardSensor, PointerSensor, closestCenter, pointerWithin, useSensor, useSensors, type Announcements, type KeyboardCoordinateGetter } from '@dnd-kit/core'
-import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   activeTasks,
-  tasksForPlacement,
-  cycleForNavigation,
-  MAX_TASK_TITLE_LENGTH,
-  MAX_TASK_NOTE_LENGTH,
   addCycle,
-  deleteCycle,
+  addDays,
   addFocusBlock,
   addTask,
-  addDays,
+  carryForwardTasks,
   cloneSnapshot,
-  mergeSnapshots,
-  reapplyReorder,
-  reorderOrigin,
-  reorderCycleTo,
   compareDateKeys,
   createFocusBlock,
   createTask,
-  carryForwardTasks,
-  carriedFromLabels,
-  dateKeysInRange,
+  cycleForNavigation,
+  deleteCycle,
   deleteFocusBlock,
   deleteTask,
   elapsedMsAt,
-  focusDisplayStatus,
-  formatDateKey,
-  linkedChainIds,
-  isoDay,
+  MAX_TASK_NOTE_LENGTH,
+  MAX_TASK_TITLE_LENGTH,
+  MAX_TIMER_MINUTES,
+  mergeSnapshots,
   moveDailyTask,
   moveWeeklyTask,
+  reapplyReorder,
+  reorderCycleTo,
+  reorderOrigin,
   reorderSibling,
   reorderSiblingTo,
   rescheduleDailyTask,
@@ -45,13 +36,43 @@ import {
   validateDurationMinutes,
   validateSnapshot,
   weekKey,
-  weekKeysInRange,
   weekRange,
 } from './domain'
 import { AuthLifecycle, type AuthIdentity, type AuthTransition } from './auth-flow'
 import { copy, type CopyKey } from './i18n'
 import { BoardError, isNoticeCode, type NoticeCode } from './notices'
 import { createDemoBoardAdapter, createSupabaseBoardAdapter, getSupabaseConfig, type SupabaseBoardAdapter } from './storage'
+import {
+  buildIndex,
+  commandsFor,
+  completeCommand,
+  fill,
+  formatClock,
+  fuzzyScore,
+  isAnswer,
+  isYes,
+  lookupRef,
+  parseDateArg,
+  parseLine,
+  parseMinutes,
+  parseQuickAdd,
+  parseRef,
+  parseWeekArg,
+  resolveCommand,
+  restAfter,
+  SCOPE_DOMAIN,
+  TASK_COLORS,
+  VIEW_KEYS,
+  VIEW_SCOPE,
+  VIEWS,
+  type CommandSpec,
+  type MenuItem,
+  type Selection,
+  type ShellContext,
+  type ViewName,
+} from './terminal'
+import { Banner, Echo, Lines, Menu, Prompt, ShellFrame, Spinner, useStickToBottom, useTheme, type Ask, type AskField, type ExternalMenu, type NavItem, type OutLine } from './Shell'
+import { BoardView, Dashboard, Finder, VIEW_LABEL, type BoardActions, type FinderItem } from './BoardViews'
 import type { BoardAdapter, BoardSnapshot, Domain, FocusBlock, GoalCycle, Language, StoredBoard, Task, TaskColor } from './types'
 import './fonts.css'
 import './styles.css'
@@ -61,13 +82,6 @@ const UNASSIGNED_CYCLE_ID = '' // 空串不是合法项目 id，避免与已有�
 type TaskPlacement = Pick<Task, 'cycleId' | 'weekKey' | 'dateKey'>
 type Screen = 'setup' | 'auth' | 'loading' | 'workspace'
 type SaveState = 'saved' | 'pending' | 'saving' | 'error' | 'offline'
-type DialogState =
-  | { kind: 'task'; task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement?: TaskPlacement }
-  | { kind: 'cycle'; cycle?: GoalCycle; initial?: { name: string; startDate: string; endDate: string } }
-  | { kind: 'focus'; block?: FocusBlock; initial?: FocusInput }
-  | { kind: 'settings' }
-  | { kind: 'reschedule'; task: Task }
-  | null
 
 type TaskInput = {
   title: string
@@ -95,6 +109,22 @@ type DraftOrigin =
 type PendingJob = { expectedRevision: number; snapshot: BoardSnapshot; draft: string | null; origin?: DraftOrigin }
 type AuthLoad = { userId: string; generation: number; promise: Promise<void> }
 
+type CycleInput = { name: string; startDate: string; endDate: string }
+type TaskWizardOptions = { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement?: TaskPlacement }
+
+// 滚动区里的每一条都是一次输出：命令回显 + 结果。视图块在被新视图取代时冻结成当时的快照，
+// 之后只读；永远只有最新的视图块是活的。
+type FrozenView = { snapshot: BoardSnapshot; selection: Selection; now: number }
+type EntryBody =
+  | { kind: 'lines'; lines: OutLine[] }
+  | { kind: 'view'; view: ViewName; frozen?: FrozenView }
+  | { kind: 'help'; context: ShellContext }
+type Entry = { id: number; echo?: string; result?: OutLine; body?: EntryBody }
+const MAX_ENTRIES = 60
+
+const COLOR_LABEL: Record<TaskColor, CopyKey> = { ink: 'colorInk', blue: 'colorBlue', orange: 'colorOrange', green: 'colorGreen', violet: 'colorViolet' }
+const DOMAIN_VIEW: Record<Domain, ViewName> = { long: 'goals', weekly: 'week', daily: 'day' }
+
 function readLanguage(): Language {
   try {
     return localStorage.getItem(LANGUAGE_KEY) === 'en' ? 'en' : 'zh'
@@ -118,15 +148,6 @@ function errorNotice(error: unknown, fallback: NoticeCode): NoticeCode | string 
   return fallback
 }
 
-function weekdayLabel(dateKey: string, language: Language): string {
-  const monday = new Date(Date.UTC(2024, 0, 1 + isoDay(dateKey) - 1, 12))
-  return new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en-US', { weekday: 'long', timeZone: 'UTC' }).format(monday)
-}
-
-function weekdayShortLabel(dateKey: string, language: Language): string {
-  const monday = new Date(Date.UTC(2024, 0, 1 + isoDay(dateKey) - 1, 12))
-  return new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en-US', { weekday: 'short', timeZone: 'UTC' }).format(monday)
-}
 
 function dateInRange(date: string, startDate: string, endDate: string): boolean {
   return compareDateKeys(date, startDate) >= 0 && compareDateKeys(date, endDate) <= 0
@@ -140,15 +161,6 @@ function clampDate(date: string, startDate: string, endDate: string): string {
 
 function dateForCycleSelection(preferredDate: string, cycle: GoalCycle, todayDate: string): string {
   return dateInRange(preferredDate, cycle.startDate, cycle.endDate) ? preferredDate : clampDate(todayDate, cycle.startDate, cycle.endDate)
-}
-
-// 日任务按日期、周任务按 ISO 周判断“已经过去”：同一套规则供建议条、面板提示与行内按钮复用。
-function isPastPlacement(task: Task, timeZone: string): boolean {
-  if (task.checked) return false
-  const today = todayInTimeZone(timeZone)
-  if (task.domain === 'daily') return Boolean(task.dateKey && task.dateKey < today)
-  if (task.domain === 'weekly') return Boolean(task.weekKey && task.weekKey < weekKey(today))
-  return false
 }
 
 function dateForWeek(key: string, cycle: GoalCycle | undefined, preferredDate: string): string {
@@ -186,10 +198,7 @@ export default function App() {
   const authLoadRef = useRef<AuthLoad | null>(null)
   const [user, setUser] = useState<AuthIdentity | null>(null)
   const userRef = useRef<AuthIdentity | null>(null)
-  const [authEmail, setAuthEmail] = useState('')
-  const [authPassword, setAuthPassword] = useState('')
   const [authBusy, setAuthBusy] = useState(false)
-  const [authError, setAuthError] = useState('')
   const [stored, setStored] = useState<StoredBoard | null>(null)
   const storedRef = useRef<StoredBoard | null>(null)
   // 三方合并的 base 必须是「上次与后端一致」的版本：若拿含本地改动的 stored 当 base，
@@ -210,18 +219,32 @@ export default function App() {
   const commitRef = useRef<((next: BoardSnapshot, draft: string | null) => boolean) | null>(null)
   const loadTokenRef = useRef(0)
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' || navigator.onLine)
-  const [dialog, setDialog] = useState<DialogState>(null)
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [selectedCycleId, setSelectedCycleId] = useState<string | null>(null)
   const [selectedWeek, setSelectedWeek] = useState(() => weekKey(todayInTimeZone(safeTimeZone())))
   const [selectedDate, setSelectedDate] = useState(() => todayInTimeZone(safeTimeZone()))
   const selectionRef = useRef<SelectionState>({ cycleId: null, date: selectedDate, week: selectedWeek })
   const [now, setNow] = useState(() => Date.now())
-  const workspaceScrollRef = useRef<HTMLDivElement | null>(null)
-  const [stageElement, setStageElement] = useState<HTMLDivElement | null>(null)
-  const panelRefs = useRef<Array<HTMLElement | null>>([])
-  const rowRefs = useRef(new Map<string, HTMLElement>())
   const [flash, setFlash] = useState('')
+  const theme = useTheme()
+  const [entries, setEntries] = useState<Entry[]>([])
+  const entryIdRef = useRef(0)
+  const [view, setView] = useState<ViewName>('day')
+  const viewRef = useRef<ViewName>('day')
+  const [ask, setAsk] = useState<Ask | null>(null)
+  const askIdRef = useRef(0)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [navMode, setNavMode] = useState(false)
+  const [finder, setFinder] = useState<string | null>(null)
+  const [helpMenu, setHelpMenu] = useState<{ entryId: number; index: number } | null>(null)
+  const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null)
+  const historyRef = useRef<string[]>([])
+  const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null)
+  const languageRef = useRef(language)
+  languageRef.current = language
+  // reopenDraft 是稳定回调，但要打开的是“当下”的编辑流程：用 ref 取每次渲染的最新版本。
+  const wizardsRef = useRef<{ task: (options: TaskWizardOptions) => void; cycle: (cycle?: GoalCycle, initial?: CycleInput) => void; focus: (block?: FocusBlock, initial?: FocusInput) => void } | null>(null)
+  const confirmRef = useRef<((question: string, onYes: () => void) => void) | null>(null)
 
   const t = useCallback((key: CopyKey) => copy[language][key], [language])
   // 提示不总是 notice code：适配器返回的诊断文本没有 code，不能假定它一定能本地化。
@@ -236,6 +259,41 @@ export default function App() {
     const selection = selectionForSnapshot(nextSnapshot, preferredCycleId, preferredDate)
     applySelection(selection)
   }, [applySelection])
+
+  const pushEntries = useCallback((next: Array<Omit<Entry, 'id'>>) => {
+    setEntries((current) => [...current, ...next.map((entry) => ({ ...entry, id: ++entryIdRef.current }))].slice(-MAX_ENTRIES))
+  }, [])
+  // 只有一行的短结果与回显同排显示（`> /done d1  [x] d1 …`），连续操作不会把视图挤出屏幕。
+  const print = useCallback((lines: OutLine[], echo?: string) => {
+    if (echo !== undefined && lines.length === 1 && !lines[0].cmd && !lines[0].key && lines[0].text.length <= 72) pushEntries([{ echo, result: lines[0] }])
+    else pushEntries([{ echo, body: lines.length ? { kind: 'lines', lines } : undefined }])
+  }, [pushEntries])
+  const freezeLive = useCallback(() => {
+    const board = storedRef.current
+    const selection = { ...selectionRef.current }
+    const frozenAt = Date.now()
+    setEntries((current) => current.flatMap((entry) => {
+      if (entry.body?.kind !== 'view' || entry.body.frozen) return [entry]
+      return board ? [{ ...entry, body: { ...entry.body, frozen: { snapshot: board.snapshot, selection, now: frozenAt } } }] : []
+    }))
+  }, [])
+  const appendView = useCallback((next: ViewName, echo?: string) => {
+    viewRef.current = next
+    setView(next)
+    pushEntries([{ echo, body: { kind: 'view', view: next } }])
+  }, [pushEntries])
+  const announceBoard = useCallback((board: StoredBoard, mode: 'demo' | 'cloud') => {
+    const words = copy[languageRef.current]
+    // 重新载入时旧的活视图属于上一份数据，直接丢弃，避免两个“活”视图同时存在。
+    setEntries((current) => current.filter((entry) => entry.body?.kind !== 'view' || entry.body.frozen))
+    pushEntries([
+      { body: { kind: 'lines', lines: [
+        { text: fill(words.boardLoaded, { rev: board.revision, projects: board.snapshot.cycles.length, tasks: activeTasks(board.snapshot).length }), tone: 'ok' },
+        ...(mode === 'demo' ? [{ text: words.demoNote, tone: 'dim' as const }] : []),
+      ] } },
+    ])
+    appendView('day')
+  }, [appendView, pushEntries])
 
   useEffect(() => { persistLanguage(language) }, [language])
   useEffect(() => { screenRef.current = screen }, [screen])
@@ -276,12 +334,16 @@ export default function App() {
     setSelectedDate(resetDate)
     setSelectedWeek(weekKey(resetDate))
     setDraftLabel(null)
-    setAuthPassword('')
-    setAuthError('')
+    setEntries([])
+    setAsk(null)
+    setHelpMenu(null)
+    setFinder(null)
+    setNavMode(false)
+    setExpandedId(null)
+    historyRef.current = []
     setSaveMessage('')
     setFailureKind(null)
     setSaveState('saved')
-    setDialog(null)
     setScreen(nextScreen)
   }, [])
 
@@ -317,6 +379,7 @@ export default function App() {
       setStored(safeBoard)
       setBoardLoadToken((value) => value + 1)
       setScreen('workspace')
+      announceBoard(safeBoard, nextAdapter.mode)
       // 未完成的过去任务直接顺延到当前周期（周→本周，日→今天），不弹确认条；走同一条 CAS 保存路径，
       // 失败/离线照常进入重试与草稿提示。顺延本身出错时不能拖垮加载，只记日志。
       try {
@@ -331,7 +394,7 @@ export default function App() {
       setSaveState('error')
       setSaveMessage(message)
     }
-  }, [authLifecycle, clearPrivateState])
+  }, [announceBoard, authLifecycle, clearPrivateState])
 
   const openSessionBoard = useCallback(async (cloud: SupabaseBoardAdapter, expectedUserId: string, expectedAuthGeneration = authLifecycle.generation()) => {
     if (userRef.current?.id !== expectedUserId || !authLifecycle.isCurrent(expectedAuthGeneration)) return
@@ -594,7 +657,7 @@ export default function App() {
   }, [])
 
   const discardDirectConflict = useCallback(() => {
-    if (window.confirm(t('confirmDiscardDirect'))) void reloadLatest(false)
+    confirmRef.current?.(t('confirmDiscardDirect'), () => void reloadLatest(false))
   }, [reloadLatest, t])
 
   const previousOnlineRef = useRef(online)
@@ -643,15 +706,15 @@ export default function App() {
       if (origin.taskId && !existing) { setFlash(copy[language].draftTargetMissing); return }
       if (origin.placement.cycleId && !board.cycles.some((cycle) => cycle.id === origin.placement.cycleId)) { setFlash(copy[language].draftTargetMissing); return }
       reconcileSelection(board, origin.placement.cycleId || UNASSIGNED_CYCLE_ID, origin.placement.dateKey || (origin.placement.weekKey ? weekRange(origin.placement.weekKey).start : selectionRef.current.date))
-      setDialog({ kind: 'task', task: existing, domain: origin.domain, parentId: origin.parentId, initial: origin.input, placement: origin.placement })
+      wizardsRef.current?.task({ task: existing, domain: origin.domain, parentId: origin.parentId, initial: origin.input, placement: origin.placement })
     } else if (origin.kind === 'cycle') {
       const existing = origin.cycleId ? board.cycles.find((cycle) => cycle.id === origin.cycleId) : undefined
       if (origin.cycleId && !existing) { setFlash(copy[language].draftTargetMissing); return }
-      setDialog({ kind: 'cycle', cycle: existing, initial: origin.input })
+      wizardsRef.current?.cycle(existing, origin.input)
     } else {
       const existing = origin.blockId ? board.focusBlocks.find((block) => block.id === origin.blockId) : undefined
       if (origin.blockId && !existing) { setFlash(copy[language].draftTargetMissing); return }
-      setDialog({ kind: 'focus', block: existing, initial: origin.input })
+      wizardsRef.current?.focus(existing, origin.input)
     }
   }, [language, reloadLatest, reconcileSelection])
 
@@ -659,29 +722,29 @@ export default function App() {
     void openBoard(createDemoBoardAdapter())
   }, [openBoard])
 
-  const signIn = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
+  const signIn = async (email: string, password: string) => {
     const cloud = cloudRef.current
-    if (!cloud || !authEmail.trim() || !authPassword) return
+    if (!cloud || !email.trim() || !password) return
     const attempt = authLifecycle.beginLogin()
     if (attempt === null) return
     setAuthBusy(true)
-    setAuthError('')
     try {
-      const result = await cloud.signIn(authEmail.trim(), authPassword)
+      const result = await cloud.signIn(email.trim(), password)
       if (!authLifecycle.isLoginCurrent(attempt)) return
       if (!result.ok) {
-        setAuthError(result.code ? t(result.code) : result.message || t('invalidCredentials'))
+        print([{ text: result.code ? t(result.code) : result.message || t('invalidCredentials'), tone: 'err' }])
+        startLogin(email.trim())
         return
       }
       const transition = authLifecycle.completeLogin(attempt, userRef.current, result.value, screenRef.current, Boolean(storedRef.current))
       if (!transition) return
       applyAuthTransition(cloud, transition)
-      setAuthPassword('')
+      print([{ text: fill(t('welcome'), { email: result.value.email || email.trim() }), tone: 'ok' }])
     } catch (caught) {
       if (!authLifecycle.isLoginCurrent(attempt)) return
       if (caught instanceof Error) console.warn('[taskboard]', caught.message)
-      setAuthError(t('cloudError'))
+      print([{ text: t('cloudError'), tone: 'err' }])
+      startLogin(email.trim())
     } finally {
       if (authLifecycle.finishLogin(attempt)) setAuthBusy(false)
     }
@@ -710,34 +773,6 @@ export default function App() {
     }
   }
 
-  useEffect(() => {
-    if (!flash) return
-    const timeout = window.setTimeout(() => setFlash(''), 3500)
-    return () => window.clearTimeout(timeout)
-  }, [flash])
-
-  useEffect(() => {
-    if (screen !== 'workspace') return
-    const onKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null
-      if (target?.closest('.drag-handle')) { if (event.key.startsWith('Arrow')) event.preventDefault(); return }
-      if (event.defaultPrevented || target?.closest('[role="dialog"]')) return
-      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
-      if (target?.isContentEditable) return
-      if (event.key === 'Escape') { setDialog(null); return }
-      if (/^[1-4]$/.test(event.key)) {
-        event.preventDefault()
-        panelRefs.current[Number(event.key) - 1]?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'start' })
-      }
-      if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
-        event.preventDefault()
-        workspaceScrollRef.current?.scrollBy({ left: event.key === 'ArrowRight' ? 460 : -460, behavior: 'smooth' })
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [screen])
-
   const updateSnapshot = (operation: (snapshot: BoardSnapshot) => BoardSnapshot, draft: string | null, origin?: DraftOrigin) => {
     const current = storedRef.current
     if (!current) return
@@ -751,9 +786,10 @@ export default function App() {
     }
   }
 
-  const submitTask = (input: TaskInput, existing?: Task, domain?: Domain, parentId?: string, placement?: TaskPlacement) => {
+  // 返回新建或更新的任务 id；失败时返回 null（提示已由保存状态或滚动区给出）。
+  const submitTask = (input: TaskInput, existing?: Task, domain?: Domain, parentId?: string, placement?: TaskPlacement): string | null => {
     const current = storedRef.current
-    if (!current) return
+    if (!current) return null
     const targetDomain = domain || existing?.domain || 'daily'
     const base = placement || {
       cycleId: existing ? existing.cycleId : selectedCycle?.id,
@@ -772,20 +808,21 @@ export default function App() {
         : dateInRange(targetPlacement.dateKey || selectedDate, selectedCycle.startDate, selectedCycle.endDate)
       if (!placeable) {
         setFlash(t('selectionOutsideCycle'))
-        return
+        return null
       }
     }
     const draft = `${t('title')}: ${input.title.trim()}`
     const now = new Date().toISOString()
     try {
       let next: BoardSnapshot
+      let id = existing?.id
       if (existing) {
         next = updateTask(current.snapshot, existing.id, { title: input.title, note: input.note, color: input.color, upperTaskId: input.parentId ? undefined : input.upperTaskId, parentId: input.parentId }, now)
         // 改日期/周单独走重排：它会带上子任务，并拒绝超出项目周期的放置。
         if (input.dateKey && input.dateKey !== existing.dateKey) next = moveDailyTask(next, existing.id, input.dateKey, now)
         if (input.weekKey && input.weekKey !== existing.weekKey) next = moveWeeklyTask(next, existing.id, input.weekKey, now)
       } else {
-        next = addTask(current.snapshot, createTask({
+        const created = createTask({
           domain: targetDomain,
           title: input.title,
           note: input.note,
@@ -793,19 +830,22 @@ export default function App() {
           parentId: parentId || input.parentId,
           upperTaskId: parentId || input.parentId ? undefined : input.upperTaskId,
           ...targetPlacement,
-        }))
+        })
+        id = created.id
+        next = addTask(current.snapshot, created)
       }
-      if (commitSnapshot(next, draft, { kind: 'task', input, taskId: existing?.id, domain: targetDomain, parentId, placement: targetPlacement })) setDialog(null)
+      return commitSnapshot(next, draft, { kind: 'task', input, taskId: existing?.id, domain: targetDomain, parentId, placement: targetPlacement }) ? id! : null
     } catch (caught) {
       setSaveState('error')
       setSaveMessage(errorNotice(caught, 'noticeTaskSaveFailed'))
       setDraftLabel(draft)
+      return null
     }
   }
 
-  const submitCycle = (input: { name: string; startDate: string; endDate: string }, existing?: GoalCycle) => {
+  const submitCycle = (input: CycleInput, existing?: GoalCycle): boolean => {
     const current = storedRef.current
-    if (!current) return
+    if (!current) return false
     try {
       let next: BoardSnapshot
       if (!existing) next = addCycle(current.snapshot, input.name, input.startDate, input.endDate)
@@ -821,171 +861,846 @@ export default function App() {
         const created = next.cycles.find((cycle) => !existing && cycle.name === input.name.trim())
         const nextCycleId = existing?.id || created?.id || selectedCycleId
         reconcileSelection(next, nextCycleId, selectionRef.current.date)
-        setDialog(null)
+        return true
       }
+      return false
     } catch (caught) {
       setSaveState('error'); setSaveMessage(errorNotice(caught, 'noticeCycleSaveFailed')); setDraftLabel(input.name)
+      return false
     }
   }
 
-  const submitFocus = (input: FocusInput, existing?: FocusBlock) => {
+  const submitFocus = (input: FocusInput, existing?: FocusBlock): string | null => {
     const current = storedRef.current
-    if (!current) return
+    if (!current) return null
     if (!existing && selectedCycle && !dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)) {
       setFlash(t('selectionOutsideCycle'))
-      return
+      return null
     }
     const draft = `${t('focusTitle')}: ${input.title.trim()}`
     try {
       const duration = validateDurationMinutes(input.durationMinutes)
+      const created = existing ? undefined : createFocusBlock({ dateKey: selectedDate, title: input.title, taskId: input.taskId || undefined, durationMinutes: duration })
       const next = existing
         ? updateFocusBlock(current.snapshot, existing.id, { title: input.title.trim(), durationMinutes: duration, taskId: input.taskId || undefined })
-        : addFocusBlock(current.snapshot, createFocusBlock({ dateKey: selectedDate, title: input.title, taskId: input.taskId || undefined, durationMinutes: duration }))
-      if (commitSnapshot(next, draft, { kind: 'focus', input, blockId: existing?.id })) setDialog(null)
+        : addFocusBlock(current.snapshot, created!)
+      return commitSnapshot(next, draft, { kind: 'focus', input, blockId: existing?.id }) ? (existing?.id ?? created!.id) : null
     } catch (caught) {
       setSaveState('error'); setSaveMessage(errorNotice(caught, 'noticeFocusSaveFailed')); setDraftLabel(draft)
+      return null
     }
   }
 
-  const selectedChain = useMemo(() => stored ? (selectedTaskId ? linkedChainIds(stored.snapshot, selectedTaskId) : new Set<string>()) : new Set<string>(), [stored, selectedTaskId])
+
+  const snapshot = stored?.snapshot ?? null
+  const selectedCycle = snapshot ? (selectedCycleId === UNASSIGNED_CYCLE_ID ? undefined : snapshot.cycles.find((cycle) => cycle.id === selectedCycleId) || snapshot.cycles[0]) : undefined
+  const navigationCycle = snapshot ? cycleForNavigation(snapshot, selectedCycle) : undefined
   const currentZone = stored?.snapshot.settings.timeZone || safeTimeZone()
-  // “今天”只算一次，供两条周期轨道标注本周/本日（与“选中”是两件事）。
+  // “今天”只算一次，供跳转、标签页与状态栏共用（与“正在看的那天”是两件事）。
   const todayKey = todayInTimeZone(currentZone)
   const currentWeekKey = weekKey(todayKey)
   const runningBlock = stored?.snapshot.focusBlocks.find((block) => block.status === 'running')
   const failedOrigin = failedJobRef.current?.origin
   const canReopenDraft = failedOrigin?.kind === 'task' || failedOrigin?.kind === 'cycle' || failedOrigin?.kind === 'focus'
+  const context: ShellContext = screen === 'workspace' ? 'board' : 'guest'
+  const liveSelection: Selection = useMemo(() => ({ cycleId: selectedCycleId, week: selectedWeek, date: selectedDate }), [selectedCycleId, selectedWeek, selectedDate])
 
-  if (screen === 'setup') {
-    return <SetupScreen language={language} setLanguage={setLanguage} t={t} onDemo={openDemo} />
-  }
-  if (screen === 'auth') {
-    return <AuthScreen language={language} setLanguage={setLanguage} t={t} email={authEmail} password={authPassword} setEmail={setAuthEmail} setPassword={setAuthPassword} busy={authBusy} error={authError || (saveState === 'error' ? noticeLabel(saveMessage) : '')} onSubmit={signIn} />
-  }
-  if (screen === 'loading' || !stored) {
-    return <LoadingScreen language={language} t={t} />
-  }
-
-  const snapshot = stored.snapshot
-  const selectedCycle = selectedCycleId === UNASSIGNED_CYCLE_ID ? undefined : snapshot.cycles.find((cycle) => cycle.id === selectedCycleId) || snapshot.cycles[0]
-  const navigationCycle = cycleForNavigation(snapshot, selectedCycle)
-  const selectCycle = (cycleId: string) => reconcileSelection(snapshot, cycleId, selectionRef.current.date)
+  const selectCycle = (cycleId: string) => { if (snapshot) reconcileSelection(snapshot, cycleId, selectionRef.current.date) }
   const selectWeek = (key: string) => {
     const date = dateForWeek(key, navigationCycle, selectionRef.current.date)
     applySelection({ cycleId: selectedCycle?.id || UNASSIGNED_CYCLE_ID, date, week: key })
   }
-  const setDate = (date: string, allowOutsideCycle = false) => {
+  // 返回实际落到的日期：超出项目范围时会被夹回边界，调用方据此提示。
+  const setDate = (date: string, allowOutsideCycle = false): string => {
     const nextDate = !allowOutsideCycle && navigationCycle ? clampDate(date, navigationCycle.startDate, navigationCycle.endDate) : date
     applySelection({ cycleId: selectedCycle?.id || UNASSIGNED_CYCLE_ID, date: nextDate, week: weekKey(nextDate) })
+    return nextDate
   }
-  const panelRef = (index: number) => (element: HTMLElement | null) => { panelRefs.current[index] = element }
-  const registerRow = (id: string) => (element: HTMLElement | null) => {
-    if (element) rowRefs.current.set(id, element)
-    else rowRefs.current.delete(id)
+  const currentIndex = () => buildIndex(storedRef.current!.snapshot, selectionRef.current)
+  const refFor = (id: string) => (storedRef.current ? buildIndex(storedRef.current.snapshot, selectionRef.current).refOf.get(id) || '' : '')
+  const focusPrompt = () => requestAnimationFrame(() => inputRef.current?.focus())
+
+  const showView = (next: ViewName, echo?: string, select?: () => OutLine | void) => {
+    if (screenRef.current !== 'workspace') return
+    freezeLive()
+    const note = select?.()
+    setExpandedId(null)
+    appendView(next, echo)
+    if (note) print([note])
+  }
+  const goDate = (date: string, allowOutsideCycle = false): OutLine | void => {
+    const landed = setDate(date, allowOutsideCycle)
+    if (landed !== date) return { text: fill(t('dateClamped'), { date: landed }), tone: 'warn' }
+  }
+  const clearScreen = () => {
+    setEntries([])
+    setHelpMenu(null)
+    if (screenRef.current === 'workspace') appendView(viewRef.current)
   }
 
-  const panelTasks = (domain: Domain) => tasksForPlacement(snapshot, domain, { cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate })
-  // 过去未完成的任务不再用顶部提示条确认：周任务在载入时已经自动顺延（见 openBoard），
-  // 日任务保留面板提示与行内“建议重新安排”作为手动入口。
+  const openAsk = (spec: Omit<Ask, 'id'>) => {
+    setNavMode(false)
+    setHelpMenu(null)
+    setAsk({
+      ...spec,
+      id: ++askIdRef.current,
+      onDone: (values) => { setAsk(null); spec.onDone(values) },
+      onCancel: () => { setAsk(null); print([{ text: t('cancelled'), tone: 'dim' }]); spec.onCancel?.() },
+    })
+    focusPrompt()
+  }
+  const confirm = (question: string, onYes: () => void) => openAsk({
+    title: question,
+    fields: [{ key: 'answer', label: '[y/N]', validate: (value) => (isAnswer(value) ? null : t('answerYesNo')) }],
+    onDone: ({ answer }) => { if (isYes(answer)) onYes(); else print([{ text: t('cancelled'), tone: 'dim' }]) },
+  })
+  confirmRef.current = confirm
 
-  // 「回到当前」只在今天/本周仍在所选周期范围内、且已离开当前周期时出现。
-  const canGoCurrentWeek = !navigationCycle || (currentWeekKey >= weekKey(navigationCycle.startDate) && currentWeekKey <= weekKey(navigationCycle.endDate))
-  const canGoToday = !navigationCycle || dateInRange(todayKey, navigationCycle.startDate, navigationCycle.endDate)
-  const goCurrentWeek = canGoCurrentWeek && selectedWeek !== currentWeekKey ? <ReturnToCurrent label={t('thisWeek')} hint={t('backToCurrentWeek')} onClick={() => selectWeek(currentWeekKey)} /> : null
-  const goToday = canGoToday && selectedDate !== todayKey ? <ReturnToCurrent label={t('today')} hint={t('backToCurrentDay')} onClick={() => setDate(todayKey)} /> : null
+  const startLogin = (email?: string) => openAsk({
+    fields: [
+      { key: 'email', label: 'login', type: 'email', autoComplete: 'username', initial: email || '', placeholder: 'you@example.com', validate: (value) => (/^\S+@\S+\.\S+$/.test(value) ? null : t('emailInvalid')) },
+      { key: 'password', label: 'password', type: 'password', autoComplete: 'current-password', placeholder: t('passwordNoEcho'), validate: (value) => (value ? null : t('passwordRequired')) },
+    ],
+    onDone: ({ email: address, password }) => {
+      print([{ text: `login: ${address}`, tone: 'dim' }, { text: 'password:', tone: 'dim' }])
+      void signIn(address, password)
+    },
+  })
 
-  const taskForFocus = activeTasks(snapshot, 'daily')
-  const canCreateInCycle = !selectedCycle || dateInRange(selectedDate, selectedCycle.startDate, selectedCycle.endDate)
-  // 日期选择的上限来自任务自己的项目；未归属任务没有周期，因此不限制。
-  const taskDialogCycle = dialog?.kind === 'task'
-    ? (dialog.task ? snapshot.cycles.find((entry) => entry.id === dialog.task?.cycleId) : selectedCycle)
-    : undefined
+  const openTaskWizard = ({ task, domain, parentId, initial, placement }: TaskWizardOptions) => {
+    const board = storedRef.current
+    if (!board) return
+    const tasks = activeTasks(board.snapshot)
+    const index = buildIndex(board.snapshot, selectionRef.current)
+    const base: TaskPlacement = placement || { cycleId: task ? task.cycleId : selectedCycle?.id, weekKey: task?.weekKey ?? selectionRef.current.week, dateKey: task?.dateKey ?? selectionRef.current.date }
+    // 子任务的放置由父任务决定，只有顶层任务能改日期（日）或周次（周）。
+    const parent = initial?.parentId ?? (parentId || task?.parentId)
+    const canEditDate = domain === 'daily' && !parent
+    const canEditWeek = domain === 'weekly' && !parent
+    const baseDate = base.dateKey || selectionRef.current.date
+    const baseWeek = base.weekKey || selectionRef.current.week
+    const keptUpper = initial?.upperTaskId || task?.upperTaskId
+    const upperDomain: Domain = domain === 'weekly' ? 'long' : 'weekly'
+    const ownCycle = task ? task.cycleId : base.cycleId
+    // 候选必须与任务落在同一项目，并与“上级所在域”的放置一致（周←项目、日←同一周）；
+    // 改了日期就按新日期所在周重算，已存的关联始终列入，避免显示空白。
+    const upperItems = (values: Record<string, string>): MenuItem[] => {
+      const date = canEditDate ? parseDateArg(values.date, baseDate, todayKey) : null
+      const week = canEditWeek ? parseWeekArg(values.week, baseWeek, currentWeekKey) : null
+      const target: TaskPlacement = date ? { ...base, weekKey: weekKey(date), dateKey: date } : week ? { ...base, weekKey: week } : base
+      const keyOf = (source: TaskPlacement) => (upperDomain === 'long' ? source.cycleId : source.weekKey)
+      const candidates = tasks.filter((candidate) => !candidate.parentId && candidate.domain === upperDomain && candidate.id !== task?.id && candidate.cycleId === ownCycle && (candidate.id === keptUpper || keyOf(candidate) === keyOf(target)))
+      return [{ id: 'none', value: '', label: t('none') }, ...candidates.map((candidate) => ({ id: candidate.id, value: candidate.id, label: `${index.refOf.get(candidate.id) ? `${index.refOf.get(candidate.id)}  ` : ''}${candidate.title}` }))]
+    }
+    const fields: AskField[] = [
+      { key: 'title', label: t('title'), initial: initial?.title ?? task?.title ?? '', maxLength: MAX_TASK_TITLE_LENGTH, validate: (value) => (value.trim() ? null : t('titleRequired')) },
+      { key: 'note', label: t('note'), type: 'note', initial: initial?.note ?? task?.note ?? '', maxLength: MAX_TASK_NOTE_LENGTH },
+      { key: 'color', label: t('color'), initial: initial?.color || task?.color || 'ink', options: TASK_COLORS.map((color) => ({ id: color, value: color, label: `■ ${t(COLOR_LABEL[color])}`, meta: color })) },
+    ]
+    if (canEditDate) fields.push({ key: 'date', label: t('date'), initial: initial?.dateKey || task?.dateKey || base.dateKey || '', placeholder: 'YYYY-MM-DD · +1 · fri', validate: (value) => (parseDateArg(value, baseDate, todayKey) ? null : t('dateInvalid')) })
+    if (canEditWeek) fields.push({ key: 'week', label: t('week'), initial: initial?.weekKey || task?.weekKey || base.weekKey || '', placeholder: '2026-W41 · +1', validate: (value) => (parseWeekArg(value, baseWeek, currentWeekKey) ? null : t('weekInvalid')) })
+    if (!parent && domain !== 'long') fields.push({ key: 'upper', label: t('association'), initial: keptUpper || '', options: upperItems })
+    const ref = task ? index.refOf.get(task.id) : undefined
+    openAsk({
+      title: task ? `${t('edit')} ${ref ? `${ref} ` : ''}${task.title}` : `${parentId ? t('addSubtask') : t('addTask')} · ${t(VIEW_LABEL[DOMAIN_VIEW[domain]])}`,
+      fields,
+      onDone: (values) => {
+        const input: TaskInput = {
+          title: values.title,
+          note: values.note,
+          color: values.color as TaskColor,
+          dateKey: canEditDate ? parseDateArg(values.date, baseDate, todayKey) || undefined : undefined,
+          weekKey: canEditWeek ? parseWeekArg(values.week, baseWeek, currentWeekKey) || undefined : undefined,
+          upperTaskId: parent ? undefined : values.upper || undefined,
+          parentId: parent || undefined,
+        }
+        const id = submitTask(input, task, domain, parentId, placement)
+        if (id) print([{ text: `${task ? '✓' : '+'} ${refFor(id)} ${input.title.trim()}`.replace('  ', ' '), tone: 'ok' }])
+      },
+    })
+  }
+
+  const openCycleWizard = (cycle?: GoalCycle, initial?: CycleInput) => {
+    const parse = (value: string | undefined, base = todayKey) => parseDateArg(value, base, todayKey)
+    openAsk({
+      title: cycle ? `${t('editCycle')} · ${cycle.name}` : t('addCycle'),
+      fields: [
+        { key: 'name', label: t('cycleName'), initial: initial?.name ?? cycle?.name ?? '', maxLength: 160, validate: (value) => (value.trim() ? null : t('nameRequired')) },
+        { key: 'start', label: t('startDate'), initial: initial?.startDate ?? cycle?.startDate ?? todayKey, validate: (value) => (parse(value) ? null : t('dateInvalid')) },
+        { key: 'end', label: t('endDate'), initial: initial?.endDate ?? cycle?.endDate ?? addDays(todayKey, 30), placeholder: '+30', validate: (value, values) => {
+          const start = parse(values.start)
+          const end = parse(value, start || todayKey)
+          return !end ? t('dateInvalid') : start && compareDateKeys(start, end) > 0 ? t('rangeInvalid') : null
+        } },
+      ],
+      onDone: (values) => {
+        const startDate = parse(values.start)!
+        const input = { name: values.name.trim(), startDate, endDate: parse(values.end, startDate)! }
+        if (submitCycle(input, cycle)) print([{ text: `✓ ${input.name}  ${input.startDate} → ${input.endDate}`, tone: 'ok' }])
+      },
+    })
+  }
+
+  const openFocusWizard = (block?: FocusBlock, initial?: FocusInput) => {
+    const board = storedRef.current
+    if (!board) return
+    const locked = Boolean(block && (block.status !== 'paused' || block.elapsedMs > 0))
+    const date = block?.dateKey || selectionRef.current.date
+    const index = buildIndex(board.snapshot, selectionRef.current)
+    const taskItems: MenuItem[] = [{ id: 'none', value: '', label: t('none') }, ...activeTasks(board.snapshot, 'daily').filter((task) => task.dateKey === date || task.id === block?.taskId).map((task) => ({ id: task.id, value: task.id, label: `${index.refOf.get(task.id) ? `${index.refOf.get(task.id)}  ` : ''}${task.title}` }))]
+    openAsk({
+      title: block ? `${t('edit')} ${index.refOf.get(block.id) || ''} ${block.title}${locked ? ` · ${t('focusDurationLocked')}` : ''}` : `${t('add')} · ${t('navFocus')} ${date.slice(5)}`,
+      fields: [
+        { key: 'title', label: t('focusTitle'), initial: initial?.title ?? block?.title ?? '', maxLength: 300, validate: (value) => (value.trim() ? null : t('titleRequired')) },
+        { key: 'minutes', label: t('duration'), initial: initial?.durationMinutes ?? String(block?.durationMinutes ?? 45), placeholder: '45 · 25m · 1.5h', skip: () => locked, validate: (value) => { const minutes = parseMinutes(value); return minutes && minutes > 0 && minutes <= MAX_TIMER_MINUTES ? null : t('noticeTimerDuration') } },
+        { key: 'task', label: t('focusTask'), initial: initial?.taskId ?? block?.taskId ?? '', options: taskItems },
+      ],
+      onDone: (values) => {
+        const input: FocusInput = { title: values.title, durationMinutes: locked && block ? String(block.durationMinutes) : String(parseMinutes(values.minutes)), taskId: values.task || undefined }
+        const id = submitFocus(input, block)
+        if (id) print([{ text: `${block ? '✓' : '+'} ${refFor(id)} ${input.title.trim()} · ${input.durationMinutes}m`, tone: 'ok' }])
+      },
+    })
+  }
+  wizardsRef.current = { task: openTaskWizard, cycle: openCycleWizard, focus: openFocusWizard }
+
+  const resolve = (token: string | undefined) => {
+    const ref = parseRef(token, VIEW_SCOPE[viewRef.current])
+    if (!ref || !storedRef.current) return null
+    const found = lookupRef(currentIndex(), ref)
+    return found ? { ref: ref.label, ...found } : null
+  }
+  const setTaskFields = (task: Task, patch: Partial<Task>) => updateSnapshot((current) => updateTask(current, task.id, patch), `${t('title')}: ${task.title}`)
+  const usage = (spec: CommandSpec) => fill(t('usage'), { usage: `/${spec.name}${spec.args ? ` ${spec.args}` : ''}` })
+
+  const quickAdd = (text: string, say: (lines: OutLine[]) => void, fail: (text: string) => void) => {
+    const current = viewRef.current
+    if (current === 'tree') return fail(t('treeNoAdd'))
+    if (current === 'focus') {
+      const quick = parseQuickAdd(text, true)
+      const linked = quick.upper ? resolve(quick.upper)?.task : undefined
+      if (quick.upper && linked?.domain !== 'daily') return fail(fill(t('refMissing'), { ref: quick.upper }))
+      const minutes = quick.minutes ?? 45
+      const id = submitFocus({ title: quick.title, durationMinutes: String(minutes), taskId: linked?.id })
+      return say(id ? [{ text: `+ ${refFor(id)} ${quick.title} · ${minutes}m`, tone: 'ok' }] : [])
+    }
+    const domain = SCOPE_DOMAIN[VIEW_SCOPE[current] as 'g' | 'w' | 'd']
+    if (domain === 'long' && !selectedCycle) return fail(t('noCycles'))
+    const quick = parseQuickAdd(text)
+    let upperTaskId: string | undefined
+    if (quick.upper) {
+      const scope = domain === 'daily' ? 'w' : domain === 'weekly' ? 'g' : null
+      const ref = parseRef(quick.upper, scope)
+      const upper = ref && ref.scope === scope ? lookupRef(currentIndex(), ref)?.task : undefined
+      if (!upper || upper.parentId) return fail(fill(t('linkInvalid'), { ref: quick.upper }))
+      upperTaskId = upper.id
+    }
+    const id = submitTask({ title: quick.title, note: '', color: quick.color || 'ink', upperTaskId }, undefined, domain)
+    say(id ? [{ text: `+ ${refFor(id)} ${quick.title.trim()}`, tone: 'ok' }] : [])
+  }
+
+  const jumpTo = (task: Task) => {
+    const board = storedRef.current?.snapshot
+    if (!board) return
+    const anchor = task.parentId ? board.tasks.find((candidate) => candidate.id === task.parentId) ?? task : task
+    const cycle = board.cycles.find((entry) => entry.id === anchor.cycleId)
+    const week = anchor.domain === 'weekly' && anchor.weekKey ? anchor.weekKey : anchor.domain === 'daily' && anchor.dateKey ? weekKey(anchor.dateKey) : selectionRef.current.week
+    const date = anchor.domain === 'daily' && anchor.dateKey ? anchor.dateKey : dateForWeek(week, cycleForNavigation(board, cycle), selectionRef.current.date)
+    const target = DOMAIN_VIEW[anchor.domain]
+    const echo = target === 'goals' ? '/goals' : target === 'week' ? `/week ${week}` : `/day ${date}`
+    showView(target, echo, () => applySelection({ cycleId: anchor.cycleId ?? UNASSIGNED_CYCLE_ID, date, week }))
+    setSelectedTaskId(task.id)
+    revealRow(task.id)
+  }
+  const jumpToBlock = (block: FocusBlock) => {
+    showView('focus', `/focus ${block.dateKey}`, () => goDate(block.dateKey, true))
+    setSelectedTaskId(block.id)
+    revealRow(block.id)
+  }
+  const revealRow = (id: string) => requestAnimationFrame(() => requestAnimationFrame(() => document.querySelector(`.board-view.is-live [data-row-id="${id}"]`)?.scrollIntoView({ block: 'center' })))
+
+  const execute = (raw: string, echo = true) => {
+    const line = raw.trim()
+    const parsed = parseLine(line)
+    setHelpMenu(null)
+    if (parsed.kind === 'empty') return
+    const shown = echo ? line : undefined
+    const say = (lines: OutLine[]) => print(lines, shown)
+    const fail = (text: string) => say([{ text, tone: 'err' }])
+    if (parsed.kind === 'text') {
+      if (screenRef.current !== 'workspace' || !storedRef.current) return fail(fill(t('cmdNotFound'), { cmd: parsed.text.split(/\s+/)[0] }))
+      return quickAdd(parsed.text, say, fail)
+    }
+    const spec = resolveCommand(parsed.name, context)
+    if (!spec) return fail(fill(t('cmdUnknown'), { cmd: parsed.name }))
+    if (spec.context.length === 1 && spec.context[0] === 'board' && !storedRef.current) return fail(t('loading'))
+    const { args, rest } = parsed
+    const board = storedRef.current?.snapshot
+    switch (spec.name) {
+      case 'help': {
+        if (args[0]) {
+          const target = resolveCommand(args[0].replace(/^\//, ''), context)
+          if (!target) return fail(fill(t('cmdUnknown'), { cmd: args[0] }))
+          return say([{ text: `/${target.name}${target.args ? ` ${target.args}` : ''}`, tone: 'accent' }, { text: target[language] }, ...(target.aliases?.length ? [{ text: `alias  ${target.aliases.map((alias) => `/${alias}`).join('  ')}`, tone: 'dim' as const }] : [])])
+        }
+        const id = ++entryIdRef.current
+        setEntries((current) => [...current, { id, echo: shown, body: { kind: 'help' as const, context } }].slice(-MAX_ENTRIES))
+        setHelpMenu({ entryId: id, index: 0 })
+        return
+      }
+      case 'login':
+        if (!config) return fail(t('setupBody'))
+        say([])
+        return startLogin(args[0])
+      case 'demo':
+        if (screenRef.current !== 'setup') return fail(t('demoSetupOnly'))
+        say([])
+        return openDemo()
+      case 'goals': return showView('goals', shown)
+      case 'week':
+      case 'tree': {
+        if (!args[0]) return showView(spec.name as ViewName, shown)
+        const key = parseWeekArg(args[0], selectionRef.current.week, currentWeekKey)
+        if (!key) return fail(usage(spec))
+        return showView(spec.name as ViewName, shown, () => selectWeek(key))
+      }
+      case 'day':
+      case 'focus': {
+        if (!args[0]) return showView(spec.name as ViewName, shown)
+        const date = parseDateArg(args[0], selectionRef.current.date, todayKey)
+        if (!date) return fail(usage(spec))
+        return showView(spec.name as ViewName, shown, () => goDate(date, spec.name === 'focus'))
+      }
+      case 'today': {
+        const target = viewRef.current === 'week' || viewRef.current === 'focus' ? viewRef.current : 'day'
+        return showView(target, shown, () => goDate(todayKey))
+      }
+      case 'project': {
+        const sub = args[0]?.toLowerCase()
+        if (!sub) {
+          const lines: OutLine[] = board!.cycles.map((cycle, position) => ({ key: `${cycle.id === selectedCycle?.id ? '●' : ' '} ${position + 1}`, text: cycle.name, meta: `${cycle.startDate} → ${cycle.endDate} · ${board!.tasks.filter((task) => !task.archivedAt && task.cycleId === cycle.id).length}`, cmd: `/project ${position + 1}` }))
+          if (board!.tasks.some((task) => !task.cycleId && !task.archivedAt)) lines.push({ key: `${selectedCycleId === UNASSIGNED_CYCLE_ID ? '●' : ' '} ~`, text: t('unassignedPlans'), cmd: '/project ~' })
+          lines.push({ text: t('projectHint'), tone: 'dim' })
+          return say(lines)
+        }
+        if (sub === 'new' || sub === 'add') { say([]); return openCycleWizard(undefined, rest.includes(' ') ? { name: restAfter(rest), startDate: todayKey, endDate: addDays(todayKey, 30) } : undefined) }
+        if (sub === 'edit') { if (!selectedCycle) return fail(t('noCycles')); say([]); return openCycleWizard(selectedCycle) }
+        if (sub === 'rm' || sub === 'delete') {
+          const cycle = selectedCycle
+          if (!cycle) return fail(t('noCycles'))
+          if (!online || saveState !== 'saved') return fail(t('deleteCycleBlocked'))
+          const confirmedBoard = storedRef.current!
+          const taskCount = confirmedBoard.snapshot.tasks.filter((task) => task.cycleId === cycle.id).length
+          say([{ text: fill(t('deleteCycleTitle'), { name: cycle.name }), tone: 'warn' }, { text: fill(t('deleteCycleSummary'), { count: taskCount }) }, { text: t('deleteCycleKeepFocus'), tone: 'dim' }, { text: t('deleteCycleWarning'), tone: 'dim' }])
+          // 有计划时必须逐字输入项目名；确认期间版本变了由 deleteCycleConfirmed 拒绝，不会扩大删除范围。
+          if (taskCount) return openAsk({ title: `${t('deleteCycleConfirmName')} · ${cycle.name}`, fields: [{ key: 'name', label: t('confirmLabel'), validate: (value) => (value === cycle.name ? null : t('deleteCycleNameMismatch')) }], onDone: () => deleteCycleConfirmed(cycle, confirmedBoard) })
+          return confirm(fill(t('deleteCycleTitle'), { name: cycle.name }), () => deleteCycleConfirmed(cycle, confirmedBoard))
+        }
+        if (sub === 'up' || sub === 'down') {
+          const at = board!.cycles.findIndex((cycle) => cycle.id === selectedCycle?.id)
+          const neighbour = board!.cycles[at + (sub === 'up' ? -1 : 1)]
+          if (!selectedCycle || !neighbour) return fail(t('cannotMove'))
+          sortCycle(selectedCycle, neighbour.id)
+          return say([{ text: `✓ ${selectedCycle.name} ${sub === 'up' ? '↑' : '↓'}`, tone: 'ok' }])
+        }
+        if (['~', '-', 'none', 'unassigned'].includes(sub)) return showView('goals', shown, () => selectCycle(UNASSIGNED_CYCLE_ID))
+        const position = Number(sub)
+        const name = rest.toLowerCase()
+        const match = Number.isInteger(position) && position >= 1 ? board!.cycles[position - 1]
+          : board!.cycles.find((cycle) => cycle.name.toLowerCase() === name) ?? board!.cycles.map((cycle) => ({ cycle, score: fuzzyScore(name, cycle.name) })).filter((entry) => entry.score !== null).sort((a, b) => b.score! - a.score!)[0]?.cycle
+        if (!match) return fail(fill(t('projectMissing'), { name: rest }))
+        return showView('goals', shown, () => selectCycle(match.id))
+      }
+      case 'add': {
+        if (rest) return quickAdd(rest, say, fail)
+        say([])
+        if (viewRef.current === 'focus') return openFocusWizard()
+        const domain = viewRef.current === 'goals' ? 'long' : viewRef.current === 'week' ? 'weekly' : 'daily'
+        if (domain === 'long' && !selectedCycle) return fail(t('noCycles'))
+        return openTaskWizard({ domain })
+      }
+      case 'sub': {
+        const target = resolve(args[0])
+        if (!target?.task) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        const parent = target.task
+        if (parent.parentId) return fail(t('subOfSub'))
+        const placement: TaskPlacement = { cycleId: parent.cycleId, weekKey: parent.weekKey, dateKey: parent.dateKey }
+        const title = restAfter(rest)
+        const create = (value: string) => {
+          const id = submitTask({ title: value, note: '', color: 'ink' }, undefined, parent.domain, parent.id, placement)
+          return id ? [{ text: `+ ${refFor(id)} ${value.trim()}`, tone: 'ok' as const }] : []
+        }
+        if (title) return say(create(title))
+        say([])
+        return openAsk({ title: `${t('addSubtask')} · ${target.ref} ${parent.title}`, fields: [{ key: 'title', label: t('title'), maxLength: MAX_TASK_TITLE_LENGTH, validate: (value) => (value.trim() ? null : t('titleRequired')) }], onDone: ({ title: value }) => print(create(value)) })
+      }
+      case 'done': {
+        if (!args.length) return fail(usage(spec))
+        const targets = args.map((arg) => ({ arg, found: resolve(arg) }))
+        const missing = targets.filter((entry) => !entry.found?.task).map((entry) => entry.arg)
+        if (missing.length) return fail(fill(t('refMissing'), { ref: missing.join(' ') }))
+        const tasks = targets.map((entry) => ({ ref: entry.found!.ref, task: entry.found!.task! }))
+        updateSnapshot((current) => tasks.reduce((next, { task }) => updateTask(next, task.id, { checked: !task.checked }), current), `${t('title')}: ${tasks.map(({ task }) => task.title).join(', ')}`)
+        return say(tasks.map(({ ref, task }) => ({ text: `${task.checked ? '[ ]' : '[x]'} ${ref} ${task.title}`, tone: task.checked ? 'dim' : 'ok' })))
+      }
+      case 'edit': {
+        const target = resolve(args[0])
+        if (!target) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        say([])
+        if (target.block) return openFocusWizard(target.block)
+        return openTaskWizard({ task: target.task!, domain: target.task!.domain })
+      }
+      case 'note': {
+        const target = resolve(args[0])
+        if (!target?.task) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        const task = target.task
+        const text = restAfter(rest)
+        if (text) { setTaskFields(task, { note: text }); return say([{ text: `✓ ${target.ref} ${t('note')}`, tone: 'ok' }]) }
+        say([])
+        return openAsk({ title: `${t('note')} · ${target.ref} ${task.title}`, fields: [{ key: 'note', label: t('note'), type: 'note', initial: task.note, maxLength: MAX_TASK_NOTE_LENGTH }], onDone: ({ note }) => { setTaskFields(task, { note }); print([{ text: `✓ ${target.ref} ${t('note')}`, tone: 'ok' }]) } })
+      }
+      case 'color': {
+        const target = resolve(args[0])
+        if (!target?.task) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        const task = target.task
+        const apply = (color: TaskColor) => { setTaskFields(task, { color }); return [{ text: `■ ${target.ref} ${t(COLOR_LABEL[color])}`, tone: 'ok' as const }] }
+        const color = args[1]?.toLowerCase() as TaskColor | undefined
+        if (color && TASK_COLORS.includes(color)) return say(apply(color))
+        if (color) return fail(usage(spec))
+        say([])
+        return openAsk({ title: `${t('color')} · ${target.ref} ${task.title}`, fields: [{ key: 'color', label: t('color'), initial: task.color, options: TASK_COLORS.map((value) => ({ id: value, value, label: `■ ${t(COLOR_LABEL[value])}`, meta: value })) }], onDone: ({ color: value }) => print(apply(value as TaskColor)) })
+      }
+      case 'link': {
+        const target = resolve(args[0])
+        if (!target?.task) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        const task = target.task
+        if (task.parentId) return fail(t('linkSubtask'))
+        if (task.domain === 'long') return fail(t('linkLong'))
+        const scope = task.domain === 'daily' ? 'w' : 'g'
+        const apply = (upperTaskId: string | undefined) => {
+          setTaskFields(task, { upperTaskId })
+          const upper = upperTaskId ? storedRef.current!.snapshot.tasks.find((candidate) => candidate.id === upperTaskId) : undefined
+          return [{ text: upper ? `↖ ${target.ref} → ${refFor(upper.id)} ${upper.title}` : `↖ ${target.ref} ${t('none')}`, tone: 'ok' as const }]
+        }
+        const arg = args[1]?.toLowerCase()
+        if (!arg) {
+          say([])
+          const rows = currentIndex()[scope].filter((row) => !row.depth)
+          return openAsk({ title: `${t('association')} · ${target.ref} ${task.title}`, fields: [{ key: 'upper', label: t('association'), initial: task.upperTaskId || '', options: [{ id: 'none', value: '', label: t('none') }, ...rows.map((row) => ({ id: row.task.id, value: row.task.id, label: `${row.ref}  ${row.task.title}` }))] }], onDone: ({ upper }) => print(apply(upper || undefined)) })
+        }
+        if (['none', 'off', '-', '0'].includes(arg)) return say(apply(undefined))
+        const ref = parseRef(arg, scope)
+        const upper = ref && ref.scope === scope ? lookupRef(currentIndex(), ref)?.task : undefined
+        if (!upper || upper.parentId) return fail(fill(t('linkInvalid'), { ref: arg }))
+        return say(apply(upper.id))
+      }
+      case 'mv': {
+        const target = resolve(args[0])
+        if (!target?.task) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        const task = target.task
+        const arg = args[1]?.toLowerCase()
+        if (!arg) return fail(usage(spec))
+        if (['up', 'down', 'k', 'j'].includes(arg)) {
+          const direction = arg === 'up' || arg === 'k' ? -1 : 1
+          reorderTask(task, direction)
+          return say([{ text: `${direction < 0 ? '↑' : '↓'} ${target.ref} ${task.title}`, tone: 'ok' }])
+        }
+        if (arg === 'top' || arg === 'bottom') {
+          const siblings = currentIndex()[target.ref[0] as 'g' | 'w' | 'd'].filter((row) => row.task.parentId === task.parentId).map((row) => row.task)
+          const anchor = arg === 'top' ? siblings[0] : siblings[siblings.length - 1]
+          if (!anchor || anchor.id === task.id) return say([{ text: t('nothingChanged'), tone: 'dim' }])
+          sortTask(task, anchor.id)
+          return say([{ text: `${arg === 'top' ? '⇡' : '⇣'} ${target.ref} ${task.title}`, tone: 'ok' }])
+        }
+        if (task.parentId) return fail(t('moveSubtask'))
+        if (task.domain === 'daily') {
+          const date = parseDateArg(arg, task.dateKey!, todayKey)
+          if (!date) return fail(usage(spec))
+          updateSnapshot((current) => moveDailyTask(current, task.id, date), `${t('title')}: ${task.title}`)
+          return say([{ text: `→ ${target.ref} ${task.title} · ${date}`, tone: 'ok' }])
+        }
+        if (task.domain === 'weekly') {
+          const week = parseWeekArg(arg, task.weekKey!, currentWeekKey)
+          if (!week) return fail(usage(spec))
+          updateSnapshot((current) => moveWeeklyTask(current, task.id, week), `${t('title')}: ${task.title}`)
+          return say([{ text: `→ ${target.ref} ${task.title} · ${week}`, tone: 'ok' }])
+        }
+        return fail(t('moveLong'))
+      }
+      case 'defer': {
+        const target = resolve(args[0])
+        if (!target?.task) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        const task = target.task
+        if (task.parentId || task.domain === 'long') return fail(t('deferInvalid'))
+        const value = args[1]
+          ? (task.domain === 'weekly' ? parseWeekArg(args[1], task.weekKey!, currentWeekKey) : parseDateArg(args[1], task.dateKey!, todayKey))
+          : nextRescheduleTarget(task, currentZone).value
+        if (!value) return fail(usage(spec))
+        rescheduleTask(task, value)
+        return say([{ text: `↷ ${target.ref} ${task.title} → ${value}`, tone: 'ok' }, { text: t('rescheduleHint'), tone: 'dim' }])
+      }
+      case 'rm': {
+        const target = resolve(args[0])
+        if (!target) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
+        say([])
+        if (target.block) {
+          const block = target.block
+          return confirm(`${t('confirmDeleteFocus')}  ${target.ref} ${block.title}`, () => {
+            updateSnapshot((current) => deleteFocusBlock(current, block.id), `${t('delete')}: ${block.title}`)
+            print([{ text: `✗ ${target.ref} ${block.title}`, tone: 'dim' }])
+          })
+        }
+        return deleteTaskWithConfirm(target.task!, target.ref)
+      }
+      case 'start': {
+        const minutes = args[1] ? parseMinutes(args[1]) : null
+        if (args[1] && !minutes) return fail(t('noticeTimerDuration'))
+        if (!args[0]) {
+          const block = board!.focusBlocks.find((entry) => entry.dateKey === selectionRef.current.date && entry.status === 'paused')
+          if (!block) return fail(t('noBlock'))
+          focusCommand(block, block.elapsedMs > 0 ? 'resume' : 'start')
+          return say([{ text: `◉ ${refFor(block.id)} ${block.title}`, tone: 'accent' }])
+        }
+        const target = resolve(args[0])
+        if (!target) return fail(fill(t('refMissing'), { ref: args[0] }))
+        if (target.block) {
+          if (target.block.status === 'finished') return fail(t('blockFinished'))
+          if (target.block.status === 'running') return say([{ text: `◉ ${target.ref} ${target.block.title}`, tone: 'accent' }])
+          focusCommand(target.block, target.block.elapsedMs > 0 ? 'resume' : 'start')
+          return say([{ text: `◉ ${target.ref} ${target.block.title}`, tone: 'accent' }])
+        }
+        const task = target.task!
+        if (task.domain !== 'daily' || !task.dateKey) return fail(t('startDailyOnly'))
+        if (selectedCycle && !dateInRange(task.dateKey, selectedCycle.startDate, selectedCycle.endDate)) return fail(t('selectionOutsideCycle'))
+        try {
+          const block = createFocusBlock({ dateKey: task.dateKey, title: task.title, taskId: task.id, durationMinutes: minutes ?? 45 })
+          updateSnapshot((current) => setFocusCommand(addFocusBlock(current, block), block.id, 'start'), `${t('focus')}: ${task.title}`)
+          return say([{ text: `◉ ${task.title} · ${block.durationMinutes}m`, tone: 'accent' }, { text: '/focus', cmd: `/focus ${task.dateKey}`, tone: 'dim' }])
+        } catch (caught) {
+          return fail(noticeLabel(errorNotice(caught, 'noticeFocusSaveFailed')))
+        }
+      }
+      case 'pause':
+      case 'resume':
+      case 'stop': {
+        const blocks = board!.focusBlocks
+        const block = spec.name === 'pause' ? blocks.find((entry) => entry.status === 'running')
+          : spec.name === 'stop' ? blocks.find((entry) => entry.status === 'running') ?? blocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0 && entry.dateKey === selectionRef.current.date)
+            : blocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0 && entry.dateKey === selectionRef.current.date) ?? blocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0)
+        if (!block) return fail(t('noRunning'))
+        focusCommand(block, spec.name === 'stop' ? 'finish' : spec.name === 'pause' ? 'pause' : 'resume')
+        const elapsed = Math.min(elapsedMsAt(block, Date.now()), block.durationMinutes * 60_000)
+        return say([{ text: `${spec.name === 'stop' ? '✓' : spec.name === 'pause' ? '◐' : '◉'} ${block.title} · ${formatClock(elapsed)}`, tone: spec.name === 'stop' ? 'ok' : 'accent' }])
+      }
+      case 'find':
+        say([])
+        return setFinder(rest)
+      case 'sync':
+        say([])
+        return void reloadLatest(true).then((loaded) => { if (loaded) print([{ text: fill(t('synced'), { rev: storedRef.current?.revision ?? 0 }), tone: 'ok' }]) })
+      case 'retry':
+        if (!failedJobRef.current) return fail(t('noDraft'))
+        retrySave()
+        return say([{ text: t('retrying'), tone: 'dim' }])
+      case 'reopen':
+        say([])
+        return void reopenDraft()
+      case 'discard':
+        if (!failedJobRef.current && !pendingJobRef.current) return fail(t('noDraft'))
+        say([])
+        return confirm(t('confirmDiscardDraft'), () => void reloadLatest(false))
+      case 'status': {
+        const pending = failedJobRef.current || pendingJobRef.current
+        return say([
+          { key: 'save', text: t(statusKey), tone: statusKey === 'saved' ? 'ok' : statusKey === 'error' || statusKey === 'offline' ? 'err' : 'warn' },
+          { key: 'rev', text: String(stored?.revision ?? 0) },
+          { key: 'mode', text: adapter?.mode === 'demo' ? t('demo') : t('cloud') },
+          { key: 'tz', text: currentZone },
+          ...(pending?.draft ? [{ key: 'draft', text: pending.draft, tone: 'warn' as const }] : []),
+          ...(saveMessage ? [{ key: 'note', text: noticeLabel(saveMessage), tone: 'warn' as const }] : []),
+        ])
+      }
+      case 'tz': {
+        if (!args[0]) return say([{ key: 'tz', text: currentZone }, { text: t('timezoneHint'), tone: 'dim' }])
+        if (safeTimeZone(args[0]) !== args[0]) return fail(t('invalidTimeZone'))
+        updateSettings(args[0])
+        return say([{ text: `✓ ${t('timezone')} ${args[0]}`, tone: 'ok' }])
+      }
+      case 'account':
+        if (adapter?.mode !== 'cloud') return fail(t('accountCloudOnly'))
+        if (saveState !== 'saved') return fail(t('accountUnsaved'))
+        say([])
+        return window.location.assign('/account')
+      case 'whoami':
+        return say([{ text: adapter?.mode === 'demo' ? `demo · ${t('demoNote')}` : user?.email || '—' }])
+      case 'theme': {
+        const pick = args[0]?.toLowerCase()
+        const next = pick === 'dark' || pick === 'light' || pick === 'auto' ? pick : !pick ? (theme.resolved === 'dark' ? 'light' : 'dark') : null
+        if (!next) return fail(usage(spec))
+        theme.setPref(next)
+        return say([{ text: `theme · ${next}`, tone: 'dim' }])
+      }
+      case 'lang': {
+        const pick = args[0]?.toLowerCase()
+        const next: Language | null = pick === 'zh' || pick === 'en' ? pick : !pick ? (language === 'zh' ? 'en' : 'zh') : null
+        if (!next) return fail(usage(spec))
+        setLanguage(next)
+        return say([{ text: `lang · ${next}`, tone: 'dim' }])
+      }
+      case 'clear':
+        return clearScreen()
+      case 'logout': {
+        if (adapter?.mode === 'cloud') {
+          return void signOut().then(() => { if (screenRef.current === 'auth') print([{ text: t('loggedOut'), tone: 'dim' }]) })
+        }
+        clearPrivateState(config ? 'auth' : 'setup')
+        return print([{ text: t('loggedOut'), tone: 'dim' }])
+      }
+      default:
+        return fail(fill(t('cmdUnknown'), { cmd: parsed.name }))
+    }
+  }
+
+  const statusKey = !online || saveState === 'offline' ? 'offline' : saveState === 'error' ? 'error' : saveState === 'saving' ? 'saving' : saveState === 'pending' ? 'pending' : 'saved'
+  const statusGlyph = { saved: '●', pending: '○', saving: '◌', error: '✗', offline: '⊘' }[statusKey]
+
+  const enterNav = () => {
+    if (screenRef.current !== 'workspace') return
+    setNavMode(true)
+    inputRef.current?.blur()
+    if (!selectedTaskId) {
+      const first = document.querySelector<HTMLElement>('.board-view.is-live [data-row-id]')?.dataset.rowId
+      if (first) setSelectedTaskId(first)
+    }
+  }
+  const exitNav = (text?: string) => {
+    setNavMode(false)
+    if (text !== undefined) setPrefill({ text, nonce: Date.now() })
+    focusPrompt()
+  }
+  const stepPeriod = (delta: -1 | 1) => {
+    const board = storedRef.current?.snapshot
+    if (!board) return
+    const current = viewRef.current
+    if (current === 'goals') {
+      const at = board.cycles.findIndex((cycle) => cycle.id === selectedCycle?.id)
+      const next = board.cycles[at + delta]
+      if (next) selectCycle(next.id)
+    } else if (current === 'week' || current === 'tree') selectWeek(weekKey(addDays(weekRange(selectionRef.current.week).start, delta * 7)))
+    else setDate(addDays(selectionRef.current.date, delta))
+  }
+  const onNavKey = (event: KeyboardEvent) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return
+    const ids = [...document.querySelectorAll<HTMLElement>('.board-view.is-live [data-row-id]')].map((element) => element.dataset.rowId!)
+    const at = selectedTaskId ? ids.indexOf(selectedTaskId) : -1
+    const ref = selectedTaskId ? refFor(selectedTaskId) : ''
+    const task = selectedTaskId ? storedRef.current?.snapshot.tasks.find((candidate) => candidate.id === selectedTaskId) : undefined
+    const block = selectedTaskId ? storedRef.current?.snapshot.focusBlocks.find((candidate) => candidate.id === selectedTaskId) : undefined
+    const move = (delta: number) => {
+      if (!ids.length) return
+      const next = ids[at < 0 ? (delta > 0 ? 0 : ids.length - 1) : Math.max(0, Math.min(ids.length - 1, at + delta))]
+      setSelectedTaskId(next)
+      document.querySelector(`.board-view.is-live [data-row-id="${next}"]`)?.scrollIntoView({ block: 'nearest' })
+    }
+    const keys: Record<string, () => void> = {
+      j: () => move(1), ArrowDown: () => move(1), k: () => move(-1), ArrowUp: () => move(-1),
+      g: () => execute('/goals'), w: () => execute('/week'), d: () => execute('/day'), f: () => execute('/focus'), t: () => execute('/tree'),
+      h: () => stepPeriod(-1), '[': () => stepPeriod(-1), ArrowLeft: () => stepPeriod(-1),
+      l: () => stepPeriod(1), ']': () => stepPeriod(1), ArrowRight: () => stepPeriod(1),
+      '.': () => execute('/today'),
+      x: () => { if (task) toggleTask(task); else if (block) focusCommand(block, block.status === 'running' ? 'pause' : block.elapsedMs > 0 ? 'resume' : 'start') },
+      ' ': () => keys.x(),
+      Enter: () => setExpandedId((current) => (current === selectedTaskId ? null : selectedTaskId)),
+      e: () => { if (ref) execute(`/edit ${ref}`) },
+      s: () => { if (task && !task.parentId && ref) execute(`/sub ${ref}`) },
+      J: () => { if (task && ref) execute(`/mv ${ref} down`) },
+      K: () => { if (task && ref) execute(`/mv ${ref} up`) },
+      r: () => { if (task && ref) execute(`/defer ${ref}`) },
+      p: () => { if (ref) execute(`/start ${ref}`) },
+      Delete: () => { if (ref) execute(`/rm ${ref}`) },
+      Backspace: () => { if (ref) execute(`/rm ${ref}`) },
+      '?': () => execute('/help'),
+      a: () => exitNav(), n: () => exitNav(), i: () => exitNav(), ':': () => exitNav(), '/': () => exitNav('/'),
+      Escape: () => { if (expandedId) setExpandedId(null); else exitNav() },
+    }
+    const handler = keys[event.key]
+    if (!handler) return
+    event.preventDefault()
+    handler()
+  }
+
+  const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {})
+  keyHandlerRef.current = (event: KeyboardEvent) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      if (screenRef.current !== 'workspace') return
+      event.preventDefault()
+      setFinder((current) => (current === null ? '' : null))
+      return
+    }
+    if (finder !== null || event.defaultPrevented) return
+    const target = event.target as HTMLElement | null
+    const typing = target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable)
+    // 光标已经回到输入框（点击或 Tab）就是命令模式，不能再把字母当导航键吞掉。
+    if (navMode && typing) setNavMode(false)
+    else if (navMode && screenRef.current === 'workspace') { onNavKey(event); return }
+    // 像真终端一样：焦点不在输入框时直接敲字，也落进提示符。
+    if (!typing && !event.metaKey && !event.ctrlKey && !event.altKey && event.key.length === 1) inputRef.current?.focus()
+  }
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => keyHandlerRef.current(event)
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  useEffect(() => {
+    if (!flash) return
+    print([{ text: flash, tone: 'warn' }])
+    setFlash('')
+  }, [flash, print])
+
+  const follow = useStickToBottom(`${entries.length}:${entries[entries.length - 1]?.id ?? 0}:${ask?.id ?? 0}`)
+
+  const helpItems = useMemo<MenuItem[]>(() => commandsFor(context).map((command) => ({ id: command.name, label: `/${command.name}${command.args ? ` ${command.args}` : ''}`, hint: command[language], value: `/${command.name}`, run: !command.needsArg })), [context, language])
+  const pickHelp = (item: MenuItem) => {
+    setHelpMenu(null)
+    if (item.run) execute(item.value!)
+    else setPrefill({ text: `${item.value} `, nonce: Date.now() })
+  }
+  const externalMenu: ExternalMenu | null = helpMenu ? { items: helpItems, index: helpMenu.index, setIndex: (index) => setHelpMenu((current) => (current ? { ...current, index } : current)), pick: pickHelp, dismiss: () => setHelpMenu(null) } : null
+
+  const complete = useCallback((input: string): MenuItem[] => {
+    const argument = /^\/(\S+)\s+(\S*)$/.exec(input)
+    if (argument) {
+      const spec = resolveCommand(argument[1], context)
+      const options = spec?.name === 'theme' ? ['dark', 'light', 'auto'] : spec?.name === 'lang' ? ['zh', 'en'] : spec?.name === 'project' ? ['new', 'edit', 'rm', 'up', 'down', ...(storedRef.current?.snapshot.cycles.map((_, index) => String(index + 1)) ?? [])] : []
+      return options.filter((option) => option.startsWith(argument[2]) && option !== argument[2]).slice(0, 8).map((option) => ({ id: option, label: `/${spec!.name} ${option}`, hint: spec?.name === 'project' && /^\d+$/.test(option) ? storedRef.current?.snapshot.cycles[Number(option) - 1]?.name : undefined, value: `/${spec!.name} ${option}`, run: true }))
+    }
+    return completeCommand(input, context, language)
+  }, [context, language])
+
+  const actions: BoardActions = {
+    run: (command) => { execute(command); focusPrompt() },
+    toggle: (task) => toggleTask(task),
+    select: (id) => { setSelectedTaskId(id); setExpandedId((current) => (current === id ? null : id)) },
+    navigate: (patch) => {
+      setExpandedId(null)
+      if (patch.cycleId !== undefined && patch.cycleId !== null) selectCycle(patch.cycleId)
+      else if (patch.week) selectWeek(patch.week)
+      else if (patch.date) setDate(patch.date)
+    },
+    jump: (task) => jumpTo(task),
+    focusCommand: (block, command) => focusCommand(block, command),
+  }
+
+  const finderItems = (): FinderItem[] => {
+    const board = storedRef.current?.snapshot
+    if (!board) return []
+    const projectName = (task: Task) => board.cycles.find((cycle) => cycle.id === task.cycleId)?.name ?? t('unassignedPlans')
+    const items: FinderItem[] = VIEWS.map((name) => ({ id: `view:${name}`, kind: 'view', title: t(VIEW_LABEL[name]), meta: `/${name}`, open: () => execute(`/${name}`) }))
+    board.cycles.forEach((cycle, position) => items.push({ id: `project:${cycle.id}`, kind: 'project', title: cycle.name, meta: `${cycle.startDate} → ${cycle.endDate}`, open: () => execute(`/project ${position + 1}`) }))
+    for (const task of activeTasks(board)) items.push({ id: task.id, kind: 'task', title: `${task.checked ? '✓ ' : ''}${task.title}`, meta: `${projectName(task)} · ${task.domain === 'long' ? t('navGoals') : task.domain === 'weekly' ? task.weekKey?.slice(5) : task.dateKey?.slice(5)}`, open: () => jumpTo(task) })
+    for (const block of board.focusBlocks) items.push({ id: block.id, kind: 'focus', title: block.title, meta: `${block.dateKey.slice(5)} · ${block.durationMinutes}m`, open: () => jumpToBlock(block) })
+    return items
+  }
+
+  const promptUser = `${screen === 'workspace' ? (adapter?.mode === 'demo' ? 'demo' : user?.email?.split('@')[0] || 'me') : 'guest'}@liubai`
+  const nav: NavItem[] = screen === 'workspace'
+    ? VIEWS.map((name) => ({ key: VIEW_KEYS[name], label: t(VIEW_LABEL[name]), active: view === name, onSelect: () => { execute(`/${name}`); focusPrompt() } }))
+    : screen === 'setup'
+      ? [{ key: 'O', label: t('navDemo'), onSelect: () => execute('/demo') }, { key: 'H', label: t('navHelp'), onSelect: () => execute('/help') }]
+      : [{ key: 'L', label: t('navLogin'), onSelect: () => execute('/login') }, { key: 'H', label: t('navHelp'), onSelect: () => execute('/help') }]
+  const cta = screen === 'workspace'
+    ? (adapter?.mode === 'cloud' ? <a className="side-button" href="/account" onClick={(event) => { if (saveState !== 'saved') { event.preventDefault(); execute('/account') } }}>{t('ctaConnect')}</a> : <button type="button" className="side-button" onClick={() => execute('/logout')}>{t('ctaExitDemo')}</button>)
+    : screen === 'setup' ? <button type="button" className="side-button" onClick={() => execute('/demo')}>{t('localDemo')}</button>
+      : screen === 'auth' ? <button type="button" className="side-button" onClick={() => execute('/login')}>{t('signIn')}</button> : null
+  const motd = screen === 'workspace' ? t('motdBoard') : screen === 'setup' ? t('motdSetup') : t('motdAuth')
+  const clock = new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: currentZone }).format(now)
+  const runningRemaining = runningBlock ? runningBlock.durationMinutes * 60_000 - Math.min(elapsedMsAt(runningBlock, now), runningBlock.durationMinutes * 60_000) : 0
+  const showSaveNotice = screen === 'workspace' && (saveState === 'error' || saveState === 'offline' || !online)
+  const showDraftNotice = screen === 'workspace' && draftLabel && canReopenDraft && (saveState === 'error' || saveState === 'offline')
+
+  const renderBody = (entry: Entry) => {
+    const body = entry.body!
+    if (body.kind === 'lines') return <Lines lines={body.lines} onCommand={(command) => actions.run(command)} />
+    if (body.kind === 'help') {
+      const active = helpMenu?.entryId === entry.id
+      return <Menu id={`help-${entry.id}`} items={helpItems} index={active ? helpMenu!.index : -1} onPick={pickHelp} onHover={active ? (index) => setHelpMenu({ entryId: entry.id, index }) : undefined} footer={active ? t('hintMenu') : undefined} />
+    }
+    const frozen = body.frozen
+    const board = frozen ? frozen.snapshot : stored?.snapshot
+    if (!board) return null
+    return <BoardView view={body.view} snapshot={board} selection={frozen ? frozen.selection : liveSelection} language={language} t={t} now={frozen ? frozen.now : now} live={!frozen} cursorId={frozen ? null : selectedTaskId} expandedId={frozen ? null : expandedId} actions={actions} />
+  }
 
   return (
-    <div className="app-shell">
-      <Header language={language} setLanguage={setLanguage} t={t} mode={adapter?.mode || 'cloud'} email={user?.email} saveState={saveState} saveMessage={noticeLabel(saveMessage)} online={online} onSettings={() => setDialog({ kind: 'settings' })} onRefresh={() => void reloadLatest(true)} onLogout={adapter?.mode === 'cloud' ? signOut : () => clearPrivateState(config ? 'auth' : 'setup')} />
-      {saveState === 'error' || saveState === 'offline' || !online ? (
-        <div className="notice-bar save-notice" role="status">
-          <span className="notice-dot" />
+    <ShellFrame nav={nav} cta={cta} homeLabel={t('appName')}>
+      <div className={`scrollback ${navMode ? 'is-nav' : ''}`} onMouseUp={(event) => {
+        const target = event.target as HTMLElement
+        if (window.getSelection()?.toString() || target.closest('button,a,input,textarea,[role="option"]')) return
+        if (navMode) exitNav(); else focusPrompt()
+      }}>
+        <Banner label={t('appName')}><p><Rich text={t('motdTagline')} onCommand={actions.run} /></p><p className="dim"><Rich text={motd} onCommand={actions.run} /></p></Banner>
+        {screen === 'workspace' && stored ? <Dashboard snapshot={stored.snapshot} selection={liveSelection} language={language} t={t} now={now} actions={actions} /> : null}
+        {entries.map((entry) => <div key={entry.id} className="entry">
+          {entry.echo !== undefined ? <Echo text={entry.echo}>{entry.result ? <span className={`tone-${entry.result.tone || 'plain'}`}>{entry.result.text}</span> : null}</Echo> : null}
+          {entry.body ? renderBody(entry) : null}
+        </div>)}
+      </div>
+      <div className="console">
+        {showSaveNotice ? <div className="notice" role="status">
+          <span className="notice-mark">!</span>
           <span>{saveMessage ? noticeLabel(saveMessage) : saveState === 'offline' || !online ? t('offline') : t('error')}</span>
-          {failedJobRef.current?.draft && !canReopenDraft ? <span className="save-operation">{failedJobRef.current.draft}</span> : null}
-          {failedJobRef.current && (saveState === 'error' || saveState === 'offline') && failureKind !== 'conflict' ? <button className="text-button" onClick={retrySave}>{t('retry')}</button> : null}
-          {failureKind === 'conflict' && !failedJobRef.current ? <button className="text-button" onClick={() => void reloadLatest(true)}>{t('reloadLatest')}</button> : null}
-          {failureKind === 'conflict' && failedJobRef.current && !canReopenDraft ? <button className="text-button" onClick={discardDirectConflict}>{t('reloadLatestDirect')}</button> : null}
-          {failureKind === 'conflict' && canReopenDraft ? <button className="text-button" onClick={() => void reopenDraft()}>{t('reopenDraft')}</button> : null}
-        </div>
-      ) : null}
-      {draftLabel && canReopenDraft && (saveState === 'error' || saveState === 'offline') ? (
-        <div className="notice-bar draft-notice" role="status">
-          <div><strong>{t('draftTitle')}</strong><span>{draftLabel}</span></div>
-          <div className="notice-actions">
-            <button className="text-button" onClick={() => void reloadLatest(true)}>{t('reloadLatest')}</button>
-            <button className="text-button muted-action" onClick={() => void reloadLatest(false)}>{t('discardDraft')}</button>
-          </div>
-        </div>
-      ) : null}
-      {runningBlock && runningBlock.dateKey !== selectedDate ? (
-        <div className="running-banner" role="status">
-          <span className="pulse-dot" />{t('runningElsewhere')} · {formatDateKey(runningBlock.dateKey, language, currentZone)}
-          <button className="text-button" onClick={() => { setDate(runningBlock.dateKey, true); panelRefs.current[3]?.scrollIntoView({ behavior: 'smooth', inline: 'start' }) }}>{t('jumpFocus')}</button>
-        </div>
-      ) : null}
-      <main className="workspace-scroll" ref={workspaceScrollRef} aria-label={t('subtitle')}>
-        <div className="workspace-stage" ref={setStageElement}>
-          <ConnectorLayer stage={stageElement} snapshot={snapshot} rowRefs={rowRefs} selectedChain={selectedChain} />
-          <TaskPanel
-            onSort={sortTask}
-            panelRef={panelRef(0)} domain="long" title={t('long')} hint={t('longHint')} language={language} t={t}
-            tasks={panelTasks('long')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<CycleRail cycles={snapshot.cycles} selectedId={selectedCycleId ?? undefined} hasUnassigned={snapshot.tasks.some((task) => !task.cycleId) || selectedCycleId === UNASSIGNED_CYCLE_ID} language={language} t={t} onSelect={selectCycle} onAdd={() => setDialog({ kind: 'cycle' })} onEdit={(cycle) => setDialog({ kind: 'cycle', cycle })} onSort={sortCycle} />}
-            canAdd={Boolean(selectedCycle)} onAdd={() => setDialog({ kind: 'task', domain: 'long' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'long' })}
-            onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'long', parentId: task.id })} />
-          <TaskPanel
-            onSort={sortTask}
-            panelRef={panelRef(1)} domain="weekly" title={t('weekly')} hint={t('weeklyHint')} language={language} t={t}
-            tasks={panelTasks('weekly')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<WeekRail selectedWeek={selectedWeek} currentWeek={currentWeekKey} cycle={navigationCycle} language={language} t={t} onSelect={selectWeek} />}
-            currentAction={goCurrentWeek}
-            canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'weekly' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'weekly' })}
-            onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'weekly', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
-          <TaskPanel
-            onSort={sortTask}
-            panelRef={panelRef(2)} domain="daily" title={`${t('daily')} · ${weekdayLabel(selectedDate, language)}`} hint={t('dailyHint')} language={language} t={t}
-            tasks={panelTasks('daily')} snapshot={snapshot} timeZone={currentZone} selectedId={selectedTaskId} selectedChain={selectedChain} registerRow={registerRow}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={navigationCycle} language={language} t={t} onSelect={setDate} />}
-            currentAction={goToday}
-            canAdd canCreate={canCreateInCycle} onAdd={() => setDialog({ kind: 'task', domain: 'daily' })} onEdit={(task) => setDialog({ kind: 'task', task, domain: 'daily' })}
-            onDelete={deleteTaskWithConfirm} onToggle={toggleTask} onReorder={reorderTask} onSelect={setSelectedTaskId} onAddSubtask={(task) => setDialog({ kind: 'task', domain: 'daily', parentId: task.id })} onReschedule={(task) => setDialog({ kind: 'reschedule', task })} />
-          <FocusPanel
-            panelRef={panelRef(3)} blocks={snapshot.focusBlocks.filter((block) => block.dateKey === selectedDate)} allTasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} now={now}
-            rail={<DayRail selectedDate={selectedDate} selectedWeek={selectedWeek} todayKey={todayKey} cycle={navigationCycle} language={language} t={t} onSelect={setDate} />}
-            currentAction={goToday}
-            canAdd={canCreateInCycle} onAdd={() => setDialog({ kind: 'focus' })} onEdit={(block) => setDialog({ kind: 'focus', block })} onDelete={deleteFocusWithConfirm} onCommand={focusCommand}
-          />
-        </div>
-      </main>
-      <footer className="app-footer"><span>{t('keyboard')}</span><span>{t('shortcuts')}</span>{adapter?.mode === 'demo' ? <span>{t('demoNote')}</span> : <span>{t('cloudNote')}</span>}</footer>
-      {flash ? <div className="toast" role="status">{flash}</div> : null}
-      {dialog?.kind === 'task' ? <TaskDialog key={`${dialog.task?.id || 'new'}:${dialog.domain}:${dialog.parentId || ''}`} task={dialog.task} domain={dialog.domain} parentId={dialog.parentId} initial={dialog.initial} placement={dialog.placement || { cycleId: selectedCycle?.id, weekKey: selectedWeek, dateKey: selectedDate }} cycle={taskDialogCycle} tasks={activeTasks(snapshot)} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitTask(input, dialog.task, dialog.domain, dialog.parentId, dialog.placement)} /> : null}
-      {dialog?.kind === 'cycle' ? <CycleDialog key={dialog.cycle?.id || 'new'} cycle={dialog.cycle} initial={dialog.initial} board={stored} deleteBlocked={!online || saveState !== 'saved'} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitCycle(input, dialog.cycle)} onDelete={deleteCycleConfirmed} /> : null}
-      {dialog?.kind === 'focus' ? <FocusDialog key={dialog.block?.id || 'new'} block={dialog.block} initial={dialog.initial} tasks={taskForFocus} selectedDate={selectedDate} language={language} t={t} onClose={() => setDialog(null)} onSubmit={(input) => submitFocus(input, dialog.block)} /> : null}
-      {dialog?.kind === 'settings' ? <SettingsDialog zone={snapshot.settings.timeZone} language={language} t={t} onClose={() => setDialog(null)} onLanguage={setLanguage} onAccount={adapter?.mode === 'cloud' && saveState === 'saved' ? () => window.location.assign('/account') : undefined} onSubmit={(zone) => { updateSettings(zone); setDialog(null) }} /> : null}
-      {dialog?.kind === 'reschedule' ? <RescheduleDialog task={dialog.task} language={language} t={t} zone={currentZone} onClose={() => setDialog(null)} onSubmit={(date) => { rescheduleTask(dialog.task, date); setDialog(null) }} /> : null}
-    </div>
+          {failedJobRef.current?.draft && !canReopenDraft ? <span className="notice-draft">{failedJobRef.current.draft}</span> : null}
+          {failedJobRef.current && (saveState === 'error' || saveState === 'offline') && failureKind !== 'conflict' ? <button type="button" className="bracket" onClick={() => execute('/retry')}>[{t('retry')}]</button> : null}
+          {failureKind === 'conflict' && !failedJobRef.current ? <button type="button" className="bracket" onClick={() => execute('/sync')}>[{t('reloadLatest')}]</button> : null}
+          {failureKind === 'conflict' && failedJobRef.current && !canReopenDraft ? <button type="button" className="bracket" onClick={discardDirectConflict}>[{t('reloadLatestDirect')}]</button> : null}
+          {failureKind === 'conflict' && canReopenDraft ? <button type="button" className="bracket" onClick={() => execute('/reopen')}>[{t('reopenDraft')}]</button> : null}
+        </div> : null}
+        {showDraftNotice ? <div className="notice draft" role="status">
+          <span className="notice-mark">~</span><span>{t('draftTitle')} · {draftLabel}</span>
+          <button type="button" className="bracket" onClick={() => execute('/sync')}>[{t('reloadLatest')}]</button>
+          <button type="button" className="bracket dim" onClick={() => execute('/discard')}>[{t('discardDraft')}]</button>
+        </div> : null}
+        {screen === 'workspace' && runningBlock && runningBlock.dateKey !== selectedDate ? <div className="notice running" role="status">
+          <span className="notice-mark">◉</span><span>{t('runningElsewhere')} · {runningBlock.dateKey}</span>
+          <button type="button" className="bracket" onClick={() => jumpToBlock(runningBlock)}>[{t('jumpFocus')}]</button>
+        </div> : null}
+        {screen !== 'workspace' && saveState === 'error' && saveMessage ? <div className="notice" role="alert"><span className="notice-mark">✗</span><span>{noticeLabel(saveMessage)}</span></div> : null}
+        <Prompt user={promptUser} ask={ask} busy={authBusy ? <><Spinner /> {t('authenticating')}</> : screen === 'loading' ? <><Spinner /> {t('loading')}</> : null}
+          placeholder={screen === 'workspace' ? fill(t('placeholderBoard'), { view: t(VIEW_LABEL[view]) }) : screen === 'setup' ? '/demo' : '/login'}
+          history={historyRef.current} copy={{ hintCommand: navMode ? '' : screen === 'workspace' ? t('hintBoard') : t('hintCommand'), hintAsk: t('hintAsk'), hintChoice: t('hintChoice'), hintNote: t('hintNote'), hintMenu: t('hintMenu'), noMatch: t('finderEmpty') }}
+          complete={complete} menu={externalMenu} inputRef={inputRef} prefill={prefill} onGrow={follow} onSubmit={(line) => execute(line)} onNav={enterNav} onClear={clearScreen} />
+      </div>
+      <footer className="statusline">
+        <span className={`sl-mode ${navMode ? 'is-nav' : ''}`}>{navMode ? 'NAV' : screen === 'workspace' ? 'CMD' : 'TTY'}</span>
+        <span className="sl-path">{screen === 'workspace' && stored ? `${selectedCycle?.name ?? t('unassignedPlans')} › ${selectedWeek.slice(5)} › ${selectedDate.slice(5)}` : `${t('appName')} · ${screen === 'setup' ? t('connectionMissing') : t('connectionReady')}`}</span>
+        <span className="sl-spacer" />
+        {screen === 'workspace' && runningBlock ? <button type="button" className="sl-item sl-running" onClick={() => jumpToBlock(runningBlock)}>◉ {formatClock(runningRemaining)}</button> : null}
+        {screen === 'workspace' ? <button type="button" className={`sl-item sl-save is-${statusKey}`} onClick={() => execute('/status')}>{statusGlyph} {t(statusKey)}</button> : null}
+        {screen === 'workspace' ? <span className="sl-item">{adapter?.mode === 'demo' ? t('demo') : t('cloud')}</span> : null}
+        <button type="button" className="sl-item" onClick={() => execute(`/lang ${language === 'zh' ? 'en' : 'zh'}`)}>{t('langShort')}</button>
+        <button type="button" className="sl-item" aria-label="theme" onClick={() => execute('/theme')}>{theme.resolved === 'dark' ? '◐' : '◑'}</button>
+        {screen === 'workspace' ? <span className="sl-item sl-clock">{clock}</span> : null}
+        <span className="sl-item sl-hint">{navMode ? t('navHint') : screen === 'workspace' ? 'esc nav · ⌘K' : ''}</span>
+      </footer>
+      {finder !== null ? <Finder user={promptUser} items={finderItems()} initialQuery={finder} t={t} onClose={() => { setFinder(null); focusPrompt() }} /> : null}
+    </ShellFrame>
   )
 
   function toggleTask(task: Task) {
     updateSnapshot((current) => updateTask(current, task.id, { checked: !task.checked }), `${t('title')}: ${task.title}`)
   }
 
-  function deleteTaskWithConfirm(task: Task) {
+  function deleteTaskWithConfirm(task: Task, ref: string) {
     const current = storedRef.current
     if (!current) return
     const hasChildren = current.snapshot.tasks.some((candidate) => candidate.parentId === task.id && !candidate.archivedAt)
     const message = hasChildren ? t('confirmDeleteWithChildren') : t('confirmDelete')
-    if (!window.confirm(message)) return
-    updateSnapshot((snapshot) => deleteTask(snapshot, task.id), `${t('delete')}: ${task.title}`)
-    if (selectedTaskId === task.id) setSelectedTaskId(null)
+    confirm(`${message}  ${ref} ${task.title}`, () => {
+      updateSnapshot((snapshot) => deleteTask(snapshot, task.id), `${t('delete')}: ${task.title}`)
+      if (selectedTaskId === task.id) setSelectedTaskId(null)
+      print([{ text: `✗ ${ref} ${task.title}`, tone: 'dim' }])
+    })
   }
 
   function deleteCycleConfirmed(cycle: GoalCycle, confirmedBoard: StoredBoard) {
@@ -1002,7 +1717,7 @@ export default function App() {
       if (commitSnapshot(next, `${t('deleteCycle')}: ${cycle.name}`)) {
         reconcileSelection(next, next.cycles[0]?.id || UNASSIGNED_CYCLE_ID)
         setSelectedTaskId(null)
-        setDialog(null)
+        print([{ text: `✗ ${cycle.name}`, tone: 'dim' }])
       }
     } catch (caught) {
       setFlash(noticeLabel(errorNotice(caught, 'noticeOperationFailed')))
@@ -1020,11 +1735,6 @@ export default function App() {
 
   function sortCycle(cycle: GoalCycle, targetId: string) {
     updateSnapshot((current) => reorderCycleTo(current, cycle.id, targetId), `${t('dragCycle')}: ${cycle.name}`)
-  }
-
-  function deleteFocusWithConfirm(block: FocusBlock) {
-    if (!window.confirm(t('confirmDeleteFocus'))) return
-    updateSnapshot((current) => deleteFocusBlock(current, block.id), `${t('delete')}: ${block.title}`)
   }
 
   function focusCommand(block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') {
@@ -1047,539 +1757,13 @@ export default function App() {
   }
 }
 
-function SetupScreen({ language, setLanguage, t, onDemo }: { language: Language; setLanguage: (language: Language) => void; t: (key: CopyKey) => string; onDemo: () => void }) {
-  return <div className="center-screen">
-    <div className="setup-card">
-      <div className="brand-lockup"><BrandMark /><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div>
-      <div className="eyebrow">{t('connectionMissing')}</div>
-      <h1>{t('setupTitle')}</h1>
-      <p>{t('setupBody')}</p>
-      <div className="setup-actions"><button className="primary-button" onClick={onDemo}>{t('localDemo')}</button><span className="setup-note">{t('setupDocs')}</span></div>
-      <div className="language-switch"><button className={language === 'zh' ? 'active' : ''} onClick={() => setLanguage('zh')}>{t('chinese')}</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>{t('english')}</button></div>
-    </div>
-  </div>
-}
-
-function AuthScreen({ language, setLanguage, t, email, password, setEmail, setPassword, busy, error, onSubmit }: {
-  language: Language; setLanguage: (language: Language) => void; t: (key: CopyKey) => string; email: string; password: string; setEmail: (value: string) => void; setPassword: (value: string) => void; busy: boolean; error: string; onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
-}) {
-  return <div className="center-screen"><div className="setup-card auth-card">
-    <div className="brand-lockup"><BrandMark /><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div>
-    <div className="eyebrow">{t('cloud')}</div><h1>{t('authTitle')}</h1><p>{t('authBody')}</p>
-    <form onSubmit={onSubmit} className="auth-form" noValidate>
-      <label>{t('email')}<input autoFocus type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
-      <label>{t('password')}<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
-      {error ? <div className="form-error" role="alert">{error}</div> : null}
-      <button className="primary-button" disabled={busy}>{busy ? t('signingIn') : t('signIn')}</button>
-    </form>
-    <div className="auth-foot"><span>{t('setupDocs')}</span><div className="language-switch"><button className={language === 'zh' ? 'active' : ''} onClick={() => setLanguage('zh')}>{t('chinese')}</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>{t('english')}</button></div></div>
-  </div></div>
-}
-
-function LoadingScreen({ language, t }: { language: Language; t: (key: CopyKey) => string }) {
-  return <div className="center-screen"><div className="loading-mark"><BrandMark /><p>{t('loading')}</p><div className="loading-line" /></div><div className="language-switch loading-language"><button className={language === 'zh' ? 'active' : ''}>{t('chinese')}</button><button className={language === 'en' ? 'active' : ''}>{t('english')}</button></div></div>
-}
-
-function Header({ language, setLanguage, t, mode, email, saveState, saveMessage, online, onSettings, onRefresh, onLogout }: {
-  language: Language; setLanguage: (language: Language) => void; t: (key: CopyKey) => string; mode: 'demo' | 'cloud'; email?: string; saveState: SaveState; saveMessage: string; online: boolean; onSettings: () => void; onRefresh: () => void; onLogout: () => void
-}) {
-  // 离线优先判断：否则 saveState 仍是 'saved' 时会错误地显示“已保存”。
-  const statusKey = !online || saveState === 'offline' ? 'offline' : saveState === 'error' ? 'error' : saveState === 'saving' ? 'saving' : saveState === 'pending' ? 'pending' : 'saved'
-  return <header className="top-header">
-    <div className="header-left"><div className="header-year">{new Date().getFullYear()}</div><div className="crumb-slash">/</div><div className="brand-lockup compact"><BrandMark /><span><strong>{t('appName')}</strong><small>{t('subtitle')}</small></span></div></div>
-    <div className="header-right"><span className={`mode-pill ${mode}`}>{mode === 'demo' ? t('demo') : t('cloud')}</span><span className={`save-indicator ${online ? saveState : 'offline'}`}><span className="status-dot" />{t(statusKey)}</span>
-      <button className="icon-button" aria-label={t('settings')} title={t('settings')} onClick={onSettings}><Icon name="sliders" /></button>
-      <button className="icon-button" aria-label={t('refresh')} title={t('refresh')} onClick={onRefresh}><Icon name="refresh" /></button>
-      <button className="account-button" onClick={onLogout} title={email || (mode === 'demo' ? t('demoNote') : '')}><span className="account-avatar">{email ? email[0].toUpperCase() : mode === 'demo' ? 'D' : '·'}</span><span className="account-label">{email || t('demo')}</span></button>
-      <div className="language-switch header-language"><button className={language === 'zh' ? 'active' : ''} onClick={() => setLanguage('zh')}>{t('chinese')}</button><button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>{t('english')}</button></div>
-    </div>
-    {saveMessage ? <span className="sr-only" role="status">{saveMessage}</span> : null}
-  </header>
-}
-
-function CycleRail({ cycles, selectedId, hasUnassigned, language, t, onSelect, onAdd, onEdit, onSort }: { cycles: GoalCycle[]; selectedId?: string; hasUnassigned: boolean; language: Language; t: (key: CopyKey) => string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (cycle: GoalCycle) => void; onSort: (cycle: GoalCycle, targetId: string) => void }) {
-  const keyboardCoordinates: KeyboardCoordinateGetter = (event, { active, context }) => {
-    if (event.code !== 'ArrowUp' && event.code !== 'ArrowDown') return
-    event.preventDefault()
-    const index = cycles.findIndex((cycle) => cycle.id === (context.over?.id ?? active))
-    const target = cycles[index + (event.code === 'ArrowDown' ? 1 : -1)]
-    const rect = target && context.droppableRects.get(target.id)
-    const current = context.collisionRect
-    if (index < 0 || !rect || !current) return
-    return { x: rect.left + (rect.width - current.width) / 2, y: rect.top + (rect.height - current.height) / 2 }
-  }
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: keyboardCoordinates, scrollBehavior: 'auto' }),
-  )
-  const position = (id: string | number) => `${t('dragPosition')}: ${cycles.findIndex((cycle) => cycle.id === id) + 1} / ${cycles.length}`
-  const announcements: Announcements = {
-    onDragStart: ({ active }) => `${t('dragCycleStarted')}: ${cycles.find((cycle) => cycle.id === active.id)?.name || ''}. ${position(active.id)}`,
-    onDragOver: ({ over }) => over ? position(over.id) : t('dragCycleOutside'),
-    onDragEnd: ({ over }) => over ? t('dragEnded') : t('dragCancelled'),
-    onDragCancel: () => t('dragCancelled'),
-  }
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('cycles')}</div>
-    <DndContext sensors={sensors} collisionDetection={(args) => args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)} accessibility={{ screenReaderInstructions: { draggable: t('dragCycleInstructions') }, announcements }} onDragEnd={({ active, over }) => { if (!over || active.id === over.id) return; const cycle = cycles.find((candidate) => candidate.id === active.id); if (cycle && cycles.some((candidate) => candidate.id === over.id)) onSort(cycle, String(over.id)) }}>
-      <SortableContext items={cycles} strategy={verticalListSortingStrategy}><div className="rail-items">{cycles.map((cycle) => <SortableCycleItem key={cycle.id} cycle={cycle} selected={selectedId === cycle.id} t={t} onSelect={onSelect} onEdit={onEdit} />)}{hasUnassigned ? <div className="rail-item-wrap"><span className="rail-grip-spacer" aria-hidden="true" /><button className={`rail-item ${selectedId === UNASSIGNED_CYCLE_ID ? 'selected' : ''}`} aria-current={selectedId === UNASSIGNED_CYCLE_ID ? 'page' : undefined} onClick={() => onSelect(UNASSIGNED_CYCLE_ID)}>{t('unassignedPlans')}</button></div> : null}</div></SortableContext>
-    </DndContext>
-    <button className="rail-add" onClick={onAdd}><Icon name="plus" />{t('addCycle')}</button></aside>
-}
-
-function SortableCycleItem({ cycle, selected, t, onSelect, onEdit }: { cycle: GoalCycle; selected: boolean; t: (key: CopyKey) => string; onSelect: (id: string) => void; onEdit: (cycle: GoalCycle) => void }) {
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: cycle.id })
-  return <div className={`rail-item-wrap ${isDragging ? 'is-dragging' : ''}`} ref={setNodeRef} style={{ transform: CSS.Translate.toString(transform), transition }}>
-    <button type="button" className="rail-grip" ref={setActivatorNodeRef} {...attributes} {...listeners} aria-roledescription={t('dragCycle')} aria-label={`${t('dragCycle')}: ${cycle.name}`} title={t('dragCycleInstructions')}><Icon name="grip" /></button>
-    <button className={`rail-item ${selected ? 'selected' : ''}`} aria-current={selected ? 'page' : undefined} onClick={() => onSelect(cycle.id)}><span>{cycle.name}</span><small>{cycle.startDate.slice(5)}</small></button>
-    {selected ? <button className="rail-edit" aria-label={t('editCycle')} onClick={() => onEdit(cycle)}><Icon name="edit" /></button> : null}
-  </div>
-}
-
-// 周、日的导航范围来自选中的长期周期；没有周期时保留独立的当前窗口，方便空板继续使用。
-const RAIL_ROW_HEIGHT = 52
-const RAIL_VIEW_HEIGHT = 480
-const RAIL_VIRTUAL_THRESHOLD = 9
-const RAIL_OVERSCAN = 4
-
-function useRailWindow<T>(items: T[], selectedIndex: number) {
-  const railRef = useRef<HTMLDivElement | null>(null)
-  const [scrollTop, setScrollTop] = useState(0)
-  const virtual = items.length > RAIL_VIRTUAL_THRESHOLD
-  useLayoutEffect(() => {
-    if (!railRef.current) return
-    const rail = railRef.current
-    const clamped = Math.min(rail.scrollTop, Math.max(0, rail.scrollHeight - rail.clientHeight))
-    if (rail.scrollTop !== clamped) rail.scrollTop = clamped
-    if (scrollTop !== clamped) setScrollTop(clamped)
-  }, [items.length, virtual])
-  useLayoutEffect(() => {
-    if (!virtual || selectedIndex < 0 || !railRef.current) return
-    const rail = railRef.current
-    const top = selectedIndex * RAIL_ROW_HEIGHT
-    const bottom = top + RAIL_ROW_HEIGHT
-    const nextScrollTop = top < rail.scrollTop ? top : bottom > rail.scrollTop + rail.clientHeight ? bottom - rail.clientHeight : rail.scrollTop
-    if (nextScrollTop !== rail.scrollTop) {
-      rail.scrollTop = nextScrollTop
-      setScrollTop(nextScrollTop)
-    }
-  }, [items.length, selectedIndex, virtual])
-  const start = virtual ? Math.max(0, Math.floor(scrollTop / RAIL_ROW_HEIGHT) - RAIL_OVERSCAN) : 0
-  const end = virtual ? Math.min(items.length, Math.ceil((scrollTop + RAIL_VIEW_HEIGHT) / RAIL_ROW_HEIGHT) + RAIL_OVERSCAN) : items.length
-  return { railRef, onScroll: (event: React.UIEvent<HTMLDivElement>) => setScrollTop(event.currentTarget.scrollTop), visible: items.slice(start, end), paddingTop: virtual ? start * RAIL_ROW_HEIGHT : 0, paddingBottom: virtual ? Math.max(0, (items.length - end) * RAIL_ROW_HEIGHT) : 0 }
-}
-
-function WeekRail({ selectedWeek, currentWeek, cycle, language, t, onSelect }: { selectedWeek: string; currentWeek: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (key: string) => void }) {
-  const weeks = useMemo(() => cycle ? weekKeysInRange(cycle.startDate, cycle.endDate) : [-2, -1, 0, 1, 2].map((offset) => weekKey(addDays(weekRange(selectedWeek).start, offset * 7))), [cycle?.startDate, cycle?.endDate, selectedWeek])
-  const items = useMemo(() => weeks.map((key) => ({ key, start: weekRange(key).start.slice(5), isCurrent: key === currentWeek })), [currentWeek, weeks])
-  const selectedIndex = items.findIndex((item) => item.key === selectedWeek)
-  const windowed = useRailWindow(items, selectedIndex)
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('weeks')}</div><div className={`rail-items ${weeks.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ key, start, isCurrent }) => <button className={`rail-item ${selectedWeek === key ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}`} aria-current={selectedWeek === key ? 'page' : undefined} aria-label={isCurrent ? `${key.slice(5)} · ${t('currentWeek')}` : key.slice(5)} key={key} onClick={() => onSelect(key)}><span>{key.slice(5)}{isCurrent ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{start}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div></aside>
-}
-
-function DayRail({ selectedDate, selectedWeek, todayKey, cycle, language, t, onSelect }: { selectedDate: string; selectedWeek: string; todayKey: string; cycle?: GoalCycle; language: Language; t: (key: CopyKey) => string; onSelect: (date: string) => void }) {
-  const days = useMemo(() => cycle ? dateKeysInRange(cycle.startDate, cycle.endDate) : Array.from({ length: 7 }, (_, index) => addDays(weekRange(selectedWeek).start, index)), [cycle?.startDate, cycle?.endDate, selectedWeek])
-  const items = useMemo(() => days.map((date) => ({ date, label: weekdayShortLabel(date, language), isToday: date === todayKey })), [days, language, todayKey])
-  const selectedIndex = items.findIndex((item) => item.date === selectedDate)
-  const windowed = useRailWindow(items, selectedIndex)
-  return <aside className="period-rail" aria-label={t('periodRail')}><div className="rail-heading">{t('days')}</div><div className={`rail-items ${days.length > 7 ? 'range-items' : ''}`} ref={windowed.railRef} onScroll={windowed.onScroll}>{windowed.paddingTop ? <div className="rail-spacer" style={{ height: windowed.paddingTop }} aria-hidden="true" /> : null}{windowed.visible.map(({ date, label, isToday }) => <button className={`rail-item day-item ${selectedDate === date ? 'selected' : ''} ${isToday ? 'is-current' : ''}`} aria-current={selectedDate === date ? 'page' : undefined} aria-label={isToday ? `${label} ${date.slice(5)} · ${t('currentDay')}` : `${label} ${date.slice(5)}`} key={date} onClick={() => onSelect(date)}><span>{label}{isToday ? <i className="current-mark" aria-hidden="true" /> : null}</span><small>{date.slice(5)}</small></button>)}{windowed.paddingBottom ? <div className="rail-spacer" style={{ height: windowed.paddingBottom }} aria-hidden="true" /> : null}</div></aside>
-}
-
-// “回到本周 / 回到今天”：按设计放在面板头部下方、右对齐；图标由“当前”圆点 + 返回箭头组成，
-// 可见文字只写“本周 / 今天”，完整语义由 aria-label / title 承担。
-function ReturnToCurrent({ label, hint, onClick }: { label: string; hint: string; onClick: () => void }) {
-  return <div className="panel-current"><button className="current-return" onClick={onClick} aria-label={hint} title={hint}><i className="current-mark" aria-hidden="true" /><Icon name="back" />{label}</button></div>
-}
-
-function SortableTaskList({ tasks, t, onSort, children }: { tasks: Task[]; t: (key: CopyKey) => string; onSort: (task: Task, targetId: string) => void; children: React.ReactNode }) {
-  const mounted = useRef(true)
-  // 传感器的结束事件可能晚于列表卸载；切换日期或退出看板后不能再提交旧拖拽。
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
-  const keyboardCoordinates: KeyboardCoordinateGetter = (event, { active, context }) => {
-    if (event.code !== 'ArrowUp' && event.code !== 'ArrowDown') return
-    event.preventDefault()
-    const index = tasks.findIndex((task) => task.id === (context.over?.id ?? active))
-    const target = tasks[index + (event.code === 'ArrowDown' ? 1 : -1)]
-    const rect = target && context.droppableRects.get(target.id)
-    const current = context.collisionRect
-    if (index < 0 || !rect || !current) return
-    // 长备注会产生高度差很大的卡片；对齐中心才能与键盘的 closestCenter 落点一致。
-    return { x: rect.left + (rect.width - current.width) / 2, y: rect.top + (rect.height - current.height) / 2 }
-  }
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: keyboardCoordinates, scrollBehavior: 'auto' }),
-  )
-  const position = (id: string | number) => `${t('dragPosition')}: ${tasks.findIndex((task) => task.id === id) + 1} / ${tasks.length}`
-  const announcements: Announcements = {
-    onDragStart: ({ active }) => `${t('dragStarted')}: ${tasks.find((task) => task.id === active.id)?.title || ''}. ${position(active.id)}`,
-    onDragOver: ({ over }) => over ? position(over.id) : t('dragOutside'),
-    onDragEnd: ({ over }) => over ? t('dragEnded') : t('dragCancelled'),
-    onDragCancel: () => t('dragCancelled'),
-  }
-  return <DndContext sensors={sensors}
-    collisionDetection={(args) => args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)}
-    accessibility={{ screenReaderInstructions: { draggable: t('dragInstructions') }, announcements }}
-    onDragEnd={({ active, over }) => {
-      if (!mounted.current || !over || active.id === over.id) return
-      const task = tasks.find((candidate) => candidate.id === active.id)
-      if (task && tasks.some((candidate) => candidate.id === over.id)) onSort(task, String(over.id))
-    }}>
-    <SortableContext items={tasks} strategy={verticalListSortingStrategy}>{children}</SortableContext>
-  </DndContext>
-}
-
-function TaskPanel({ domain, title, hint, language, t, tasks, snapshot, timeZone, selectedId, selectedChain, registerRow, rail, currentAction, canAdd, canCreate = true, onAdd, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule, panelRef }: {
-  domain: Domain; title: string; hint: string; language: Language; t: (key: CopyKey) => string; tasks: Task[]; snapshot: BoardSnapshot; timeZone: string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; rail: React.ReactNode; currentAction?: React.ReactNode; canAdd: boolean; canCreate?: boolean; onAdd: () => void; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void; panelRef?: (element: HTMLElement | null) => void
-  onSort: (task: Task, targetId: string) => void
-}) {
-  const topLevel = tasks.filter((task) => !task.parentId)
-  const addEnabled = canAdd && canCreate
-  const carrySource = carriedFromLabels(snapshot)
-  return <section className={`panel-shell domain-${domain}`} ref={panelRef} aria-labelledby={`panel-${domain}`}>
-    {rail}<div className="paper-panel"><div className="panel-top"><div><div className="eyebrow">{domain === 'long' ? '01' : domain === 'weekly' ? '02' : '03'}</div><h2 id={`panel-${domain}`}>{title}</h2><p>{hint}</p></div><button className="add-button" onClick={onAdd} disabled={!addEnabled}><Icon name="plus" />{t('addTask')}</button></div>
-      {currentAction}
-      {(domain === 'daily' || domain === 'weekly') && tasks.some((task) => isPastPlacement(task, snapshot.settings.timeZone)) ? <div className="past-note">{t('reschedule')}</div> : null}
-      {!canAdd ? <div className="empty-panel"><div className="empty-glyph">○</div><p>{t('noCycles')}</p></div> : topLevel.length === 0 ? <div className="empty-panel"><div className="empty-glyph">—</div><p>{domain === 'long' ? t('emptyLong') : domain === 'weekly' ? t('emptyWeekly') : t('emptyDaily')}</p><button className="text-button" onClick={onAdd} disabled={!addEnabled}>{t('addTask')}</button></div> : <div className="task-list"><SortableTaskList key={JSON.stringify([topLevel[0].cycleId, topLevel[0].weekKey, topLevel[0].dateKey])} tasks={topLevel} t={t} onSort={onSort}>{topLevel.map((task) => <TaskRow key={task.id} task={task} childrenTasks={tasks.filter((candidate) => candidate.parentId === task.id)} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} carrySource={carrySource} />)}</SortableTaskList></div>}
-      <div className="paper-space" />
-    </div>
-  </section>
-}
-
-function TaskRow({ task, childrenTasks, timeZone, language, t, selectedId, selectedChain, registerRow, carrySource, onEdit, onDelete, onToggle, onReorder, onSort, onSelect, onAddSubtask, onReschedule }: {
-  task: Task; childrenTasks: Task[]; timeZone: string; language: Language; t: (key: CopyKey) => string; selectedId: string | null; selectedChain: Set<string>; registerRow: (id: string) => (element: HTMLElement | null) => void; carrySource: Map<string, string>; onEdit: (task: Task) => void; onDelete: (task: Task) => void; onToggle: (task: Task) => void; onReorder: (task: Task, direction: -1 | 1) => void; onSelect: (id: string) => void; onAddSubtask: (task: Task) => void; onReschedule?: (task: Task) => void
-  onSort: (task: Task, targetId: string) => void
-}) {
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: task.id })
-  const isPast = isPastPlacement(task, timeZone)
-  const carriedFrom = carrySource.get(task.id)
-  return <div className={`task-tree ${isDragging ? 'is-dragging' : ''}`} ref={setNodeRef} style={{ transform: CSS.Translate.toString(transform), transition }}><div className={`task-row ${selectedId === task.id ? 'selected' : ''} ${selectedChain.has(task.id) ? 'is-linked' : ''} ${task.checked ? 'is-checked' : ''} ${isPast && onReschedule ? 'is-past' : ''}`} data-task-id={task.id} ref={registerRow(task.id)}>
-    <button type="button" className="drag-handle" ref={setActivatorNodeRef} {...attributes} {...listeners} aria-roledescription={t('dragTask')} aria-label={`${t('dragTask')}: ${task.title}`} title={t('dragInstructions')}><Icon name="grip" /></button>
-    <button className="task-select" onClick={() => onSelect(task.id)} aria-label={`${t('taskDetails')}: ${task.title}`}><span className={`task-stroke stroke-${task.color}`} /></button>
-    <input type="checkbox" checked={task.checked} onChange={() => onToggle(task)} aria-label={`${task.title} · ${task.checked ? t('taskChecked') : t('taskUnchecked')}`} />
-    <button className="task-title" onClick={() => { onSelect(task.id); onEdit(task) }} title={t('taskDetails')}><span>{task.title}</span>{task.note ? <small>{task.note}</small> : null}</button>
-    {task.upperTaskId ? <span className="link-mark" title={t('association')}><Icon name="link" /></span> : null}
-    {carriedFrom ? <span className="carry-tag" title={`${t('carriedFrom')} ${carriedFrom}`}>{carriedFrom.slice(5)}</span> : null}
-    <span className="row-break" aria-hidden="true" />
-    {isPast && onReschedule ? <button className="row-action reschedule-action" onClick={() => onReschedule(task)}>{t('reschedule')}</button> : null}
-    <div className="row-actions">{!task.parentId ? <button className="row-icon" aria-label={t('addSubtask')} title={t('addSubtask')} onClick={() => onAddSubtask(task)}><Icon name="subtask" /></button> : null}<button className="row-icon" aria-label={t('moveUp')} title={t('moveUp')} onClick={() => onReorder(task, -1)}><Icon name="up" /></button><button className="row-icon" aria-label={t('moveDown')} title={t('moveDown')} onClick={() => onReorder(task, 1)}><Icon name="down" /></button><button className="row-icon" aria-label={t('edit')} title={t('edit')} onClick={() => onEdit(task)}><Icon name="edit" /></button><button className="row-icon danger" aria-label={t('delete')} title={t('delete')} onClick={() => onDelete(task)}><Icon name="trash" /></button></div>
-  </div>{childrenTasks.length ? <div className="subtask-list"><SortableTaskList tasks={childrenTasks} t={t} onSort={onSort}>{childrenTasks.map((child) => <TaskRow key={child.id} task={child} childrenTasks={[]} timeZone={timeZone} language={language} t={t} selectedId={selectedId} selectedChain={selectedChain} registerRow={registerRow} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle} onReorder={onReorder} onSort={onSort} onSelect={onSelect} onAddSubtask={onAddSubtask} onReschedule={onReschedule} carrySource={carrySource} />)}</SortableTaskList></div> : null}</div>
-}
-
-function FocusPanel({ blocks, allTasks, selectedDate, language, t, now, rail, currentAction, canAdd = true, onAdd, onEdit, onDelete, onCommand, panelRef }: {
-  blocks: FocusBlock[]; allTasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; now: number; rail: React.ReactNode; currentAction?: React.ReactNode; canAdd?: boolean; onAdd: () => void; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void; panelRef?: (element: HTMLElement | null) => void
-}) {
-  return <section className="panel-shell focus-shell" ref={panelRef} aria-labelledby="panel-focus">{rail}<div className="focus-panel"><div className="panel-top"><div><div className="eyebrow">{`04 · ${t('timeLabel')}`}</div><h2 id="panel-focus">{t('focus')}</h2><p>{t('focusHint')}</p></div><button className="add-button light" onClick={onAdd} disabled={!canAdd}><Icon name="plus" />{t('add')}</button></div>{currentAction}<div className="focus-date-label">{formatDateKey(selectedDate, language)} <span>{selectedDate}</span></div>{blocks.length ? <div className="focus-list">{blocks.map((block) => <FocusCard key={block.id} block={block} allTasks={allTasks} language={language} t={t} now={now} onEdit={onEdit} onDelete={onDelete} onCommand={onCommand} />)}</div> : <div className="focus-empty"><div className="empty-glyph">◯</div><p>{t('emptyFocus')}</p><button className="text-button light-text" onClick={onAdd} disabled={!canAdd}>{t('add')}</button></div>}<div className="focus-space" /></div></section>
-}
-
-function FocusCard({ block, allTasks, language, t, now, onEdit, onDelete, onCommand }: { block: FocusBlock; allTasks: Task[]; language: Language; t: (key: CopyKey) => string; now: number; onEdit: (block: FocusBlock) => void; onDelete: (block: FocusBlock) => void; onCommand: (block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') => void }) {
-  const elapsed = Math.min(elapsedMsAt(block, now), block.durationMinutes * 60_000)
-  const status = focusDisplayStatus(block, now)
-  const task = allTasks.find((candidate) => candidate.id === block.taskId)
-  const subtasks = task ? allTasks.filter((candidate) => candidate.parentId === task.id && !candidate.archivedAt) : []
-  const percentage = Math.min(100, Math.round((elapsed / (block.durationMinutes * 60_000)) * 100))
-  // 到时间时显示完整时长，避免四舍五入后出现 “0 / 0.1 分钟” 这类与“时间到”矛盾的读数。
-  const summary = `${status === 'complete' ? block.durationMinutes : Math.round(elapsed / 60_000)} / ${block.durationMinutes} ${t('minutes')}`
-  return <article className={`focus-card ${status === 'finished' || status === 'complete' ? 'muted' : ''} ${status === 'running' ? 'active' : ''}`}>
-    <div className="focus-card-head"><span className="focus-status-icon">{status === 'finished' || status === 'complete' ? '✓' : status === 'running' ? '◉' : '○'}</span><div className="focus-card-title"><strong>{block.title}</strong>{task ? <small>{task.title}</small> : null}</div><div className="focus-card-actions">{status === 'running' ? <button className="stop-button" onClick={() => onCommand(block, 'finish')}>{t('stop')}</button> : null}<button className="row-icon light-icon" aria-label={t('edit')} title={t('edit')} onClick={() => onEdit(block)}><Icon name="edit" /></button><button className="row-icon light-icon danger" aria-label={t('delete')} title={t('delete')} onClick={() => onDelete(block)}><Icon name="trash" /></button></div></div>
-    {subtasks.length ? <div className="focus-subtasks">{subtasks.map((subtask) => <span key={subtask.id} className={subtask.checked ? 'done' : ''}>□ {subtask.title}</span>)}</div> : null}<div className="focus-time"><span>{status === 'running' ? formatTimer(block, now) : summary}</span><small>{status === 'running' ? t('running') : status === 'paused' ? t('paused') : status === 'complete' ? t('complete') : t('finished')}</small></div>
-    <div className="timer-track"><span style={{ width: `${percentage}%` }} /></div>
-    <div className="focus-card-foot"><span>{t('elapsed')} {summary}</span><div>{status === 'paused' ? <button className="card-button" onClick={() => onCommand(block, block.elapsedMs > 0 ? 'resume' : 'start')}>{block.elapsedMs > 0 ? t('resume') : t('start')}</button> : status === 'running' ? <button className="card-button" onClick={() => onCommand(block, 'pause')}>{t('pause')}</button> : status === 'complete' ? <button className="card-button" onClick={() => onCommand(block, 'finish')}>{t('finish')}</button> : null}</div></div>
-  </article>
-}
-
-function formatTimer(block: FocusBlock, now: number): string {
-  const remaining = Math.max(0, block.durationMinutes * 60_000 - elapsedMsAt(block, now))
-  const totalSeconds = Math.ceil(remaining / 1000)
-  const hours = Math.floor(totalSeconds / 3600)
-  const minutes = Math.floor((totalSeconds % 3600) / 60)
-  const seconds = totalSeconds % 60
-  return `${hours ? `${String(hours).padStart(2, '0')}:` : ''}${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-}
-
-function ConnectorLayer({ stage, snapshot, rowRefs, selectedChain }: { stage: HTMLDivElement | null; snapshot: BoardSnapshot; rowRefs: React.MutableRefObject<Map<string, HTMLElement>>; selectedChain: Set<string> }) {
-  const [geometry, setGeometry] = useState({ width: 1, height: 1, paths: [] as Array<{ id: string; d: string; active: boolean }> })
-  useLayoutEffect(() => {
-    if (!stage) return
-    const draw = () => {
-      const stageRect = stage.getBoundingClientRect()
-      const width = Math.max(1, stage.offsetWidth)
-      const height = Math.max(1, stage.offsetHeight)
-      const paths: Array<{ id: string; d: string; active: boolean }> = []
-      for (const task of snapshot.tasks) {
-        if (task.archivedAt || !task.upperTaskId) continue
-        const lower = rowRefs.current.get(task.id)
-        const upper = rowRefs.current.get(task.upperTaskId)
-        if (!lower || !upper) continue
-        const lowerRect = lower.getBoundingClientRect()
-        const upperRect = upper.getBoundingClientRect()
-        const lowerIsRight = lowerRect.left > upperRect.left
-        const source = lowerIsRight ? lowerRect.left - stageRect.left : lowerRect.right - stageRect.left
-        const target = lowerIsRight ? upperRect.right - stageRect.left : upperRect.left - stageRect.left
-        const y1 = lowerRect.top - stageRect.top + lowerRect.height / 2
-        const y2 = upperRect.top - stageRect.top + upperRect.height / 2
-        const curve = Math.max(24, Math.abs(target - source) * 0.38)
-        const d = lowerIsRight ? `M ${source} ${y1} C ${source - curve} ${y1}, ${target + curve} ${y2}, ${target} ${y2}` : `M ${source} ${y1} C ${source + curve} ${y1}, ${target - curve} ${y2}, ${target} ${y2}`
-        paths.push({ id: `${task.id}:${task.upperTaskId}`, d, active: selectedChain.has(task.id) && selectedChain.has(task.upperTaskId) })
-      }
-      setGeometry({ width, height, paths })
-    }
-    draw()
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(draw)
-    observer?.observe(stage)
-    const scroll = stage.closest('.workspace-scroll')
-    scroll?.addEventListener('scroll', draw, { passive: true })
-    const mutation = typeof MutationObserver === 'undefined' ? null : new MutationObserver(draw)
-    mutation?.observe(stage, { childList: true, subtree: true, attributes: true })
-    window.addEventListener('resize', draw)
-    return () => { observer?.disconnect(); mutation?.disconnect(); scroll?.removeEventListener('scroll', draw); window.removeEventListener('resize', draw) }
-  }, [rowRefs, snapshot, selectedChain, stage])
-  return <svg className="connector-layer" width="100%" height="100%" viewBox={`0 0 ${geometry.width} ${geometry.height}`} aria-hidden="true">{geometry.paths.map((path) => <path key={path.id} d={path.d} className={path.active ? 'connector active' : 'connector'} />)}</svg>
-}
-
-function TaskChoice({ id, label, value, noneLabel, options, onChange }: { id: string; label: string; value: string; noneLabel: string; options: Array<{ value: string; label: string }>; onChange: (value: string) => void }) {
-  const choices = [{ value: '', label: noneLabel }, ...options]
-  const selectedIndex = Math.max(0, choices.findIndex((choice) => choice.value === value))
-  const selected = choices[selectedIndex]
-  const [open, setOpen] = useState(false)
-  const [activeIndex, setActiveIndex] = useState(selectedIndex)
-  const rootRef = useRef<HTMLDivElement | null>(null)
-  const triggerRef = useRef<HTMLButtonElement | null>(null)
-  const optionRefs = useRef<Array<HTMLButtonElement | null>>([])
-
-  useEffect(() => {
-    if (!open) return
-    setActiveIndex(selectedIndex)
-    optionRefs.current[selectedIndex]?.focus()
-    const onPointerDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
-    }
-    document.addEventListener('mousedown', onPointerDown)
-    return () => document.removeEventListener('mousedown', onPointerDown)
-  }, [open, selectedIndex])
-
-  const choose = (next: string) => {
-    onChange(next)
-    setOpen(false)
-    requestAnimationFrame(() => triggerRef.current?.focus())
-  }
-
-  const move = (direction: -1 | 1) => {
-    const next = (activeIndex + direction + choices.length) % choices.length
-    setActiveIndex(next)
-    optionRefs.current[next]?.focus()
-  }
-
-  const onTriggerKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault()
-      setOpen(true)
-    } else if (event.key === 'Escape' && open) {
-      event.preventDefault()
-      setOpen(false)
-    }
-  }
-
-  const onListKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'ArrowDown') { event.preventDefault(); move(1) }
-    else if (event.key === 'ArrowUp') { event.preventDefault(); move(-1) }
-    else if (event.key === 'Home') { event.preventDefault(); setActiveIndex(0); optionRefs.current[0]?.focus() }
-    else if (event.key === 'End') { event.preventDefault(); const last = choices.length - 1; setActiveIndex(last); optionRefs.current[last]?.focus() }
-    else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); choose(choices[activeIndex].value) }
-    else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setOpen(false); triggerRef.current?.focus() }
-    else if (event.key === 'Tab') {
-      event.preventDefault()
-      event.stopPropagation()
-      setOpen(false)
-      requestAnimationFrame(() => {
-        const dialog = rootRef.current?.closest('[role="dialog"]')
-        const focusable = dialog ? [...dialog.querySelectorAll<HTMLElement>('button,input,select,textarea,[href]')].filter((candidate) => !candidate.hasAttribute('disabled') && !candidate.closest('[role="listbox"]')) : []
-        const index = triggerRef.current ? focusable.indexOf(triggerRef.current) : -1
-        focusable[index + (event.shiftKey ? -1 : 1)]?.focus()
-      })
-    }
-  }
-
-  return <div className="choice-field" ref={rootRef}>
-    <span className="choice-label" id={`${id}-label`}>{label}</span>
-    <button type="button" id={id} ref={triggerRef} className="choice-trigger" aria-haspopup="listbox" aria-expanded={open} aria-controls={`${id}-listbox`} aria-labelledby={`${id}-label`} onClick={() => setOpen((value) => !value)} onKeyDown={onTriggerKeyDown}>
-      <span>{selected.label}</span><span className="choice-chevron" aria-hidden="true">⌄</span>
-    </button>
-    {open ? <div id={`${id}-listbox`} className="choice-menu" role="listbox" aria-labelledby={`${id}-label`} onKeyDown={onListKeyDown}>{choices.map((choice, index) => <button type="button" role="option" aria-selected={choice.value === value} className={`choice-option ${choice.value === value ? 'selected' : ''}`} ref={(element) => { optionRefs.current[index] = element }} key={choice.value || 'none'} onClick={() => choose(choice.value)}>{choice.label}</button>)}</div> : null}
-  </div>
-}
-
-function TaskDialog({ task, domain, parentId, initial, placement, cycle, tasks, t, onClose, onSubmit }: { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement: { cycleId?: string; weekKey?: string; dateKey?: string }; cycle?: GoalCycle; tasks: Task[]; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: TaskInput) => void }) {
-  const [title, setTitle] = useState(initial?.title || task?.title || '')
-  const [note, setNote] = useState(initial?.note ?? task?.note ?? '')
-  const [color, setColor] = useState<TaskColor>(initial?.color || task?.color || 'ink')
-  const [upperTaskId, setUpperTaskId] = useState(initial?.upperTaskId || task?.upperTaskId || '')
-  const [selectedParent, setSelectedParent] = useState(initial?.parentId || parentId || task?.parentId || '')
-  // 子任务的放置由父任务决定，只有顶层任务能改日期（日）或周次（周）。
-  const canEditDate = domain === 'daily' && !parentId && !task?.parentId
-  const canEditWeek = domain === 'weekly' && !parentId && !task?.parentId
-  const [dateKey, setDateKey] = useState(initial?.dateKey || task?.dateKey || placement.dateKey || '')
-  const [weekValue, setWeekValue] = useState(initial?.weekKey || task?.weekKey || placement.weekKey || '')
-  // 放置变了，原先选中的父任务可能已不在同一格；留着它提交必然被校验拒绝，所以直接清掉。
-  const changeDate = (value: string) => {
-    setDateKey(value)
-    if (selectedParent && tasks.find((candidate) => candidate.id === selectedParent)?.dateKey !== value) setSelectedParent('')
-  }
-  const changeWeek = (value: string) => {
-    setWeekValue(value)
-    if (selectedParent && tasks.find((candidate) => candidate.id === selectedParent)?.weekKey !== value) setSelectedParent('')
-  }
-  // 候选必须与新任务落在同一放置位置，否则校验必然失败（用户会看到无法保存的选项）。
-  // 项目归属与日期分别比较，再比较“候选所在域”的日历放置键：
-  // 上级候选属于另一个域（周←长期、日←周），要用该域的键（周期 / 周），不能拿子任务自己的键去比。
-  const valueFor = (valueDomain: Domain, source: { cycleId?: string; weekKey?: string; dateKey?: string }) =>
-    valueDomain === 'long' ? source.cycleId : valueDomain === 'weekly' ? source.weekKey : source.dateKey
-  // 改日期会同时换掉所在周，上级（周任务）候选必须跟着换，否则下拉里会没有可选项。
-  const selectedPlacement = canEditDate && dateKey
-    ? { ...placement, weekKey: weekKey(dateKey), dateKey }
-    : canEditWeek && weekValue ? { ...placement, weekKey: weekValue } : placement
-  const ownPlacement = {
-    cycleId: task ? task.cycleId : selectedPlacement.cycleId,
-    weekKey: canEditWeek ? weekValue : task?.weekKey ?? selectedPlacement.weekKey,
-    dateKey: canEditDate ? dateKey : task?.dateKey ?? selectedPlacement.dateKey,
-  }
-  const upperDomain: Domain = domain === 'weekly' ? 'long' : 'weekly'
-  // 校验只要求上级是同域顶层任务，不限制其放置位置；编辑时若当前选中的周期/周与已存在的关联不同，
-  // 仍要把现有上级列进候选，否则下拉会显示空白（值不在选项里）。
-  // 下拉自身的值优先，其次是已存任务的关联，最后是保留草稿的关联；三者都列进候选才不会显示空白。
-  const keptUpperId = upperTaskId || task?.upperTaskId || initial?.upperTaskId
-  const upperOptions = tasks.filter((candidate) => !candidate.parentId && !candidate.archivedAt && candidate.domain === upperDomain && candidate.id !== task?.id &&
-    candidate.cycleId === ownPlacement.cycleId &&
-    (candidate.id === keptUpperId || valueFor(upperDomain, candidate) === valueFor(upperDomain, selectedPlacement)))
-  const parentOptions = tasks.filter((candidate) => !candidate.parentId && !candidate.archivedAt && candidate.domain === domain && candidate.id !== task?.id &&
-    candidate.cycleId === ownPlacement.cycleId &&
-    valueFor(domain, candidate) === valueFor(domain, ownPlacement))
-  // 旧版可能把任务顺延到周期外：只有停在那个原放置时才豁免原生 min/max，一旦改了它就恢复周期范围，
-  // 否则凭当前输入值扩张边界，等于把越界限制整个放开了。
-  const keepsLegacyDate = Boolean(cycle && task?.dateKey && dateKey === task.dateKey && (task.dateKey < cycle.startDate || task.dateKey > cycle.endDate))
-  const dateMin = keepsLegacyDate ? undefined : cycle?.startDate
-  const dateMax = keepsLegacyDate ? undefined : cycle?.endDate
-  const keepsLegacyWeek = Boolean(cycle && task?.weekKey && weekValue === task.weekKey && (task.weekKey < weekKey(cycle.startDate) || task.weekKey > weekKey(cycle.endDate)))
-  const weekMin = keepsLegacyWeek || !cycle ? undefined : weekKey(cycle.startDate)
-  const weekMax = keepsLegacyWeek || !cycle ? undefined : weekKey(cycle.endDate)
-  return <Dialog closeLabel={t('close')} title={task ? t('edit') : parentId ? t('addSubtask') : t('addTask')} onClose={onClose} initialFocus="task-title">
-    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (!title.trim()) return; onSubmit({ title, note, color, dateKey: canEditDate ? dateKey || undefined : undefined, weekKey: canEditWeek ? weekValue || undefined : undefined, upperTaskId: selectedParent ? undefined : upperTaskId || undefined, parentId: selectedParent || undefined }) }}>
-      <label>{t('title')}<input id="task-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={MAX_TASK_TITLE_LENGTH} required /></label>
-      {canEditDate ? <label>{t('date')}<input id="task-date" type="date" value={dateKey} min={dateMin} max={dateMax} onChange={(event) => changeDate(event.target.value)} required /></label> : null}
-      {canEditWeek ? <label>{t('week')}<input id="task-week" type="week" value={weekValue} min={weekMin} max={weekMax} onChange={(event) => changeWeek(event.target.value)} required /></label> : null}
-      <label>{t('note')}<textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={MAX_TASK_NOTE_LENGTH} rows={5} /></label>
-      <fieldset className="color-field"><legend>{t('color')}</legend><div className="color-picker">{([['ink', 'colorInk'], ['blue', 'colorBlue'], ['orange', 'colorOrange'], ['green', 'colorGreen'], ['violet', 'colorViolet']] as const).map(([value, label]) => <label className={`color-choice color-${value}`} key={value} title={t(label)}><input type="radio" name="task-color" value={value} checked={color === value} onChange={() => setColor(value)} /><span className="color-swatch" aria-hidden="true" /><span className="sr-only">{t(label)}</span></label>)}</div></fieldset>
-      {!parentId && domain !== 'long' ? <TaskChoice id="task-association" label={t('association')} value={upperTaskId} noneLabel={t('none')} options={upperOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setUpperTaskId(value); if (value) setSelectedParent('') }} /> : null}
-      {!task && !parentId ? <TaskChoice id="task-parent" label={t('parentTask')} value={selectedParent} noneLabel={t('none')} options={parentOptions.map((candidate) => ({ value: candidate.id, label: candidate.title }))} onChange={(value) => { setSelectedParent(value); if (value) setUpperTaskId('') }} /> : null}
-      <div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div>
-    </form>
-  </Dialog>
-}
-
-function CycleDialog({ cycle, initial, board, deleteBlocked, language, t, onClose, onSubmit, onDelete }: { cycle?: GoalCycle; initial?: { name: string; startDate: string; endDate: string }; board: StoredBoard; deleteBlocked: boolean; language: Language; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: { name: string; startDate: string; endDate: string }) => void; onDelete: (cycle: GoalCycle, confirmedBoard: StoredBoard) => void }) {
-  const today = todayInTimeZone(safeTimeZone())
-  const [name, setName] = useState(initial?.name || cycle?.name || '')
-  const [startDate, setStartDate] = useState(initial?.startDate || cycle?.startDate || today)
-  const [endDate, setEndDate] = useState(initial?.endDate || cycle?.endDate || addDays(today, 30))
-  const [confirmingDelete, setConfirmingDelete] = useState(false)
-  const savedCycle = board.snapshot.cycles.find((candidate) => candidate.id === cycle?.id)
-  // 同一个弹窗切换确认页，取消后仍保留编辑中的字段；远端版本变化则清空名称确认。
-  if (confirmingDelete && cycle) return <DeleteCycleDialog key={board.revision} cycle={savedCycle || cycle} taskCount={board.snapshot.tasks.filter((task) => task.cycleId === cycle.id).length} blocked={deleteBlocked || !savedCycle} t={t} onClose={() => setConfirmingDelete(false)} onSubmit={() => onDelete(savedCycle || cycle, board)} />
-  return <Dialog closeLabel={t('close')} title={cycle ? t('editCycle') : t('addCycle')} onClose={onClose} initialFocus="cycle-name"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit({ name, startDate, endDate }) }}>
-    <label>{t('cycleName')}<input id="cycle-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={160} required /></label><div className="field-row"><label>{t('startDate')}<input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} required /></label><label>{t('endDate')}<input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} required /></label></div><p className="form-hint">{t('rangeHint')}</p>
-    {cycle && deleteBlocked ? <p className="form-hint" role="status">{t('deleteCycleBlocked')}</p> : null}
-    <div className="dialog-actions cycle-dialog-actions">{cycle ? <button type="button" className="text-button cycle-delete-entry" disabled={deleteBlocked || !savedCycle} onClick={() => setConfirmingDelete(true)}>{t('deleteCycle')}</button> : null}<button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div>
-  </form></Dialog>
-}
-
-function DeleteCycleDialog({ cycle, taskCount, blocked, t, onClose, onSubmit }: { cycle: GoalCycle; taskCount: number; blocked: boolean; t: (key: CopyKey) => string; onClose: () => void; onSubmit: () => void }) {
-  const [confirmation, setConfirmation] = useState('')
-  const canDelete = !blocked && (taskCount === 0 || confirmation === cycle.name)
-  return <Dialog closeLabel={t('close')} title={t('deleteCycleTitle').replace('{name}', cycle.name)} onClose={onClose} initialFocus={taskCount ? 'delete-cycle-name' : 'cancel-cycle-delete'}>
-    <form className="dialog-form" onSubmit={(event) => { event.preventDefault(); if (canDelete) onSubmit() }}>
-      <div className="cycle-delete-summary" id="cycle-delete-summary"><p>{t('deleteCycleSummary').replace('{count}', String(taskCount))}</p><p>{t('deleteCycleKeepFocus')}</p></div>
-      <p className="cycle-delete-warning" id="cycle-delete-warning">{t('deleteCycleWarning')}</p>
-      {taskCount ? <label>{t('deleteCycleConfirmName')}<strong className="cycle-delete-name">{cycle.name}</strong><input id="delete-cycle-name" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} aria-describedby="cycle-delete-summary cycle-delete-warning" autoComplete="off" spellCheck={false} maxLength={160} required /></label> : null}
-      {blocked ? <p className="form-hint" role="status">{t('deleteCycleBlocked')}</p> : null}
-      <div className="dialog-actions"><button id="cancel-cycle-delete" type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button danger-button" type="submit" disabled={!canDelete}>{t('deleteCycle')}</button></div>
-    </form>
-  </Dialog>
-}
-
-function FocusDialog({ block, initial, tasks, selectedDate, language, t, onClose, onSubmit }: { block?: FocusBlock; initial?: FocusInput; tasks: Task[]; selectedDate: string; language: Language; t: (key: CopyKey) => string; onClose: () => void; onSubmit: (input: FocusInput) => void }) {
-  const [title, setTitle] = useState(initial?.title || block?.title || '')
-  const [durationMinutes, setDurationMinutes] = useState(initial?.durationMinutes || String(block?.durationMinutes || 45))
-  const [taskId, setTaskId] = useState(initial?.taskId || block?.taskId || '')
-  const locked = Boolean(block && (block.status !== 'paused' || block.elapsedMs > 0))
-  return <Dialog closeLabel={t('close')} title={block ? t('edit') : t('add')} onClose={onClose} initialFocus="focus-title"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit({ title, durationMinutes, taskId: taskId || undefined }) }}>
-    <label>{t('focusTitle')}<input id="focus-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={300} required /></label><label>{t('duration')}<input type="number" min="0.1" max="1440" step="0.1" value={durationMinutes} disabled={locked} onChange={(event) => setDurationMinutes(event.target.value)} required />{locked ? <small className="field-note">{t('focusDurationLocked')}</small> : null}</label><label>{t('focusTask')}<select value={taskId} onChange={(event) => setTaskId(event.target.value)}><option value="">{t('none')}</option>{tasks.filter((task) => task.dateKey === selectedDate || task.id === block?.taskId).map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select></label><p className="form-hint">{t('focusDate')}: {formatDateKey(selectedDate, language)}</p><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div>
-  </form></Dialog>
-}
-
-function SettingsDialog({ zone, language, t, onClose, onLanguage, onSubmit, onAccount }: { zone: string; language: Language; t: (key: CopyKey) => string; onClose: () => void; onLanguage: (language: Language) => void; onSubmit: (zone: string) => void; onAccount?: () => void }) {
-   const [value, setValue] = useState(zone)
-   return <Dialog closeLabel={t('close')} title={t('settings')} onClose={onClose} initialFocus="timezone"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit(value) }}><label>{t('timezone')}<input id="timezone" list="timezone-options" value={value} onChange={(event) => setValue(event.target.value)} maxLength={100} required /><datalist id="timezone-options"><option value="UTC" /><option value="Asia/Shanghai" /><option value="Asia/Tokyo" /><option value="America/New_York" /><option value="America/Los_Angeles" /><option value="Europe/London" /></datalist></label><p className="form-hint">{t('timezoneHint')}</p>{onAccount ? <button type="button" className="secondary-button" onClick={onAccount}>{t('accountTools')}</button> : null}<div className="setting-language"><span>{t('language')}</span><div className="language-switch"><button type="button" className={language === 'zh' ? 'active' : ''} onClick={() => onLanguage('zh')}>{t('chinese')}</button><button type="button" className={language === 'en' ? 'active' : ''} onClick={() => onLanguage('en')}>{t('english')}</button></div></div><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('save')}</button></div></form></Dialog>
-}
-
 // 顺延只允许往后：min 挡住选了也必然失败的过去日期，默认值取次日/下周让用户直接确认。
 function nextRescheduleTarget(task: Task, zone: string): { value: string; kind: 'date' | 'week' } {
   if (task.domain === 'weekly') return { value: weekKey(addDays(weekRange(task.weekKey || weekKey(todayInTimeZone(zone))).start, 7)), kind: 'week' }
   return { value: addDays(task.dateKey || todayInTimeZone(zone), 1), kind: 'date' }
 }
 
-function RescheduleDialog({ task, language, t, zone, onClose, onSubmit }: { task: Task; language: Language; t: (key: CopyKey) => string; zone: string; onClose: () => void; onSubmit: (target: string) => void }) {
-  const target = nextRescheduleTarget(task, zone)
-  const [value, setValue] = useState(target.value)
-   return <Dialog closeLabel={t('close')} title={t('reschedule')} onClose={onClose} initialFocus="reschedule-target"><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); onSubmit(value) }}><p className="reschedule-copy"><strong>{task.title}</strong><span>{t('rescheduleHint')}</span></p><label>{t('rescheduleTitle')}<input id="reschedule-target" type={target.kind} value={value} min={target.value} onChange={(event) => setValue(event.target.value)} required /></label><div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>{t('cancel')}</button><button className="primary-button" type="submit">{t('reschedule')}</button></div></form></Dialog>
-}
-
-function Dialog({ title, closeLabel, children, onClose, initialFocus }: { title: string; closeLabel: string; children: React.ReactNode; onClose: () => void; initialFocus?: string }) {
-  const dialogRef = useRef<HTMLDivElement | null>(null)
-  const onCloseRef = useRef(onClose)
-  const initialFocusRef = useRef(initialFocus)
-  onCloseRef.current = onClose
-  useEffect(() => {
-    const dialog = dialogRef.current
-    if (!dialog) return
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const element = initialFocusRef.current ? document.getElementById(initialFocusRef.current) : dialog.querySelector<HTMLElement>('input,button,select,textarea')
-    element?.focus()
-    return () => { if (previousFocus?.isConnected) previousFocus.focus() }
-  }, [])
-  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.defaultPrevented) return
-    if (event.key === 'Escape') { event.preventDefault(); onCloseRef.current(); return }
-    if (event.key !== 'Tab') return
-    const dialog = dialogRef.current
-    if (!dialog) return
-    const focusable = [...dialog.querySelectorAll<HTMLElement>('button,input,select,textarea,[href]')].filter((candidate) => !candidate.hasAttribute('disabled'))
-    if (!focusable.length) return
-    const first = focusable[0]
-    const last = focusable[focusable.length - 1]
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
-  }
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onCloseRef.current() }}><div className="dialog" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="dialog-title" onKeyDown={onKeyDown}><div className="dialog-header"><h2 id="dialog-title">{title}</h2><button type="button" className="dialog-close" aria-label={closeLabel} onClick={() => onCloseRef.current()}><Icon name="close" /></button></div>{children}</div></div>
-}
-
-/**
- * 品牌标记：与 public/favicon.svg 同一造型（三根递降柱 = 目标→周→日，橙点 = 此刻专注的一步）。
- * 内联 SVG 而非 <img>，以便跟随字号、任意尺寸清晰，并避免额外请求。
- * 图标本身 aria-hidden，品牌名由紧邻的文字承担，屏幕阅读器不会重复朗读。
- */
-function BrandMark() {
-  return <svg className="brand-mark" width="27" height="27" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-    <rect width="32" height="32" rx="7.5" fill="#2c302e" />
-    <rect x="6.6" y="6.8" width="4" height="16.4" rx="2" fill="#ffffff" />
-    <rect x="12.7" y="10.4" width="4" height="12.8" rx="2" fill="#ffffff" opacity="0.8" />
-    <rect x="18.8" y="14" width="4" height="9.2" rx="2" fill="#ffffff" opacity="0.6" />
-    <circle cx="24.8" cy="21.6" r="2.5" fill="#df875e" />
-  </svg>
-}
-
-function Icon({ name }: { name: 'plus' | 'edit' | 'trash' | 'up' | 'down' | 'subtask' | 'link' | 'sliders' | 'refresh' | 'close' | 'back' | 'grip' }) {
-  const paths: Record<string, React.ReactNode> = {
-    grip: <path d="M9 5h.01M15 5h.01M9 12h.01M15 12h.01M9 19h.01M15 19h.01" strokeWidth="3" />,
-    plus: <><path d="M12 5v14M5 12h14" /></>, edit: <><path d="M4 16.5V20h3.5L18.7 8.8l-3.5-3.5L4 16.5Z" /><path d="m13.5 6.5 3.5 3.5" /></>, trash: <><path d="M5 7h14M10 11v5M14 11v5M7 7l1 13h8l1-13M9 7V4h6v3" /></>, up: <path d="m6 14 6-6 6 6" />, down: <path d="m6 10 6 6 6-6" />, subtask: <><path d="M5 6h14M5 12h9M5 18h6" /><path d="M17 15v6M14 18h6" /></>, link: <><path d="M9.5 14.5 14.5 9.5" /><path d="M7 17H5.5a3.5 3.5 0 0 1 0-7H9M15 7h1.5a3.5 3.5 0 0 1 0 7H15" /></>, sliders: <><path d="M4 6h16M4 12h16M4 18h16" /><circle cx="9" cy="6" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="8" cy="18" r="2" /></>, refresh: <><path d="M20 11a8 8 0 0 0-14-4L4 9" /><path d="M4 4v5h5M4 13a8 8 0 0 0 14 4l2-2" /><path d="M20 20v-5h-5" /></>, close: <><path d="m6 6 12 12M18 6 6 18" /></>, back: <><path d="M9.5 5.5 5 10l4.5 4.5" /><path d="M5 10h8.5a4.5 4.5 0 0 1 0 9H9" /></>,
-  }
-  return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
+/** 输出里的 `/命令` 都可以点：点一下等于把它敲进提示符。 */
+function Rich({ text, onCommand }: { text: string; onCommand: (command: string) => void }) {
+  return <>{text.split(/(\/[a-z]+)/g).map((part, index) => (/^\/[a-z]+$/.test(part) ? <button key={index} type="button" className="inline-cmd" onClick={() => onCommand(part)}>{part}</button> : part))}</>
 }

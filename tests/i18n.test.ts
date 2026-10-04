@@ -159,8 +159,9 @@ test('automatic refresh must refuse to run while unsaved work exists', async () 
   // the automatic callers must be marked automatic
   const automaticCalls = [...source.matchAll(/reloadLatest\((false|true),\s*true\)/g)]
   assert.ok(automaticCalls.length >= 2, `focus/online refresh must pass automatic=true, saw ${automaticCalls.length}`)
-  // and the explicit "discard draft" action must NOT be automatic, so the user can still discard
-  assert.match(source, /onClick=\{\(\) => void reloadLatest\(false\)\}/, 'the discard action must stay user-initiated')
+  // and the explicit "discard draft" action must NOT be automatic, so the user can still discard:
+  // in the terminal it is `/discard`, answered with y in the prompt.
+  assert.match(source, /confirm\(t\('confirmDiscardDraft'\), \(\) => void reloadLatest\(false\)\)/, 'the discard action must stay user-initiated')
 })
 
 test('no debug instrumentation is left in the shipped source', async () => {
