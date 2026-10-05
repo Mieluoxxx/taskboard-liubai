@@ -3,17 +3,16 @@ import type { OAuthAuthorizationDetails, OAuthGrant, SupabaseClient, User } from
 import { createSupabaseBoardAdapter, getSupabaseConfig, type SupabaseBoardAdapter } from './storage'
 import { copy, type CopyKey } from './i18n'
 import { createAuthorizationLoader } from './auth-flow'
-import { validateStoredBoard } from './domain'
+import { safeTimeZone, todayInTimeZone, validateStoredBoard, weekKey } from './domain'
 import { restoreTrash, type RestoreTarget, type TrashEntry } from './agent-operations'
-import { commandsFor, completeCommand, fill, isAnswer, isYes, parseDateArg, parseLine, parseWeekArg, resolveCommand, type MenuItem } from './terminal'
-import { Banner, Echo, Lines, Menu, Prompt, ShellFrame, Spinner, useStickToBottom, useTheme, type Ask, type OutLine } from './Shell'
+import { commandsFor, completeCommand, fill, formatDate, formatSpan, isAnswer, isYes, parseDateArg, parseLine, parseWeekArg, resolveCommand, type MenuItem } from './terminal'
+import { Banner, Lines, Menu, OutputStrip, PageHead, Prompt, ShellFrame, Spinner, useOutput, useTheme, type Ask, type OutLine } from './Shell'
 import type { Language, StoredBoard } from './types'
 import './fonts.css'
 import './styles.css'
 
 type Translate = (key: CopyKey) => string
 type Audit = { id: number; occurred_at: string; client_id: string | null; action: string; object_kind: string; object_id: string | null; result: string }
-type Entry = { id: number; echo?: string; lines?: OutLine[]; help?: boolean }
 /** 账户区注册给提示符的命令处理器：返回 false 表示不认识，交回外层报错。 */
 type AccountCommand = (name: string, args: string[]) => boolean
 type Shell = { print: (lines: OutLine[], echo?: string) => void; ask: (spec: Omit<Ask, 'id'>) => void; confirm: (question: string, onYes: () => void) => void }
@@ -44,15 +43,13 @@ export default function AccountPage() {
   const [user, setUser] = useState<User | null>(null)
   const [ready, setReady] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [entries, setEntries] = useState<Entry[]>([])
-  const entryId = useRef(0)
+  const { output, page, print, showHelp, closePage, clear } = useOutput()
   const [ask, setAsk] = useState<Ask | null>(null)
   const askId = useRef(0)
   const [helpIndex, setHelpIndex] = useState<number | null>(null)
   const history = useRef<string[]>([])
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null)
   const commandRef = useRef<AccountCommand | null>(null)
-  const follow = useStickToBottom(`${entries.length}:${ask?.id ?? 0}`)
 
   useEffect(() => {
     document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'
@@ -73,9 +70,6 @@ export default function AccountPage() {
     return () => { active = false; data.subscription.unsubscribe() }
   }, [cloud])
 
-  const print = useCallback((lines: OutLine[], echo?: string) => {
-    setEntries((current) => [...current, { id: ++entryId.current, echo, lines }].slice(-80))
-  }, [])
   const openAsk = useCallback((spec: Omit<Ask, 'id'>) => {
     setHelpIndex(null)
     setAsk({ ...spec, id: ++askId.current, onDone: (values) => { setAsk(null); spec.onDone(values) }, onCancel: () => { setAsk(null); print([{ text: copy[language].cancelled, tone: 'dim' }]); spec.onCancel?.() } })
@@ -122,7 +116,7 @@ export default function AccountPage() {
     if (!spec) return fail(fill(t('cmdUnknown'), { cmd: parsed.name }))
     switch (spec.name) {
       case 'help':
-        setEntries((current) => [...current, { id: ++entryId.current, echo: line, help: true }])
+        showHelp(line)
         return setHelpIndex(0)
       case 'login':
         if (!cloud) return fail(t('setupBody'))
@@ -149,7 +143,8 @@ export default function AccountPage() {
         return print([{ text: `lang · ${next}`, tone: 'dim' }], line)
       }
       case 'clear':
-        return setEntries([])
+        setHelpIndex(null)
+        return clear()
       default:
         if (!user) return fail(fill(t('cmdNotFound'), { cmd: `/${spec.name}` }))
         print([], line)
@@ -158,27 +153,34 @@ export default function AccountPage() {
   }
 
   const complete = useCallback((input: string) => completeCommand(input, context, language), [language])
-  const pickHelp = (item: MenuItem) => { setHelpIndex(null); if (item.run) execute(item.value!); else execute(`/help ${item.id}`) }
-  const lastHelp = [...entries].reverse().find((entry) => entry.help)?.id
+  const pickHelp = (item: MenuItem) => { setHelpIndex(null); closePage(); if (item.run) execute(item.value!); else execute(`/help ${item.id}`) }
+  const dismissHelp = () => { setHelpIndex(null); closePage() }
 
   return <ShellFrame homeLabel={t('appName')} nav={[{ key: 'B', label: t('backToBoard'), href: '/' }, { key: 'A', label: t('accountNav'), active: true }]}
     cta={user ? <button type="button" className="side-button" onClick={() => execute('/logout')}>{t('logout')}</button> : cloud && ready ? <button type="button" className="side-button" onClick={() => execute('/login')}>{t('signIn')}</button> : null}>
-    <div className="scrollback" onMouseUp={(event) => { if (!window.getSelection()?.toString() && !(event.target as HTMLElement).closest('button,a,input,textarea,[role="option"]')) inputRef.current?.focus() }}>
-      <Banner label={t('appName')}><p>{t('accountTools')}</p><p className="dim">{t('accountMotd')}</p></Banner>
-      <section className="account">
-        {!cloud ? <Lines lines={[{ text: t('setupBody'), tone: 'err' }]} /> : !ready ? <div className="out-line"><Spinner /> <span className="tone-dim">{t('loading')}</span></div> : user ? <AccountContent key={user.id} cloud={cloud} user={user} t={t} shell={shell} commandRef={commandRef} onCommand={execute} /> : <Lines lines={[{ text: t('authBody'), tone: 'dim' }, { text: '/login', cmd: '/login' }]} onCommand={execute} />}
-      </section>
-      {entries.map((entry) => <div key={entry.id} className="entry">
-        {entry.echo !== undefined ? <Echo text={entry.echo} /> : null}
-        {entry.help ? <Menu id={`help-${entry.id}`} items={helpItems} index={entry.id === lastHelp && helpIndex !== null ? helpIndex : -1} onPick={pickHelp} footer={entry.id === lastHelp && helpIndex !== null ? t('hintMenu') : undefined} /> : null}
-        {entry.lines?.length ? <Lines lines={entry.lines} onCommand={execute} /> : null}
-      </div>)}
+    <div className="stage">
+      <div className="scene" onMouseUp={(event) => { if (!window.getSelection()?.toString() && !(event.target as HTMLElement).closest('button,a,input,textarea,[role="option"]')) inputRef.current?.focus() }}>
+        {page ? <section className="page" aria-label={page.echo}>
+          <PageHead echo={page.echo} hint={t('pageHint')} />
+          {page.kind === 'help'
+            ? <Menu id="help-page" items={helpItems} index={helpIndex ?? -1} onPick={pickHelp} onHover={helpIndex !== null ? setHelpIndex : undefined} footer={helpIndex !== null ? t('hintMenu') : undefined} />
+            : <Lines lines={page.lines} onCommand={execute} />}
+        </section> : null}
+        {/* 整页输出只是盖住账户内容：卸载会丢掉已读取的列表，授权页还会重新弹出同一个确认。 */}
+        <div hidden={Boolean(page)}>
+          <Banner label={t('appName')}><p>{t('accountTools')}</p><p className="dim">{t('accountMotd')}</p></Banner>
+          <section className="account">
+            {!cloud ? <Lines lines={[{ text: t('setupBody'), tone: 'err' }]} /> : !ready ? <div className="out-line"><Spinner /> <span className="tone-dim">{t('loading')}</span></div> : user ? <AccountContent key={user.id} cloud={cloud} user={user} t={t} shell={shell} commandRef={commandRef} onCommand={execute} /> : <Lines lines={[{ text: t('authBody'), tone: 'dim' }, { text: '/login', cmd: '/login' }]} onCommand={execute} />}
+          </section>
+        </div>
+      </div>
     </div>
     <div className="console">
+      <OutputStrip output={output} onCommand={execute} />
       <Prompt user={`${user?.email?.split('@')[0] || 'guest'}@liubai`} ask={ask} busy={busy ? <><Spinner /> {t('authenticating')}</> : null} placeholder={user ? '/help' : '/login'} history={history.current}
         copy={{ hintCommand: t('hintCommand'), hintAsk: t('hintAsk'), hintChoice: t('hintChoice'), hintNote: t('hintNote'), hintMenu: t('hintMenu'), noMatch: t('finderEmpty') }}
-        complete={complete} inputRef={inputRef} onGrow={follow} onSubmit={execute} onClear={() => setEntries([])}
-        menu={helpIndex !== null ? { items: helpItems, index: helpIndex, setIndex: setHelpIndex, pick: pickHelp, dismiss: () => setHelpIndex(null) } : null} />
+        complete={complete} inputRef={inputRef} onSubmit={execute} onClear={() => { setHelpIndex(null); clear() }} onNav={dismissHelp}
+        menu={helpIndex !== null && page?.kind === 'help' ? { items: helpItems, index: helpIndex, setIndex: setHelpIndex, pick: pickHelp, dismiss: dismissHelp } : null} />
     </div>
     <footer className="statusline">
       <span className="sl-mode">TTY</span>
@@ -299,20 +301,21 @@ function AccountContent({ cloud, user, t, shell, commandRef, onCommand }: { clou
     const missingProject = entry.payload.tasks.some((task) => task.cycleId && !entry.payload.cycles.some((cycle) => cycle.id === task.cycleId) && !board?.snapshot.cycles.some((cycle) => cycle.id === task.cycleId))
     const choosesProject = !entry.payload.cycles.length && entry.payload.tasks.length > 0
     if (!choosesProject) return void run(() => restore(entry, {}))
-    const today = new Date().toISOString().slice(0, 10)
-    const projects: MenuItem[] = [...(missingProject ? [] : [{ id: 'original', value: '', label: t('accountOriginalPlacement') }]), ...(board?.snapshot.cycles.map((cycle) => ({ id: cycle.id, value: cycle.id, label: cycle.name, meta: `${cycle.startDate} → ${cycle.endDate}` })) ?? [])]
+    // 与看板一样以看板时区的今天为锚点，而不是 UTC 的今天。
+    const today = todayInTimeZone(board?.snapshot.settings.timeZone ?? safeTimeZone())
+    const projects: MenuItem[] = [...(missingProject ? [] : [{ id: 'original', value: '', label: t('accountOriginalPlacement') }]), ...(board?.snapshot.cycles.map((cycle) => ({ id: cycle.id, value: cycle.id, label: cycle.name, meta: formatSpan(cycle.startDate, cycle.endDate, (key) => formatDate(key, today)) })) ?? [])]
     shell.ask({
       title: `${t('accountRestore')} · ${names(entry)[0] || entry.id}`,
       fields: [
         { key: 'cycleId', label: t('accountRestoreProject'), options: projects },
-        { key: 'date', label: t('date'), placeholder: 'YYYY-MM-DD', skip: (values) => !values.cycleId || !entry.payload.tasks.some((task) => task.domain === 'daily'), validate: (value) => (parseDateArg(value, today, today) ? null : t('dateInvalid')) },
-        { key: 'week', label: t('week'), placeholder: '2026-W41', skip: (values) => !values.cycleId || !entry.payload.tasks.some((task) => task.domain === 'weekly'), validate: (value) => (parseWeekArg(value, `${today.slice(0, 4)}-W01`, `${today.slice(0, 4)}-W01`) ? null : t('weekInvalid')) },
+        { key: 'date', label: t('date'), placeholder: '10-06 · today', skip: (values) => !values.cycleId || !entry.payload.tasks.some((task) => task.domain === 'daily'), validate: (value) => (parseDateArg(value, today, today) ? null : t('dateInvalid')) },
+        { key: 'week', label: t('week'), placeholder: 'W41 · today', skip: (values) => !values.cycleId || !entry.payload.tasks.some((task) => task.domain === 'weekly'), validate: (value) => (parseWeekArg(value, weekKey(today), today) ? null : t('weekInvalid')) },
       ],
       onDone: (values) => {
         const target: RestoreTarget = {
           ...(values.cycleId ? { cycleId: values.cycleId } : {}),
           ...(values.date ? { dateKey: parseDateArg(values.date, today, today)! } : {}),
-          ...(values.week ? { weekKey: parseWeekArg(values.week, `${today.slice(0, 4)}-W01`, `${today.slice(0, 4)}-W01`)! } : {}),
+          ...(values.week ? { weekKey: parseWeekArg(values.week, weekKey(today), today)! } : {}),
         }
         void run(() => restore(entry, target))
       },

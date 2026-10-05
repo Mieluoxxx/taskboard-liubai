@@ -8,6 +8,8 @@ import {
   carryForwardTasks,
   cloneSnapshot,
   compareDateKeys,
+  coversDate,
+  coversWeek,
   createFocusBlock,
   createTask,
   cycleForNavigation,
@@ -15,21 +17,21 @@ import {
   deleteFocusBlock,
   deleteTask,
   elapsedMsAt,
+  focusDisplayStatus,
   MAX_TASK_NOTE_LENGTH,
   MAX_TASK_TITLE_LENGTH,
   MAX_TIMER_MINUTES,
   mergeSnapshots,
   moveDailyTask,
   moveWeeklyTask,
-  reapplyReorder,
   reorderCycleTo,
   reorderOrigin,
-  reorderSibling,
   reorderSiblingTo,
   rescheduleDailyTask,
   rescheduleWeeklyTask,
   safeTimeZone,
   setFocusCommand,
+  targetSpan,
   todayInTimeZone,
   updateFocusBlock,
   updateTask,
@@ -44,42 +46,57 @@ import { BoardError, isNoticeCode, type NoticeCode } from './notices'
 import { createDemoBoardAdapter, createSupabaseBoardAdapter, getSupabaseConfig, type SupabaseBoardAdapter } from './storage'
 import {
   buildIndex,
+  changedIds,
   commandsFor,
   completeCommand,
   fill,
   formatClock,
+  formatDate,
+  formatSpan,
+  formatSpanEnd,
+  formatWeek,
   fuzzyScore,
   isAnswer,
   isYes,
   lookupRef,
+  openBlock,
   parseDateArg,
+  parseDateSpanArg,
   parseLine,
   parseMinutes,
   parseQuickAdd,
   parseRef,
+  parseSceneHash,
   parseWeekArg,
+  parseWeekSpanArg,
+  reorderInScene,
   resolveCommand,
   restAfter,
+  sceneHash,
+  sceneSiblings,
   SCOPE_DOMAIN,
   TASK_COLORS,
   VIEW_KEYS,
   VIEW_SCOPE,
   VIEWS,
+  type ClockFace,
   type CommandSpec,
   type MenuItem,
+  type RefScope,
   type Selection,
   type ShellContext,
   type ViewName,
 } from './terminal'
-import { Banner, Echo, Lines, Menu, Prompt, ShellFrame, Spinner, useStickToBottom, useTheme, type Ask, type AskField, type ExternalMenu, type NavItem, type OutLine } from './Shell'
-import { BoardView, Dashboard, Finder, VIEW_LABEL, type BoardActions, type FinderItem } from './BoardViews'
+import { Banner, Lines, Menu, OutputStrip, PageHead, Prompt, ShellFrame, Spinner, useColumns, useOutput, useTheme, type Ask, type AskField, type ExternalMenu, type NavItem, type OutLine } from './Shell'
+import { clockLeft, Finder, placementLabel, Scene, SceneHead, VIEW_LABEL, type BoardActions, type FinderItem, type Touched } from './BoardViews'
 import type { BoardAdapter, BoardSnapshot, Domain, FocusBlock, GoalCycle, Language, StoredBoard, Task, TaskColor } from './types'
 import './fonts.css'
 import './styles.css'
 
 const LANGUAGE_KEY = 'liubai-taskboard:language:v1'
+const CLOCK_KEY = 'liubai-taskboard:clock:v1'
 const UNASSIGNED_CYCLE_ID = '' // 空串不是合法项目 id，避免与已有项目碰撞。
-type TaskPlacement = Pick<Task, 'cycleId' | 'weekKey' | 'dateKey'>
+type TaskPlacement = Pick<Task, 'cycleId' | 'weekKey' | 'endWeekKey' | 'dateKey' | 'endDateKey'>
 type Screen = 'setup' | 'auth' | 'loading' | 'workspace'
 type SaveState = 'saved' | 'pending' | 'saving' | 'error' | 'offline'
 
@@ -87,9 +104,11 @@ type TaskInput = {
   title: string
   note: string
   color: TaskColor
-  // 日任务给日期、周任务给周次；其余域保持放置不变，因此不写进 input。
+  // 日任务给日期、周任务给周次（跨度另给最后一天/最后一周）；其余域保持放置不变，因此不写进 input。
   dateKey?: string
+  endDateKey?: string
   weekKey?: string
+  endWeekKey?: string
   upperTaskId?: string
   parentId?: string
 }
@@ -112,16 +131,6 @@ type AuthLoad = { userId: string; generation: number; promise: Promise<void> }
 type CycleInput = { name: string; startDate: string; endDate: string }
 type TaskWizardOptions = { task?: Task; domain: Domain; parentId?: string; initial?: TaskInput; placement?: TaskPlacement }
 
-// 滚动区里的每一条都是一次输出：命令回显 + 结果。视图块在被新视图取代时冻结成当时的快照，
-// 之后只读；永远只有最新的视图块是活的。
-type FrozenView = { snapshot: BoardSnapshot; selection: Selection; now: number }
-type EntryBody =
-  | { kind: 'lines'; lines: OutLine[] }
-  | { kind: 'view'; view: ViewName; frozen?: FrozenView }
-  | { kind: 'help'; context: ShellContext }
-type Entry = { id: number; echo?: string; result?: OutLine; body?: EntryBody }
-const MAX_ENTRIES = 60
-
 const COLOR_LABEL: Record<TaskColor, CopyKey> = { ink: 'colorInk', blue: 'colorBlue', orange: 'colorOrange', green: 'colorGreen', violet: 'colorViolet' }
 const DOMAIN_VIEW: Record<Domain, ViewName> = { long: 'goals', weekly: 'week', daily: 'day' }
 
@@ -135,6 +144,18 @@ function readLanguage(): Language {
 
 function persistLanguage(language: Language): void {
   try { localStorage.setItem(LANGUAGE_KEY, language) } catch { /* private mode can reject preferences */ }
+}
+
+function readClockFace(): ClockFace {
+  try {
+    return localStorage.getItem(CLOCK_KEY) === 'digital' ? 'digital' : 'analog'
+  } catch {
+    return 'analog'
+  }
+}
+
+function persistClockFace(face: ClockFace): void {
+  try { localStorage.setItem(CLOCK_KEY, face) } catch { /* private mode can reject preferences */ }
 }
 
 function noticeText(value: { code?: NoticeCode; message?: string } | null | undefined, fallback: NoticeCode): NoticeCode | string {
@@ -189,6 +210,7 @@ function cycleRangesDiffer(left: BoardSnapshot | null, right: BoardSnapshot): bo
 export default function App() {
   const config = useMemo(() => getSupabaseConfig(), [])
   const [language, setLanguage] = useState<Language>(readLanguage)
+  const [clockFace, setClockFace] = useState<ClockFace>(readClockFace)
   const [screen, setScreen] = useState<Screen>(config ? 'auth' : 'setup')
   const screenRef = useRef<Screen>(screen)
   const [adapter, setAdapter] = useState<BoardAdapter | null>(null)
@@ -227,8 +249,8 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now())
   const [flash, setFlash] = useState('')
   const theme = useTheme()
-  const [entries, setEntries] = useState<Entry[]>([])
-  const entryIdRef = useRef(0)
+  // 屏幕上只有当前场景：没有滚动区，命令的结果只保留最后一条（见 useOutput）。
+  const { output, page, print, showHelp, closePage, clear: clearOutput } = useOutput()
   const [view, setView] = useState<ViewName>('day')
   const viewRef = useRef<ViewName>('day')
   const [ask, setAsk] = useState<Ask | null>(null)
@@ -236,7 +258,12 @@ export default function App() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [navMode, setNavMode] = useState(false)
   const [finder, setFinder] = useState<string | null>(null)
-  const [helpMenu, setHelpMenu] = useState<{ entryId: number; index: number } | null>(null)
+  const [helpMenu, setHelpMenu] = useState<{ index: number } | null>(null)
+  const [touched, setTouched] = useState<Touched | null>(null)
+  const touchRef = useRef(0)
+  // 地址栏里的场景只在加载完成、选区按它落定之后才开始回写，否则会先被默认场景覆盖。
+  const [routeToken, setRouteToken] = useState(0)
+  const historyViewRef = useRef<ViewName | null>(null)
   const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null)
   const historyRef = useRef<string[]>([])
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null)
@@ -260,46 +287,23 @@ export default function App() {
     applySelection(selection)
   }, [applySelection])
 
-  const pushEntries = useCallback((next: Array<Omit<Entry, 'id'>>) => {
-    setEntries((current) => [...current, ...next.map((entry) => ({ ...entry, id: ++entryIdRef.current }))].slice(-MAX_ENTRIES))
+  const touch = useCallback((ids: Iterable<string>) => {
+    const next = new Set(ids)
+    if (next.size) setTouched({ ids: next, nonce: ++touchRef.current })
   }, [])
-  // 只有一行的短结果与回显同排显示（`> /done d1  [x] d1 …`），连续操作不会把视图挤出屏幕。
-  const print = useCallback((lines: OutLine[], echo?: string) => {
-    if (echo !== undefined && lines.length === 1 && !lines[0].cmd && !lines[0].key && lines[0].text.length <= 72) pushEntries([{ echo, result: lines[0] }])
-    else pushEntries([{ echo, body: lines.length ? { kind: 'lines', lines } : undefined }])
-  }, [pushEntries])
-  const freezeLive = useCallback(() => {
-    const board = storedRef.current
-    const selection = { ...selectionRef.current }
-    const frozenAt = Date.now()
-    setEntries((current) => current.flatMap((entry) => {
-      if (entry.body?.kind !== 'view' || entry.body.frozen) return [entry]
-      return board ? [{ ...entry, body: { ...entry.body, frozen: { snapshot: board.snapshot, selection, now: frozenAt } } }] : []
-    }))
-  }, [])
-  const appendView = useCallback((next: ViewName, echo?: string) => {
-    viewRef.current = next
-    setView(next)
-    pushEntries([{ echo, body: { kind: 'view', view: next } }])
-  }, [pushEntries])
   const announceBoard = useCallback((board: StoredBoard, mode: 'demo' | 'cloud') => {
     const words = copy[languageRef.current]
-    // 重新载入时旧的活视图属于上一份数据，直接丢弃，避免两个“活”视图同时存在。
-    setEntries((current) => current.filter((entry) => entry.body?.kind !== 'view' || entry.body.frozen))
-    pushEntries([
-      { body: { kind: 'lines', lines: [
-        { text: fill(words.boardLoaded, { rev: board.revision, projects: board.snapshot.cycles.length, tasks: activeTasks(board.snapshot).length }), tone: 'ok' },
-        ...(mode === 'demo' ? [{ text: words.demoNote, tone: 'dim' as const }] : []),
-      ] } },
+    print([
+      { text: fill(words.boardLoaded, { rev: board.revision, projects: board.snapshot.cycles.length, tasks: activeTasks(board.snapshot).length }), tone: 'ok' },
+      ...(mode === 'demo' ? [{ text: words.demoNote, tone: 'dim' as const }] : []),
     ])
-    appendView('day')
-  }, [appendView, pushEntries])
+  }, [print])
 
   useEffect(() => { persistLanguage(language) }, [language])
+  useEffect(() => { persistClockFace(clockFace) }, [clockFace])
   useEffect(() => { screenRef.current = screen }, [screen])
   useEffect(() => {
     document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'
-    document.title = copy[language].documentTitle
   }, [language])
   useEffect(() => { storedRef.current = stored }, [stored])
   useEffect(() => { adapterRef.current = adapter }, [adapter])
@@ -334,7 +338,7 @@ export default function App() {
     setSelectedDate(resetDate)
     setSelectedWeek(weekKey(resetDate))
     setDraftLabel(null)
-    setEntries([])
+    clearOutput()
     setAsk(null)
     setHelpMenu(null)
     setFinder(null)
@@ -461,12 +465,55 @@ export default function App() {
     return () => { alive = false; authLifecycle.invalidate(); subscription.unsubscribe() }
   }, [applyAuthTransition, authLifecycle, config])
 
+  // 仅显式加载会改变 boardLoadToken，普通保存不会重置当前周期。地址栏里若有场景（刷新、书签），按它落地。
   useEffect(() => {
     if (!stored || !boardLoadToken) return
     const current = todayInTimeZone(stored.snapshot.settings.timeZone)
-    reconcileSelection(stored.snapshot, stored.snapshot.cycles[0]?.id || null, current)
+    const location = parseSceneHash(window.location.hash)
+    const date = location?.date ?? (location?.week && weekKey(current) !== location.week ? weekRange(location.week).start : current)
+    reconcileSelection(stored.snapshot, location?.cycleId !== undefined ? location.cycleId : stored.snapshot.cycles[0]?.id || null, date)
+    viewRef.current = location?.view ?? 'day'
+    setView(viewRef.current)
+    historyViewRef.current = null
+    setRouteToken(boardLoadToken)
     setSelectedTaskId(null)
-  }, [boardLoadToken, reconcileSelection]) // 仅显式加载会改变 boardLoadToken，普通保存不会重置当前周期。
+  }, [boardLoadToken, reconcileSelection])
+
+  // 换视图记一条历史（后退回到上一个视图），同一视图里翻日期只替换当前这条，免得 h/l 连按刷满历史。
+  useEffect(() => {
+    if (screen !== 'workspace' || !routeToken || routeToken !== boardLoadToken) return
+    const next = sceneHash(view, { cycleId: selectedCycleId, week: selectedWeek, date: selectedDate })
+    if (window.location.hash !== next) {
+      const url = `${window.location.pathname}${window.location.search}${next}`
+      if (historyViewRef.current && historyViewRef.current !== view) window.history.pushState(null, '', url)
+      else window.history.replaceState(null, '', url)
+    }
+    historyViewRef.current = view
+  }, [screen, routeToken, boardLoadToken, view, selectedCycleId, selectedWeek, selectedDate])
+
+  useEffect(() => {
+    const onPop = () => {
+      const board = storedRef.current?.snapshot
+      const location = parseSceneHash(window.location.hash)
+      if (!board || screenRef.current !== 'workspace' || !location) return
+      const current = selectionRef.current
+      const date = location.date ?? (location.week && weekKey(current.date) !== location.week ? weekRange(location.week).start : current.date)
+      reconcileSelection(board, location.cycleId !== undefined ? location.cycleId : current.cycleId, date)
+      historyViewRef.current = location.view
+      viewRef.current = location.view
+      setView(location.view)
+      setExpandedId(null)
+      closePage()
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [reconcileSelection, closePage])
+
+  useEffect(() => {
+    if (!touched) return
+    const id = window.setTimeout(() => setTouched(null), 1600)
+    return () => window.clearTimeout(id)
+  }, [touched])
 
   const drainSave = useCallback(async () => {
     if (saveInFlightRef.current || !adapterRef.current) return
@@ -584,6 +631,7 @@ export default function App() {
     const local: StoredBoard = { revision: current.revision, snapshot: next }
     storedRef.current = local
     setStored(local)
+    touch(changedIds(current.snapshot, next))
     const job: PendingJob = { expectedRevision: current.revision, snapshot: next, draft, origin }
     pendingJobRef.current = job
     failedJobRef.current = null
@@ -592,7 +640,7 @@ export default function App() {
     setSaveState('pending')
     void drainRef.current?.()
     return true
-  }, [])
+  }, [touch])
   commitRef.current = commitSnapshot
 
   // 返回是否成功换上了新的板（false = 仍在旧板/被取代/失败）。调用方据此决定是否继续依赖它。
@@ -695,7 +743,7 @@ export default function App() {
         setFlash(copy[language].draftTargetMissing)
         return
       }
-      const next = reapplyReorder(board, origin.taskId, origin.direction)
+      const next = reorderInScene(board, origin.taskId, origin.direction, selectionRef.current)
       const applied = commitSnapshot(next, `${t('title')}: ${board.tasks.find((task) => task.id === origin.taskId)?.title || ''}`, origin)
       if (applied) setFlash(copy[language].reorderReapplied)
       return
@@ -773,16 +821,18 @@ export default function App() {
     }
   }
 
-  const updateSnapshot = (operation: (snapshot: BoardSnapshot) => BoardSnapshot, draft: string | null, origin?: DraftOrigin) => {
+  // 返回这次改动是否被接受：被校验拒绝时提示已经给出，调用方就不要再回显成功。
+  const updateSnapshot = (operation: (snapshot: BoardSnapshot) => BoardSnapshot, draft: string | null, origin?: DraftOrigin): boolean => {
     const current = storedRef.current
-    if (!current) return
+    if (!current) return false
     try {
       const next = operation(current.snapshot)
-      if (next !== current.snapshot) commitSnapshot(next, draft, origin)
+      return next === current.snapshot || commitSnapshot(next, draft, origin)
     } catch (caught) {
       setSaveState('error')
       setSaveMessage(errorNotice(caught, 'noticeOperationFailed'))
       setDraftLabel(draft)
+      return false
     }
   }
 
@@ -794,18 +844,20 @@ export default function App() {
     const base = placement || {
       cycleId: existing ? existing.cycleId : selectedCycle?.id,
       weekKey: targetDomain === 'weekly' ? existing?.weekKey || selectedWeek : undefined,
+      endWeekKey: targetDomain === 'weekly' ? existing?.endWeekKey : undefined,
       dateKey: targetDomain === 'daily' ? existing?.dateKey || selectedDate : undefined,
+      endDateKey: targetDomain === 'daily' ? existing?.endDateKey : undefined,
     }
     // 表单里的放置优先于当前选中的日期/周：用户可以在编辑器里直接改期。
     const targetPlacement: TaskPlacement = targetDomain === 'daily' && input.dateKey
-      ? { ...base, dateKey: input.dateKey }
+      ? { ...base, dateKey: input.dateKey, endDateKey: input.endDateKey }
       : targetDomain === 'weekly' && input.weekKey
-        ? { ...base, weekKey: input.weekKey }
+        ? { ...base, weekKey: input.weekKey, endWeekKey: input.endWeekKey }
         : base
     if (!existing && targetDomain !== 'long' && selectedCycle) {
       const placeable = targetDomain === 'weekly'
-        ? (targetPlacement.weekKey || selectedWeek) >= weekKey(selectedCycle.startDate) && (targetPlacement.weekKey || selectedWeek) <= weekKey(selectedCycle.endDate)
-        : dateInRange(targetPlacement.dateKey || selectedDate, selectedCycle.startDate, selectedCycle.endDate)
+        ? (targetPlacement.weekKey || selectedWeek) >= weekKey(selectedCycle.startDate) && (targetPlacement.endWeekKey || targetPlacement.weekKey || selectedWeek) <= weekKey(selectedCycle.endDate)
+        : dateInRange(targetPlacement.dateKey || selectedDate, selectedCycle.startDate, selectedCycle.endDate) && dateInRange(targetPlacement.endDateKey || targetPlacement.dateKey || selectedDate, selectedCycle.startDate, selectedCycle.endDate)
       if (!placeable) {
         setFlash(t('selectionOutsideCycle'))
         return null
@@ -819,8 +871,8 @@ export default function App() {
       if (existing) {
         next = updateTask(current.snapshot, existing.id, { title: input.title, note: input.note, color: input.color, upperTaskId: input.parentId ? undefined : input.upperTaskId, parentId: input.parentId }, now)
         // 改日期/周单独走重排：它会带上子任务，并拒绝超出项目周期的放置。
-        if (input.dateKey && input.dateKey !== existing.dateKey) next = moveDailyTask(next, existing.id, input.dateKey, now)
-        if (input.weekKey && input.weekKey !== existing.weekKey) next = moveWeeklyTask(next, existing.id, input.weekKey, now)
+        if (input.dateKey && (input.dateKey !== existing.dateKey || input.endDateKey !== existing.endDateKey)) next = moveDailyTask(next, existing.id, { start: input.dateKey, end: input.endDateKey || input.dateKey }, now)
+        if (input.weekKey && (input.weekKey !== existing.weekKey || input.endWeekKey !== existing.endWeekKey)) next = moveWeeklyTask(next, existing.id, { start: input.weekKey, end: input.endWeekKey || input.weekKey }, now)
       } else {
         const created = createTask({
           domain: targetDomain,
@@ -899,7 +951,12 @@ export default function App() {
   // “今天”只算一次，供跳转、标签页与状态栏共用（与“正在看的那天”是两件事）。
   const todayKey = todayInTimeZone(currentZone)
   const currentWeekKey = weekKey(todayKey)
+  const showDate = (key: string) => formatDate(key, todayKey)
+  const showWeek = (key: string) => formatWeek(key, todayKey)
   const runningBlock = stored?.snapshot.focusBlocks.find((block) => block.status === 'running')
+  // 计时多半是在别的窗口里跑完的：标签页标题就是那块钟，到点后换成 ⏰ 和超出的时长。
+  const tabTitle = runningBlock ? `${focusDisplayStatus(runningBlock, now) === 'complete' ? '⏰' : '◉'} ${clockLeft(runningBlock, now)} ${runningBlock.title}` : copy[language].documentTitle
+  useEffect(() => { document.title = tabTitle }, [tabTitle])
   const failedOrigin = failedJobRef.current?.origin
   const canReopenDraft = failedOrigin?.kind === 'task' || failedOrigin?.kind === 'cycle' || failedOrigin?.kind === 'focus'
   const context: ShellContext = screen === 'workspace' ? 'board' : 'guest'
@@ -920,22 +977,22 @@ export default function App() {
   const refFor = (id: string) => (storedRef.current ? buildIndex(storedRef.current.snapshot, selectionRef.current).refOf.get(id) || '' : '')
   const focusPrompt = () => requestAnimationFrame(() => inputRef.current?.focus())
 
+  // 切场景就是重画：没有旧视图要冻结，回显与提示（例如日期被夹回项目范围）留在提示符上方。
   const showView = (next: ViewName, echo?: string, select?: () => OutLine | void) => {
     if (screenRef.current !== 'workspace') return
-    freezeLive()
     const note = select?.()
     setExpandedId(null)
-    appendView(next, echo)
-    if (note) print([note])
+    viewRef.current = next
+    setView(next)
+    print(note ? [note] : [], echo)
   }
   const goDate = (date: string, allowOutsideCycle = false): OutLine | void => {
     const landed = setDate(date, allowOutsideCycle)
-    if (landed !== date) return { text: fill(t('dateClamped'), { date: landed }), tone: 'warn' }
+    if (landed !== date) return { text: fill(t('dateClamped'), { date: showDate(landed) }), tone: 'warn' }
   }
   const clearScreen = () => {
-    setEntries([])
+    clearOutput()
     setHelpMenu(null)
-    if (screenRef.current === 'workspace') appendView(viewRef.current)
   }
 
   const openAsk = (spec: Omit<Ask, 'id'>) => {
@@ -972,7 +1029,7 @@ export default function App() {
     if (!board) return
     const tasks = activeTasks(board.snapshot)
     const index = buildIndex(board.snapshot, selectionRef.current)
-    const base: TaskPlacement = placement || { cycleId: task ? task.cycleId : selectedCycle?.id, weekKey: task?.weekKey ?? selectionRef.current.week, dateKey: task?.dateKey ?? selectionRef.current.date }
+    const base: TaskPlacement = placement || { cycleId: task ? task.cycleId : selectedCycle?.id, weekKey: task?.weekKey ?? selectionRef.current.week, endWeekKey: task?.endWeekKey, dateKey: task?.dateKey ?? selectionRef.current.date, endDateKey: task?.endDateKey }
     // 子任务的放置由父任务决定，只有顶层任务能改日期（日）或周次（周）。
     const parent = initial?.parentId ?? (parentId || task?.parentId)
     const canEditDate = domain === 'daily' && !parent
@@ -982,14 +1039,13 @@ export default function App() {
     const keptUpper = initial?.upperTaskId || task?.upperTaskId
     const upperDomain: Domain = domain === 'weekly' ? 'long' : 'weekly'
     const ownCycle = task ? task.cycleId : base.cycleId
-    // 候选必须与任务落在同一项目，并与“上级所在域”的放置一致（周←项目、日←同一周）；
+    // 候选必须与任务落在同一项目，并与“上级所在域”的放置一致（周←项目、日←覆盖那一周的周任务，跨周任务在它占的每一周都可选）；
     // 改了日期就按新日期所在周重算，已存的关联始终列入，避免显示空白。
     const upperItems = (values: Record<string, string>): MenuItem[] => {
-      const date = canEditDate ? parseDateArg(values.date, baseDate, todayKey) : null
-      const week = canEditWeek ? parseWeekArg(values.week, baseWeek, currentWeekKey) : null
-      const target: TaskPlacement = date ? { ...base, weekKey: weekKey(date), dateKey: date } : week ? { ...base, weekKey: week } : base
-      const keyOf = (source: TaskPlacement) => (upperDomain === 'long' ? source.cycleId : source.weekKey)
-      const candidates = tasks.filter((candidate) => !candidate.parentId && candidate.domain === upperDomain && candidate.id !== task?.id && candidate.cycleId === ownCycle && (candidate.id === keptUpper || keyOf(candidate) === keyOf(target)))
+      const date = canEditDate ? parseDateSpanArg(values.date, baseDate, todayKey)?.start : undefined
+      const targetWeek = date ? weekKey(date) : base.weekKey
+      const fits = (candidate: Task) => upperDomain === 'long' || (targetWeek !== undefined && coversWeek(candidate, targetWeek))
+      const candidates = tasks.filter((candidate) => !candidate.parentId && candidate.domain === upperDomain && candidate.id !== task?.id && candidate.cycleId === ownCycle && (candidate.id === keptUpper || fits(candidate)))
       return [{ id: 'none', value: '', label: t('none') }, ...candidates.map((candidate) => ({ id: candidate.id, value: candidate.id, label: `${index.refOf.get(candidate.id) ? `${index.refOf.get(candidate.id)}  ` : ''}${candidate.title}` }))]
     }
     const fields: AskField[] = [
@@ -997,20 +1053,30 @@ export default function App() {
       { key: 'note', label: t('note'), type: 'note', initial: initial?.note ?? task?.note ?? '', maxLength: MAX_TASK_NOTE_LENGTH },
       { key: 'color', label: t('color'), initial: initial?.color || task?.color || 'ink', options: TASK_COLORS.map((color) => ({ id: color, value: color, label: `■ ${t(COLOR_LABEL[color])}`, meta: color })) },
     ]
-    if (canEditDate) fields.push({ key: 'date', label: t('date'), initial: initial?.dateKey || task?.dateKey || base.dateKey || '', placeholder: 'YYYY-MM-DD · +1 · fri', validate: (value) => (parseDateArg(value, baseDate, todayKey) ? null : t('dateInvalid')) })
-    if (canEditWeek) fields.push({ key: 'week', label: t('week'), initial: initial?.weekKey || task?.weekKey || base.weekKey || '', placeholder: '2026-W41 · +1', validate: (value) => (parseWeekArg(value, baseWeek, currentWeekKey) ? null : t('weekInvalid')) })
+    // 初始值用与界面相同的写法；起点以任务自己的放置为锚点，直接回车能解析回原值。
+    const spanText = (format: (key: string) => string, start?: string, end?: string) => (start ? formatSpan(start, end, format) : '')
+    const validDays = (value: string) => {
+      const span = parseDateSpanArg(value, baseDate, todayKey)
+      return !span ? t('dateInvalid') : weekKey(span.start) !== weekKey(span.end) ? t('noticeDaySpanWeek') : null
+    }
+    if (canEditDate) fields.push({ key: 'date', label: t('date'), initial: spanText(showDate, initial?.dateKey, initial?.endDateKey) || spanText(showDate, task?.dateKey, task?.endDateKey) || spanText(showDate, base.dateKey, base.endDateKey), placeholder: '10-06 · +1 · fri · today · mon..wed', validate: validDays })
+    if (canEditWeek) fields.push({ key: 'week', label: t('week'), initial: spanText(showWeek, initial?.weekKey, initial?.endWeekKey) || spanText(showWeek, task?.weekKey, task?.endWeekKey) || spanText(showWeek, base.weekKey, base.endWeekKey), placeholder: 'W41 · +1 · today · W41..W43', validate: (value) => (parseWeekSpanArg(value, baseWeek, todayKey) ? null : t('weekInvalid')) })
     if (!parent && domain !== 'long') fields.push({ key: 'upper', label: t('association'), initial: keptUpper || '', options: upperItems })
     const ref = task ? index.refOf.get(task.id) : undefined
     openAsk({
       title: task ? `${t('edit')} ${ref ? `${ref} ` : ''}${task.title}` : `${parentId ? t('addSubtask') : t('addTask')} · ${t(VIEW_LABEL[DOMAIN_VIEW[domain]])}`,
       fields,
       onDone: (values) => {
+        const span = canEditWeek ? parseWeekSpanArg(values.week, baseWeek, todayKey) : null
+        const days = canEditDate ? parseDateSpanArg(values.date, baseDate, todayKey) : null
         const input: TaskInput = {
           title: values.title,
           note: values.note,
           color: values.color as TaskColor,
-          dateKey: canEditDate ? parseDateArg(values.date, baseDate, todayKey) || undefined : undefined,
-          weekKey: canEditWeek ? parseWeekArg(values.week, baseWeek, currentWeekKey) || undefined : undefined,
+          dateKey: days?.start,
+          endDateKey: days && days.end > days.start ? days.end : undefined,
+          weekKey: span?.start,
+          endWeekKey: span && span.end > span.start ? span.end : undefined,
           upperTaskId: parent ? undefined : values.upper || undefined,
           parentId: parent || undefined,
         }
@@ -1021,22 +1087,26 @@ export default function App() {
   }
 
   const openCycleWizard = (cycle?: GoalCycle, initial?: CycleInput) => {
-    const parse = (value: string | undefined, base = todayKey) => parseDateArg(value, base, todayKey)
+    // 开始日期以原来的开始为锚点，结束日期以开始为锚点、按区间终点补年份：项目就是一段区间，直接回车能解析回原值。
+    const startDate = initial?.startDate ?? cycle?.startDate ?? todayKey
+    const endDate = initial?.endDate ?? cycle?.endDate ?? addDays(todayKey, 30)
+    const parseStart = (value: string | undefined) => parseDateArg(value, startDate, todayKey)
+    const parseEnd = (value: string | undefined, start: string) => parseDateArg(value, start, todayKey, 'onOrAfter')
     openAsk({
       title: cycle ? `${t('editCycle')} · ${cycle.name}` : t('addCycle'),
       fields: [
         { key: 'name', label: t('cycleName'), initial: initial?.name ?? cycle?.name ?? '', maxLength: 160, validate: (value) => (value.trim() ? null : t('nameRequired')) },
-        { key: 'start', label: t('startDate'), initial: initial?.startDate ?? cycle?.startDate ?? todayKey, validate: (value) => (parse(value) ? null : t('dateInvalid')) },
-        { key: 'end', label: t('endDate'), initial: initial?.endDate ?? cycle?.endDate ?? addDays(todayKey, 30), placeholder: '+30', validate: (value, values) => {
-          const start = parse(values.start)
-          const end = parse(value, start || todayKey)
+        { key: 'start', label: t('startDate'), initial: showDate(startDate), validate: (value) => (parseStart(value) ? null : t('dateInvalid')) },
+        { key: 'end', label: t('endDate'), initial: formatSpanEnd(startDate, endDate, showDate), placeholder: '+30', validate: (value, values) => {
+          const start = parseStart(values.start)
+          const end = parseEnd(value, start || todayKey)
           return !end ? t('dateInvalid') : start && compareDateKeys(start, end) > 0 ? t('rangeInvalid') : null
         } },
       ],
       onDone: (values) => {
-        const startDate = parse(values.start)!
-        const input = { name: values.name.trim(), startDate, endDate: parse(values.end, startDate)! }
-        if (submitCycle(input, cycle)) print([{ text: `✓ ${input.name}  ${input.startDate} → ${input.endDate}`, tone: 'ok' }])
+        const start = parseStart(values.start)!
+        const input = { name: values.name.trim(), startDate: start, endDate: parseEnd(values.end, start)! }
+        if (submitCycle(input, cycle)) print([{ text: `✓ ${input.name}  ${formatSpan(input.startDate, input.endDate, showDate)}`, tone: 'ok' }])
       },
     })
   }
@@ -1047,9 +1117,9 @@ export default function App() {
     const locked = Boolean(block && (block.status !== 'paused' || block.elapsedMs > 0))
     const date = block?.dateKey || selectionRef.current.date
     const index = buildIndex(board.snapshot, selectionRef.current)
-    const taskItems: MenuItem[] = [{ id: 'none', value: '', label: t('none') }, ...activeTasks(board.snapshot, 'daily').filter((task) => task.dateKey === date || task.id === block?.taskId).map((task) => ({ id: task.id, value: task.id, label: `${index.refOf.get(task.id) ? `${index.refOf.get(task.id)}  ` : ''}${task.title}` }))]
+    const taskItems: MenuItem[] = [{ id: 'none', value: '', label: t('none') }, ...activeTasks(board.snapshot, 'daily').filter((task) => coversDate(task, date) || task.id === block?.taskId).map((task) => ({ id: task.id, value: task.id, label: `${index.refOf.get(task.id) ? `${index.refOf.get(task.id)}  ` : ''}${task.title}` }))]
     openAsk({
-      title: block ? `${t('edit')} ${index.refOf.get(block.id) || ''} ${block.title}${locked ? ` · ${t('focusDurationLocked')}` : ''}` : `${t('add')} · ${t('navFocus')} ${date.slice(5)}`,
+      title: block ? `${t('edit')} ${index.refOf.get(block.id) || ''} ${block.title}${locked ? ` · ${t('focusDurationLocked')}` : ''}` : `${t('add')} · ${t('navFocus')} ${showDate(date)}`,
       fields: [
         { key: 'title', label: t('focusTitle'), initial: initial?.title ?? block?.title ?? '', maxLength: 300, validate: (value) => (value.trim() ? null : t('titleRequired')) },
         { key: 'minutes', label: t('duration'), initial: initial?.durationMinutes ?? String(block?.durationMinutes ?? 45), placeholder: '45 · 25m · 1.5h', skip: () => locked, validate: (value) => { const minutes = parseMinutes(value); return minutes && minutes > 0 && minutes <= MAX_TIMER_MINUTES ? null : t('noticeTimerDuration') } },
@@ -1064,18 +1134,20 @@ export default function App() {
   }
   wizardsRef.current = { task: openTaskWizard, cycle: openCycleWizard, focus: openFocusWizard }
 
+  // 命令点到哪一行，光标就跟到哪一行：编辑、删除确认进行时，场景里能看到正在问的是谁。
   const resolve = (token: string | undefined) => {
     const ref = parseRef(token, VIEW_SCOPE[viewRef.current])
     if (!ref || !storedRef.current) return null
     const found = lookupRef(currentIndex(), ref)
-    return found ? { ref: ref.label, ...found } : null
+    if (!found) return null
+    setSelectedTaskId(found.task?.id ?? found.block!.id)
+    return { ref: ref.label, ...found }
   }
   const setTaskFields = (task: Task, patch: Partial<Task>) => updateSnapshot((current) => updateTask(current, task.id, patch), `${t('title')}: ${task.title}`)
   const usage = (spec: CommandSpec) => fill(t('usage'), { usage: `/${spec.name}${spec.args ? ` ${spec.args}` : ''}` })
 
   const quickAdd = (text: string, say: (lines: OutLine[]) => void, fail: (text: string) => void) => {
     const current = viewRef.current
-    if (current === 'tree') return fail(t('treeNoAdd'))
     if (current === 'focus') {
       const quick = parseQuickAdd(text, true)
       const linked = quick.upper ? resolve(quick.upper)?.task : undefined
@@ -1084,7 +1156,7 @@ export default function App() {
       const id = submitFocus({ title: quick.title, durationMinutes: String(minutes), taskId: linked?.id })
       return say(id ? [{ text: `+ ${refFor(id)} ${quick.title} · ${minutes}m`, tone: 'ok' }] : [])
     }
-    const domain = SCOPE_DOMAIN[VIEW_SCOPE[current] as 'g' | 'w' | 'd']
+    const domain = SCOPE_DOMAIN[VIEW_SCOPE[current] as Exclude<RefScope, 'f'>]
     if (domain === 'long' && !selectedCycle) return fail(t('noCycles'))
     const quick = parseQuickAdd(text)
     let upperTaskId: string | undefined
@@ -1104,8 +1176,9 @@ export default function App() {
     if (!board) return
     const anchor = task.parentId ? board.tasks.find((candidate) => candidate.id === task.parentId) ?? task : task
     const cycle = board.cycles.find((entry) => entry.id === anchor.cycleId)
-    const week = anchor.domain === 'weekly' && anchor.weekKey ? anchor.weekKey : anchor.domain === 'daily' && anchor.dateKey ? weekKey(anchor.dateKey) : selectionRef.current.week
-    const date = anchor.domain === 'daily' && anchor.dateKey ? anchor.dateKey : dateForWeek(week, cycleForNavigation(board, cycle), selectionRef.current.date)
+    // 跨周任务落在它覆盖的、离用户最近的那一周：正在看的周或本周都不在跨度里，才回到起始周。
+    const week = anchor.domain === 'weekly' && anchor.weekKey ? [selectionRef.current.week, currentWeekKey].find((candidate) => coversWeek(anchor, candidate)) ?? anchor.weekKey : anchor.domain === 'daily' && anchor.dateKey ? weekKey(anchor.dateKey) : selectionRef.current.week
+    const date = anchor.domain === 'daily' && anchor.dateKey ? [selectionRef.current.date, todayKey].find((candidate) => coversDate(anchor, candidate)) ?? anchor.dateKey : dateForWeek(week, cycleForNavigation(board, cycle), selectionRef.current.date)
     const target = DOMAIN_VIEW[anchor.domain]
     const echo = target === 'goals' ? '/goals' : target === 'week' ? `/week ${week}` : `/day ${date}`
     showView(target, echo, () => applySelection({ cycleId: anchor.cycleId ?? UNASSIGNED_CYCLE_ID, date, week }))
@@ -1117,7 +1190,26 @@ export default function App() {
     setSelectedTaskId(block.id)
     revealRow(block.id)
   }
-  const revealRow = (id: string) => requestAnimationFrame(() => requestAnimationFrame(() => document.querySelector(`.board-view.is-live [data-row-id="${id}"]`)?.scrollIntoView({ block: 'center' })))
+  const revealRow = (id: string) => requestAnimationFrame(() => requestAnimationFrame(() => document.querySelector(`.scene [data-row-id="${id}"]`)?.scrollIntoView({ block: 'center' })))
+
+  // 开始（或接着）一块专注。计时器全局只有一个：已有别的在跑时先问要不要切过去，答应了就在同一次提交里暂停它、开始这块。
+  const beginFocus = (subject: FocusBlock, created: FocusBlock | null, say: (lines: OutLine[]) => void) => {
+    const board = storedRef.current!.snapshot
+    const label = (block: FocusBlock) => `${refFor(block.id) || showDate(block.dateKey)} ${block.title}`
+    const running = board.focusBlocks.find((block) => block.status === 'running' && block.id !== subject.id)
+    const go = (emit: (lines: OutLine[]) => void) => {
+      const ok = updateSnapshot((current) => {
+        // 只暂停此刻真的还在跑的那块：问答期间它可能已在别处结束，对已结束的块下暂停会把它改回未结束。
+        const live = running ? current.focusBlocks.find((block) => block.status === 'running' && block.id !== subject.id) : undefined
+        const paused = live ? setFocusCommand(current, live.id, 'pause') : current
+        return created ? setFocusCommand(addFocusBlock(paused, created), created.id, 'start') : setFocusCommand(paused, subject.id, subject.elapsedMs > 0 ? 'resume' : 'start')
+      }, `${t('focus')}: ${subject.title}`)
+      if (ok) emit([{ text: `◉ ${label(subject)} · ${subject.elapsedMs > 0 ? clockLeft(subject, Date.now()) : `${subject.durationMinutes}m`}`, tone: 'accent' }])
+    }
+    if (!running) return go(say)
+    say([])
+    confirm(fill(t('confirmSwitch'), { from: label(running), to: created ? created.title : label(subject) }), () => go(print))
+  }
 
   const execute = (raw: string, echo = true) => {
     const line = raw.trim()
@@ -1143,9 +1235,8 @@ export default function App() {
           if (!target) return fail(fill(t('cmdUnknown'), { cmd: args[0] }))
           return say([{ text: `/${target.name}${target.args ? ` ${target.args}` : ''}`, tone: 'accent' }, { text: target[language] }, ...(target.aliases?.length ? [{ text: `alias  ${target.aliases.map((alias) => `/${alias}`).join('  ')}`, tone: 'dim' as const }] : [])])
         }
-        const id = ++entryIdRef.current
-        setEntries((current) => [...current, { id, echo: shown, body: { kind: 'help' as const, context } }].slice(-MAX_ENTRIES))
-        setHelpMenu({ entryId: id, index: 0 })
+        showHelp(shown)
+        setHelpMenu({ index: 0 })
         return
       }
       case 'login':
@@ -1157,12 +1248,11 @@ export default function App() {
         say([])
         return openDemo()
       case 'goals': return showView('goals', shown)
-      case 'week':
-      case 'tree': {
-        if (!args[0]) return showView(spec.name as ViewName, shown)
-        const key = parseWeekArg(args[0], selectionRef.current.week, currentWeekKey)
+      case 'week': {
+        if (!args[0]) return showView('week', shown)
+        const key = parseWeekArg(args[0], selectionRef.current.week, todayKey)
         if (!key) return fail(usage(spec))
-        return showView(spec.name as ViewName, shown, () => selectWeek(key))
+        return showView('week', shown, () => selectWeek(key))
       }
       case 'day':
       case 'focus': {
@@ -1178,7 +1268,7 @@ export default function App() {
       case 'project': {
         const sub = args[0]?.toLowerCase()
         if (!sub) {
-          const lines: OutLine[] = board!.cycles.map((cycle, position) => ({ key: `${cycle.id === selectedCycle?.id ? '●' : ' '} ${position + 1}`, text: cycle.name, meta: `${cycle.startDate} → ${cycle.endDate} · ${board!.tasks.filter((task) => !task.archivedAt && task.cycleId === cycle.id).length}`, cmd: `/project ${position + 1}` }))
+          const lines: OutLine[] = board!.cycles.map((cycle, position) => ({ key: `${cycle.id === selectedCycle?.id ? '●' : ' '} ${position + 1}`, text: cycle.name, meta: `${formatSpan(cycle.startDate, cycle.endDate, showDate)} · ${board!.tasks.filter((task) => !task.archivedAt && task.cycleId === cycle.id).length}`, cmd: `/project ${position + 1}` }))
           if (board!.tasks.some((task) => !task.cycleId && !task.archivedAt)) lines.push({ key: `${selectedCycleId === UNASSIGNED_CYCLE_ID ? '●' : ' '} ~`, text: t('unassignedPlans'), cmd: '/project ~' })
           lines.push({ text: t('projectHint'), tone: 'dim' })
           return say(lines)
@@ -1224,7 +1314,7 @@ export default function App() {
         if (!target?.task) return fail(fill(t('refMissing'), { ref: args[0] || '' }))
         const parent = target.task
         if (parent.parentId) return fail(t('subOfSub'))
-        const placement: TaskPlacement = { cycleId: parent.cycleId, weekKey: parent.weekKey, dateKey: parent.dateKey }
+        const placement: TaskPlacement = { cycleId: parent.cycleId, weekKey: parent.weekKey, endWeekKey: parent.endWeekKey, dateKey: parent.dateKey, endDateKey: parent.endDateKey }
         const title = restAfter(rest)
         const create = (value: string) => {
           const id = submitTask({ title: value, note: '', color: 'ink' }, undefined, parent.domain, parent.id, placement)
@@ -1302,28 +1392,34 @@ export default function App() {
         if (!arg) return fail(usage(spec))
         if (['up', 'down', 'k', 'j'].includes(arg)) {
           const direction = arg === 'up' || arg === 'k' ? -1 : 1
+          if (reorderInScene(storedRef.current!.snapshot, task.id, direction, selectionRef.current) === storedRef.current!.snapshot) return say([{ text: t('cannotMove'), tone: 'dim' }])
           reorderTask(task, direction)
           return say([{ text: `${direction < 0 ? '↑' : '↓'} ${target.ref} ${task.title}`, tone: 'ok' }])
         }
         if (arg === 'top' || arg === 'bottom') {
-          const siblings = currentIndex()[target.ref[0] as 'g' | 'w' | 'd'].filter((row) => row.task.parentId === task.parentId).map((row) => row.task)
+          const siblings = sceneSiblings(storedRef.current!.snapshot, task, selectionRef.current)
           const anchor = arg === 'top' ? siblings[0] : siblings[siblings.length - 1]
           if (!anchor || anchor.id === task.id) return say([{ text: t('nothingChanged'), tone: 'dim' }])
           sortTask(task, anchor.id)
           return say([{ text: `${arg === 'top' ? '⇡' : '⇣'} ${target.ref} ${task.title}`, tone: 'ok' }])
         }
         if (task.parentId) return fail(t('moveSubtask'))
+        // 单个日期或周次整段平移、保持天数或周数；看不懂再按区间解析，按区间重设跨度。区间可能带空格，所以取整段剩余参数。
+        const spanArg = restAfter(rest)
         if (task.domain === 'daily') {
-          const date = parseDateArg(arg, task.dateKey!, todayKey)
+          const date = parseDateArg(spanArg, task.dateKey!, todayKey) ?? parseDateSpanArg(spanArg, task.dateKey!, todayKey)
           if (!date) return fail(usage(spec))
-          updateSnapshot((current) => moveDailyTask(current, task.id, date), `${t('title')}: ${task.title}`)
-          return say([{ text: `→ ${target.ref} ${task.title} · ${date}`, tone: 'ok' }])
+          const span = targetSpan(task, date)
+          if (weekKey(span.start) !== weekKey(span.end)) return fail(t('noticeDaySpanWeek'))
+          updateSnapshot((current) => moveDailyTask(current, task.id, span), `${t('title')}: ${task.title}`)
+          return say([{ text: `→ ${target.ref} ${task.title} · ${formatSpan(span.start, span.end, showDate)}`, tone: 'ok' }])
         }
         if (task.domain === 'weekly') {
-          const week = parseWeekArg(arg, task.weekKey!, currentWeekKey)
+          const week = parseWeekArg(spanArg, task.weekKey!, todayKey) ?? parseWeekSpanArg(spanArg, task.weekKey!, todayKey)
           if (!week) return fail(usage(spec))
-          updateSnapshot((current) => moveWeeklyTask(current, task.id, week), `${t('title')}: ${task.title}`)
-          return say([{ text: `→ ${target.ref} ${task.title} · ${week}`, tone: 'ok' }])
+          const span = targetSpan(task, week)
+          updateSnapshot((current) => moveWeeklyTask(current, task.id, span), `${t('title')}: ${task.title}`)
+          return say([{ text: `→ ${target.ref} ${task.title} · ${formatSpan(span.start, span.end, showWeek)}`, tone: 'ok' }])
         }
         return fail(t('moveLong'))
       }
@@ -1333,11 +1429,13 @@ export default function App() {
         const task = target.task
         if (task.parentId || task.domain === 'long') return fail(t('deferInvalid'))
         const value = args[1]
-          ? (task.domain === 'weekly' ? parseWeekArg(args[1], task.weekKey!, currentWeekKey) : parseDateArg(args[1], task.dateKey!, todayKey))
+          ? (task.domain === 'weekly' ? parseWeekArg(args[1], task.weekKey!, todayKey) : parseDateArg(args[1], task.dateKey!, todayKey))
           : nextRescheduleTarget(task, currentZone).value
         if (!value) return fail(usage(spec))
+        const span = targetSpan(task, value)
+        if (task.domain === 'daily' && weekKey(span.start) !== weekKey(span.end)) return fail(t('noticeDaySpanWeek'))
         rescheduleTask(task, value)
-        return say([{ text: `↷ ${target.ref} ${task.title} → ${value}`, tone: 'ok' }, { text: t('rescheduleHint'), tone: 'dim' }])
+        return say([{ text: `↷ ${target.ref} ${task.title} → ${formatSpan(span.start, span.end, task.domain === 'weekly' ? showWeek : showDate)}`, tone: 'ok' }, { text: t('rescheduleHint'), tone: 'dim' }])
       }
       case 'rm': {
         const target = resolve(args[0])
@@ -1355,42 +1453,54 @@ export default function App() {
       case 'start': {
         const minutes = args[1] ? parseMinutes(args[1]) : null
         if (args[1] && !minutes) return fail(t('noticeTimerDuration'))
-        if (!args[0]) {
-          const block = board!.focusBlocks.find((entry) => entry.dateKey === selectionRef.current.date && entry.status === 'paused')
-          if (!block) return fail(t('noBlock'))
-          focusCommand(block, block.elapsedMs > 0 ? 'resume' : 'start')
-          return say([{ text: `◉ ${refFor(block.id)} ${block.title}`, tone: 'accent' }])
+        const target = args[0] ? resolve(args[0]) : null
+        if (args[0] && !target) return fail(fill(t('refMissing'), { ref: args[0] }))
+        let block = target ? target.block : openBlock(currentIndex().f.map((row) => row.block))
+        let created: FocusBlock | null = null
+        if (target?.task) {
+          const task = target.task
+          if (task.domain !== 'daily' || !task.dateKey) return fail(t('startDailyOnly'))
+          // 跨天任务的专注记在正在看的那一天，而不是总记到第一天。
+          const focusDate = coversDate(task, selectionRef.current.date) ? selectionRef.current.date : task.dateKey
+          // 不给时长就接着这件事当天没做完的那块：暂停后再按一次开始，不该变成两块。
+          block = minutes ? undefined : openBlock(board!.focusBlocks.filter((entry) => entry.taskId === task.id && entry.dateKey === focusDate))
+          if (!block) {
+            if (selectedCycle && !dateInRange(focusDate, selectedCycle.startDate, selectedCycle.endDate)) return fail(t('selectionOutsideCycle'))
+            try {
+              created = createFocusBlock({ dateKey: focusDate, title: task.title, taskId: task.id, durationMinutes: minutes ?? 45 })
+            } catch (caught) {
+              return fail(noticeLabel(errorNotice(caught, 'noticeFocusSaveFailed')))
+            }
+          }
         }
-        const target = resolve(args[0])
-        if (!target) return fail(fill(t('refMissing'), { ref: args[0] }))
-        if (target.block) {
-          if (target.block.status === 'finished') return fail(t('blockFinished'))
-          if (target.block.status === 'running') return say([{ text: `◉ ${target.ref} ${target.block.title}`, tone: 'accent' }])
-          focusCommand(target.block, target.block.elapsedMs > 0 ? 'resume' : 'start')
-          return say([{ text: `◉ ${target.ref} ${target.block.title}`, tone: 'accent' }])
-        }
-        const task = target.task!
-        if (task.domain !== 'daily' || !task.dateKey) return fail(t('startDailyOnly'))
-        if (selectedCycle && !dateInRange(task.dateKey, selectedCycle.startDate, selectedCycle.endDate)) return fail(t('selectionOutsideCycle'))
-        try {
-          const block = createFocusBlock({ dateKey: task.dateKey, title: task.title, taskId: task.id, durationMinutes: minutes ?? 45 })
-          updateSnapshot((current) => setFocusCommand(addFocusBlock(current, block), block.id, 'start'), `${t('focus')}: ${task.title}`)
-          return say([{ text: `◉ ${task.title} · ${block.durationMinutes}m`, tone: 'accent' }, { text: '/focus', cmd: `/focus ${task.dateKey}`, tone: 'dim' }])
-        } catch (caught) {
-          return fail(noticeLabel(errorNotice(caught, 'noticeFocusSaveFailed')))
-        }
+        const subject = block ?? created
+        if (!subject) return fail(t('noBlock'))
+        if (subject.status === 'finished') return fail(t('blockFinished'))
+        if (subject.status === 'running') return say([{ text: `◉ ${refFor(subject.id)} ${subject.title}`, tone: 'accent' }])
+        return beginFocus(subject, created, say)
       }
-      case 'pause':
-      case 'resume':
-      case 'stop': {
-        const blocks = board!.focusBlocks
-        const block = spec.name === 'pause' ? blocks.find((entry) => entry.status === 'running')
-          : spec.name === 'stop' ? blocks.find((entry) => entry.status === 'running') ?? blocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0 && entry.dateKey === selectionRef.current.date)
-            : blocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0 && entry.dateKey === selectionRef.current.date) ?? blocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0)
+      case 'pause': {
+        const block = board!.focusBlocks.find((entry) => entry.status === 'running')
         if (!block) return fail(t('noRunning'))
-        focusCommand(block, spec.name === 'stop' ? 'finish' : spec.name === 'pause' ? 'pause' : 'resume')
-        const elapsed = Math.min(elapsedMsAt(block, Date.now()), block.durationMinutes * 60_000)
-        return say([{ text: `${spec.name === 'stop' ? '✓' : spec.name === 'pause' ? '◐' : '◉'} ${block.title} · ${formatClock(elapsed)}`, tone: spec.name === 'stop' ? 'ok' : 'accent' }])
+        if (!updateSnapshot((current) => setFocusCommand(current, block.id, 'pause'), `${t('focus')}: ${block.title}`)) return say([])
+        return say([{ text: `◐ ${block.title} · ${formatClock(elapsedMsAt(block, Date.now()))}`, tone: 'accent' }])
+      }
+      case 'resume': {
+        const block = board!.focusBlocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0 && entry.dateKey === selectionRef.current.date) ?? board!.focusBlocks.find((entry) => entry.status === 'paused' && entry.elapsedMs > 0)
+        if (!block) return fail(t('noRunning'))
+        return beginFocus(block, null, say)
+      }
+      case 'stop': {
+        // 做了一半被打断也能直接记为结束，不必先继续再停止；记下的是实际时长，超时不截断。
+        const inProgress = (entry: FocusBlock) => entry.status === 'running' || (entry.status === 'paused' && entry.elapsedMs > 0)
+        const target = args[0] ? resolve(args[0]) : null
+        if (args[0] && !target) return fail(fill(t('refMissing'), { ref: args[0] }))
+        const block = target
+          ? target.block ?? openBlock(board!.focusBlocks.filter((entry) => entry.taskId === target.task!.id && entry.dateKey === selectionRef.current.date))
+          : board!.focusBlocks.find((entry) => entry.status === 'running') ?? board!.focusBlocks.find((entry) => inProgress(entry) && entry.dateKey === selectionRef.current.date)
+        if (!block || !inProgress(block)) return fail(t('noRunning'))
+        if (!updateSnapshot((current) => setFocusCommand(current, block.id, 'finish'), `${t('focus')}: ${block.title}`)) return say([])
+        return say([{ text: `✓ ${block.title} · ${formatClock(elapsedMsAt(block, Date.now()))}`, tone: 'ok' }])
       }
       case 'find':
         say([])
@@ -1440,6 +1550,13 @@ export default function App() {
         theme.setPref(next)
         return say([{ text: `theme · ${next}`, tone: 'dim' }])
       }
+      case 'clock': {
+        const pick = args[0]?.toLowerCase()
+        const next: ClockFace | null = pick === 'analog' || pick === 'digital' ? pick : !pick ? (clockFace === 'analog' ? 'digital' : 'analog') : null
+        if (!next) return fail(usage(spec))
+        setClockFace(next)
+        return say([{ text: `clock · ${next}`, tone: 'dim' }])
+      }
       case 'lang': {
         const pick = args[0]?.toLowerCase()
         const next: Language | null = pick === 'zh' || pick === 'en' ? pick : !pick ? (language === 'zh' ? 'en' : 'zh') : null
@@ -1450,6 +1567,7 @@ export default function App() {
       case 'clear':
         return clearScreen()
       case 'logout': {
+        if (window.location.hash) window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
         if (adapter?.mode === 'cloud') {
           return void signOut().then(() => { if (screenRef.current === 'auth') print([{ text: t('loggedOut'), tone: 'dim' }]) })
         }
@@ -1464,13 +1582,15 @@ export default function App() {
   const statusKey = !online || saveState === 'offline' ? 'offline' : saveState === 'error' ? 'error' : saveState === 'saving' ? 'saving' : saveState === 'pending' ? 'pending' : 'saved'
   const statusGlyph = { saved: '●', pending: '○', saving: '◌', error: '✗', offline: '⊘' }[statusKey]
 
+  // 空提示符上的 esc：先收起盖住场景的整页输出，再进导航模式。
   const enterNav = () => {
+    if (page) { closePage(); setHelpMenu(null); return }
     if (screenRef.current !== 'workspace') return
     setNavMode(true)
     inputRef.current?.blur()
-    if (!selectedTaskId) {
-      const first = document.querySelector<HTMLElement>('.board-view.is-live [data-row-id]')?.dataset.rowId
-      if (first) setSelectedTaskId(first)
+    const ids = [...document.querySelectorAll<HTMLElement>('.scene [data-row-id]')].map((element) => element.dataset.rowId)
+    if (!selectedTaskId || !ids.includes(selectedTaskId)) {
+      if (ids[0]) setSelectedTaskId(ids[0])
     }
   }
   const exitNav = (text?: string) => {
@@ -1486,12 +1606,12 @@ export default function App() {
       const at = board.cycles.findIndex((cycle) => cycle.id === selectedCycle?.id)
       const next = board.cycles[at + delta]
       if (next) selectCycle(next.id)
-    } else if (current === 'week' || current === 'tree') selectWeek(weekKey(addDays(weekRange(selectionRef.current.week).start, delta * 7)))
+    } else if (current === 'week') selectWeek(weekKey(addDays(weekRange(selectionRef.current.week).start, delta * 7)))
     else setDate(addDays(selectionRef.current.date, delta))
   }
   const onNavKey = (event: KeyboardEvent) => {
     if (event.metaKey || event.ctrlKey || event.altKey) return
-    const ids = [...document.querySelectorAll<HTMLElement>('.board-view.is-live [data-row-id]')].map((element) => element.dataset.rowId!)
+    const ids = [...document.querySelectorAll<HTMLElement>('.scene [data-row-id]')].map((element) => element.dataset.rowId!)
     const at = selectedTaskId ? ids.indexOf(selectedTaskId) : -1
     const ref = selectedTaskId ? refFor(selectedTaskId) : ''
     const task = selectedTaskId ? storedRef.current?.snapshot.tasks.find((candidate) => candidate.id === selectedTaskId) : undefined
@@ -1500,15 +1620,15 @@ export default function App() {
       if (!ids.length) return
       const next = ids[at < 0 ? (delta > 0 ? 0 : ids.length - 1) : Math.max(0, Math.min(ids.length - 1, at + delta))]
       setSelectedTaskId(next)
-      document.querySelector(`.board-view.is-live [data-row-id="${next}"]`)?.scrollIntoView({ block: 'nearest' })
+      document.querySelector(`.scene [data-row-id="${next}"]`)?.scrollIntoView({ block: 'nearest' })
     }
     const keys: Record<string, () => void> = {
       j: () => move(1), ArrowDown: () => move(1), k: () => move(-1), ArrowUp: () => move(-1),
-      g: () => execute('/goals'), w: () => execute('/week'), d: () => execute('/day'), f: () => execute('/focus'), t: () => execute('/tree'),
+      g: () => execute('/goals'), w: () => execute('/week'), d: () => execute('/day'), f: () => execute('/focus'),
       h: () => stepPeriod(-1), '[': () => stepPeriod(-1), ArrowLeft: () => stepPeriod(-1),
       l: () => stepPeriod(1), ']': () => stepPeriod(1), ArrowRight: () => stepPeriod(1),
       '.': () => execute('/today'),
-      x: () => { if (task) toggleTask(task); else if (block) focusCommand(block, block.status === 'running' ? 'pause' : block.elapsedMs > 0 ? 'resume' : 'start') },
+      x: () => { if (task) toggleTask(task); else if (block) keys.p() },
       ' ': () => keys.x(),
       Enter: () => setExpandedId((current) => (current === selectedTaskId ? null : selectedTaskId)),
       e: () => { if (ref) execute(`/edit ${ref}`) },
@@ -1516,7 +1636,13 @@ export default function App() {
       J: () => { if (task && ref) execute(`/mv ${ref} down`) },
       K: () => { if (task && ref) execute(`/mv ${ref} up`) },
       r: () => { if (task && ref) execute(`/defer ${ref}`) },
-      p: () => { if (ref) execute(`/start ${ref}`) },
+      // p 对着正在跑的那块（或它的任务）是暂停，否则是开始；S 结束，小写 s 留给子任务。
+      p: () => {
+        const running = storedRef.current?.snapshot.focusBlocks.find((candidate) => candidate.status === 'running')
+        if (running && (block?.id === running.id || (task && running.taskId === task.id))) execute('/pause')
+        else execute(ref ? `/start ${ref}` : '/start')
+      },
+      S: () => execute(ref && (block || task?.domain === 'daily') ? `/stop ${ref}` : '/stop'),
       Delete: () => { if (ref) execute(`/rm ${ref}`) },
       Backspace: () => { if (ref) execute(`/rm ${ref}`) },
       '?': () => execute('/help'),
@@ -1558,21 +1684,26 @@ export default function App() {
     setFlash('')
   }, [flash, print])
 
-  const follow = useStickToBottom(`${entries.length}:${entries[entries.length - 1]?.id ?? 0}:${ask?.id ?? 0}`)
+  const stageRef = useRef<HTMLDivElement | null>(null)
+  const sceneRef = useRef<HTMLDivElement | null>(null)
+  const columns = useColumns(stageRef)
+  // 换场景回到顶部：场景是重画出来的，停在上一个场景的滚动位置没有意义。
+  useEffect(() => { sceneRef.current?.scrollTo({ top: 0 }) }, [view, selectedCycleId, selectedWeek, selectedDate, page?.id])
 
   const helpItems = useMemo<MenuItem[]>(() => commandsFor(context).map((command) => ({ id: command.name, label: `/${command.name}${command.args ? ` ${command.args}` : ''}`, hint: command[language], value: `/${command.name}`, run: !command.needsArg })), [context, language])
   const pickHelp = (item: MenuItem) => {
     setHelpMenu(null)
+    closePage()
     if (item.run) execute(item.value!)
     else setPrefill({ text: `${item.value} `, nonce: Date.now() })
   }
-  const externalMenu: ExternalMenu | null = helpMenu ? { items: helpItems, index: helpMenu.index, setIndex: (index) => setHelpMenu((current) => (current ? { ...current, index } : current)), pick: pickHelp, dismiss: () => setHelpMenu(null) } : null
+  const externalMenu: ExternalMenu | null = helpMenu && page?.kind === 'help' ? { items: helpItems, index: helpMenu.index, setIndex: (index) => setHelpMenu((current) => (current ? { ...current, index } : current)), pick: pickHelp, dismiss: () => { setHelpMenu(null); closePage() } } : null
 
   const complete = useCallback((input: string): MenuItem[] => {
     const argument = /^\/(\S+)\s+(\S*)$/.exec(input)
     if (argument) {
       const spec = resolveCommand(argument[1], context)
-      const options = spec?.name === 'theme' ? ['dark', 'light', 'auto'] : spec?.name === 'lang' ? ['zh', 'en'] : spec?.name === 'project' ? ['new', 'edit', 'rm', 'up', 'down', ...(storedRef.current?.snapshot.cycles.map((_, index) => String(index + 1)) ?? [])] : []
+      const options = spec?.name === 'theme' ? ['dark', 'light', 'auto'] : spec?.name === 'lang' ? ['zh', 'en'] : spec?.name === 'clock' ? ['analog', 'digital'] : spec?.name === 'project' ? ['new', 'edit', 'rm', 'up', 'down', ...(storedRef.current?.snapshot.cycles.map((_, index) => String(index + 1)) ?? [])] : []
       return options.filter((option) => option.startsWith(argument[2]) && option !== argument[2]).slice(0, 8).map((option) => ({ id: option, label: `/${spec!.name} ${option}`, hint: spec?.name === 'project' && /^\d+$/.test(option) ? storedRef.current?.snapshot.cycles[Number(option) - 1]?.name : undefined, value: `/${spec!.name} ${option}`, run: true }))
     }
     return completeCommand(input, context, language)
@@ -1584,12 +1715,12 @@ export default function App() {
     select: (id) => { setSelectedTaskId(id); setExpandedId((current) => (current === id ? null : id)) },
     navigate: (patch) => {
       setExpandedId(null)
+      closePage()
       if (patch.cycleId !== undefined && patch.cycleId !== null) selectCycle(patch.cycleId)
       else if (patch.week) selectWeek(patch.week)
       else if (patch.date) setDate(patch.date)
     },
     jump: (task) => jumpTo(task),
-    focusCommand: (block, command) => focusCommand(block, command),
   }
 
   const finderItems = (): FinderItem[] => {
@@ -1597,9 +1728,9 @@ export default function App() {
     if (!board) return []
     const projectName = (task: Task) => board.cycles.find((cycle) => cycle.id === task.cycleId)?.name ?? t('unassignedPlans')
     const items: FinderItem[] = VIEWS.map((name) => ({ id: `view:${name}`, kind: 'view', title: t(VIEW_LABEL[name]), meta: `/${name}`, open: () => execute(`/${name}`) }))
-    board.cycles.forEach((cycle, position) => items.push({ id: `project:${cycle.id}`, kind: 'project', title: cycle.name, meta: `${cycle.startDate} → ${cycle.endDate}`, open: () => execute(`/project ${position + 1}`) }))
-    for (const task of activeTasks(board)) items.push({ id: task.id, kind: 'task', title: `${task.checked ? '✓ ' : ''}${task.title}`, meta: `${projectName(task)} · ${task.domain === 'long' ? t('navGoals') : task.domain === 'weekly' ? task.weekKey?.slice(5) : task.dateKey?.slice(5)}`, open: () => jumpTo(task) })
-    for (const block of board.focusBlocks) items.push({ id: block.id, kind: 'focus', title: block.title, meta: `${block.dateKey.slice(5)} · ${block.durationMinutes}m`, open: () => jumpToBlock(block) })
+    board.cycles.forEach((cycle, position) => items.push({ id: `project:${cycle.id}`, kind: 'project', title: cycle.name, meta: formatSpan(cycle.startDate, cycle.endDate, showDate), open: () => execute(`/project ${position + 1}`) }))
+    for (const task of activeTasks(board)) items.push({ id: task.id, kind: 'task', title: `${task.checked ? '✓ ' : ''}${task.title}`, meta: `${projectName(task)} · ${task.domain === 'long' ? t('navGoals') : placementLabel(task, todayKey)}`, open: () => jumpTo(task) })
+    for (const block of board.focusBlocks) items.push({ id: block.id, kind: 'focus', title: block.title, meta: `${showDate(block.dateKey)} · ${block.durationMinutes}m`, open: () => jumpToBlock(block) })
     return items
   }
 
@@ -1613,38 +1744,30 @@ export default function App() {
     ? (adapter?.mode === 'cloud' ? <a className="side-button" href="/account" onClick={(event) => { if (saveState !== 'saved') { event.preventDefault(); execute('/account') } }}>{t('ctaConnect')}</a> : <button type="button" className="side-button" onClick={() => execute('/logout')}>{t('ctaExitDemo')}</button>)
     : screen === 'setup' ? <button type="button" className="side-button" onClick={() => execute('/demo')}>{t('localDemo')}</button>
       : screen === 'auth' ? <button type="button" className="side-button" onClick={() => execute('/login')}>{t('signIn')}</button> : null
-  const motd = screen === 'workspace' ? t('motdBoard') : screen === 'setup' ? t('motdSetup') : t('motdAuth')
+  const motd = screen === 'setup' ? t('motdSetup') : t('motdAuth')
   const clock = new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: currentZone }).format(now)
-  const runningRemaining = runningBlock ? runningBlock.durationMinutes * 60_000 - Math.min(elapsedMsAt(runningBlock, now), runningBlock.durationMinutes * 60_000) : 0
   const showSaveNotice = screen === 'workspace' && (saveState === 'error' || saveState === 'offline' || !online)
   const showDraftNotice = screen === 'workspace' && draftLabel && canReopenDraft && (saveState === 'error' || saveState === 'offline')
 
-  const renderBody = (entry: Entry) => {
-    const body = entry.body!
-    if (body.kind === 'lines') return <Lines lines={body.lines} onCommand={(command) => actions.run(command)} />
-    if (body.kind === 'help') {
-      const active = helpMenu?.entryId === entry.id
-      return <Menu id={`help-${entry.id}`} items={helpItems} index={active ? helpMenu!.index : -1} onPick={pickHelp} onHover={active ? (index) => setHelpMenu({ entryId: entry.id, index }) : undefined} footer={active ? t('hintMenu') : undefined} />
-    }
-    const frozen = body.frozen
-    const board = frozen ? frozen.snapshot : stored?.snapshot
-    if (!board) return null
-    return <BoardView view={body.view} snapshot={board} selection={frozen ? frozen.selection : liveSelection} language={language} t={t} now={frozen ? frozen.now : now} live={!frozen} cursorId={frozen ? null : selectedTaskId} expandedId={frozen ? null : expandedId} actions={actions} />
-  }
-
+  const board = screen === 'workspace' && stored ? stored.snapshot : null
   return (
     <ShellFrame nav={nav} cta={cta} homeLabel={t('appName')}>
-      <div className={`scrollback ${navMode ? 'is-nav' : ''}`} onMouseUp={(event) => {
-        const target = event.target as HTMLElement
-        if (window.getSelection()?.toString() || target.closest('button,a,input,textarea,[role="option"]')) return
-        if (navMode) exitNav(); else focusPrompt()
-      }}>
-        <Banner label={t('appName')}><p><Rich text={t('motdTagline')} onCommand={actions.run} /></p><p className="dim"><Rich text={motd} onCommand={actions.run} /></p></Banner>
-        {screen === 'workspace' && stored ? <Dashboard snapshot={stored.snapshot} selection={liveSelection} language={language} t={t} now={now} actions={actions} /> : null}
-        {entries.map((entry) => <div key={entry.id} className="entry">
-          {entry.echo !== undefined ? <Echo text={entry.echo}>{entry.result ? <span className={`tone-${entry.result.tone || 'plain'}`}>{entry.result.text}</span> : null}</Echo> : null}
-          {entry.body ? renderBody(entry) : null}
-        </div>)}
+      <div ref={stageRef} className={`stage ${navMode ? 'is-nav' : ''}`}>
+        {board ? <SceneHead view={view} snapshot={board} selection={liveSelection} language={language} t={t} now={now} columns={columns} actions={actions} /> : null}
+        <div ref={sceneRef} className="scene" onMouseUp={(event) => {
+          const target = event.target as HTMLElement
+          if (window.getSelection()?.toString() || target.closest('button,a,input,textarea,[role="option"]')) return
+          if (navMode) exitNav(); else focusPrompt()
+        }}>
+          {page ? <section className="page" aria-label={page.echo}>
+            <PageHead echo={page.echo} hint={t('pageHint')} />
+            {page.kind === 'help'
+              ? <Menu id="help-page" items={helpItems} index={helpMenu?.index ?? -1} onPick={pickHelp} onHover={helpMenu ? (index) => setHelpMenu({ index }) : undefined} footer={helpMenu ? t('hintMenu') : undefined} />
+              : <Lines lines={page.lines} onCommand={actions.run} />}
+          </section>
+            : board ? <Scene view={view} snapshot={board} selection={liveSelection} language={language} t={t} now={now} columns={columns} clockFace={clockFace} cursorId={selectedTaskId} expandedId={expandedId} touched={touched} actions={actions} />
+              : <Banner label={t('appName')}><p><Rich text={t('motdTagline')} onCommand={actions.run} /></p><p className="dim"><Rich text={motd} onCommand={actions.run} /></p></Banner>}
+        </div>
       </div>
       <div className="console">
         {showSaveNotice ? <div className="notice" role="status">
@@ -1661,21 +1784,17 @@ export default function App() {
           <button type="button" className="bracket" onClick={() => execute('/sync')}>[{t('reloadLatest')}]</button>
           <button type="button" className="bracket dim" onClick={() => execute('/discard')}>[{t('discardDraft')}]</button>
         </div> : null}
-        {screen === 'workspace' && runningBlock && runningBlock.dateKey !== selectedDate ? <div className="notice running" role="status">
-          <span className="notice-mark">◉</span><span>{t('runningElsewhere')} · {runningBlock.dateKey}</span>
-          <button type="button" className="bracket" onClick={() => jumpToBlock(runningBlock)}>[{t('jumpFocus')}]</button>
-        </div> : null}
         {screen !== 'workspace' && saveState === 'error' && saveMessage ? <div className="notice" role="alert"><span className="notice-mark">✗</span><span>{noticeLabel(saveMessage)}</span></div> : null}
+        <OutputStrip output={output} onCommand={actions.run} />
         <Prompt user={promptUser} ask={ask} busy={authBusy ? <><Spinner /> {t('authenticating')}</> : screen === 'loading' ? <><Spinner /> {t('loading')}</> : null}
           placeholder={screen === 'workspace' ? fill(t('placeholderBoard'), { view: t(VIEW_LABEL[view]) }) : screen === 'setup' ? '/demo' : '/login'}
           history={historyRef.current} copy={{ hintCommand: navMode ? '' : screen === 'workspace' ? t('hintBoard') : t('hintCommand'), hintAsk: t('hintAsk'), hintChoice: t('hintChoice'), hintNote: t('hintNote'), hintMenu: t('hintMenu'), noMatch: t('finderEmpty') }}
-          complete={complete} menu={externalMenu} inputRef={inputRef} prefill={prefill} onGrow={follow} onSubmit={(line) => execute(line)} onNav={enterNav} onClear={clearScreen} />
+          complete={complete} menu={externalMenu} inputRef={inputRef} prefill={prefill} onSubmit={(line) => execute(line)} onNav={enterNav} onClear={clearScreen} />
       </div>
       <footer className="statusline">
         <span className={`sl-mode ${navMode ? 'is-nav' : ''}`}>{navMode ? 'NAV' : screen === 'workspace' ? 'CMD' : 'TTY'}</span>
-        <span className="sl-path">{screen === 'workspace' && stored ? `${selectedCycle?.name ?? t('unassignedPlans')} › ${selectedWeek.slice(5)} › ${selectedDate.slice(5)}` : `${t('appName')} · ${screen === 'setup' ? t('connectionMissing') : t('connectionReady')}`}</span>
+        {screen !== 'workspace' ? <span className="sl-path">{t('appName')} · {screen === 'setup' ? t('connectionMissing') : t('connectionReady')}</span> : null}
         <span className="sl-spacer" />
-        {screen === 'workspace' && runningBlock ? <button type="button" className="sl-item sl-running" onClick={() => jumpToBlock(runningBlock)}>◉ {formatClock(runningRemaining)}</button> : null}
         {screen === 'workspace' ? <button type="button" className={`sl-item sl-save is-${statusKey}`} onClick={() => execute('/status')}>{statusGlyph} {t(statusKey)}</button> : null}
         {screen === 'workspace' ? <span className="sl-item">{adapter?.mode === 'demo' ? t('demo') : t('cloud')}</span> : null}
         <button type="button" className="sl-item" onClick={() => execute(`/lang ${language === 'zh' ? 'en' : 'zh'}`)}>{t('langShort')}</button>
@@ -1726,19 +1845,17 @@ export default function App() {
 
   function reorderTask(task: Task, direction: -1 | 1) {
     // 带上来源，冲突时直接加载最新版本后再明确重做，不把排序伪装成表单草稿。
-    updateSnapshot((current) => reorderSibling(current, task.id, direction), `${t('title')}: ${task.title}`, reorderOrigin(task, direction))
+    updateSnapshot((current) => reorderInScene(current, task.id, direction, selectionRef.current), `${t('title')}: ${task.title}`, reorderOrigin(task, direction))
+    touch([task.id])
   }
 
   function sortTask(task: Task, targetId: string) {
     updateSnapshot((current) => reorderSiblingTo(current, task.id, targetId), `${t('dragTask')}: ${task.title}`)
+    touch([task.id])
   }
 
   function sortCycle(cycle: GoalCycle, targetId: string) {
     updateSnapshot((current) => reorderCycleTo(current, cycle.id, targetId), `${t('dragCycle')}: ${cycle.name}`)
-  }
-
-  function focusCommand(block: FocusBlock, command: 'start' | 'pause' | 'resume' | 'finish') {
-    updateSnapshot((current) => setFocusCommand(current, block.id, command), `${t('focus')}: ${block.title}`)
   }
 
   function updateSettings(zone: string) {

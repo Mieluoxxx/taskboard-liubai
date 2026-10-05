@@ -21,7 +21,7 @@ Supabase 当前未声明 CIMD 和 RFC 9207 的 `iss` 回调能力：它们是规
 
 ### 1. 数据库
 
-按顺序执行 `supabase/migrations/001`–`008`。已有 `007` 部署再执行 `008_mcp_database_gateway.sql`，并完成下述专用角色配置，必须先于新版 MCP 函数发布。迁移不改写现有快照或 revision；网页旧版 CAS 写入也会进入统一的删除捕获和审计触发器。
+按顺序执行 `supabase/migrations/001`–`010`。已有 `007` 部署再执行 `008_mcp_database_gateway.sql`，并完成下述专用角色配置，必须先于新版 MCP 函数发布；`009_weekly_span.sql`、`010_daily_span.sql` 须先于支持跨周、跨天任务的新版前端与 MCP 发布。迁移不改写现有快照或 revision；网页旧版 CAS 写入也会进入统一的删除捕获和审计触发器。
 
 先启用 Cron 扩展，`006` 会安排每小时清理到期数据：
 
@@ -107,8 +107,8 @@ curl -fsS https://YOUR_DOMAIN/.well-known/oauth-protected-resource/api/mcp
 
 ## 工具与一致性
 
-- `board_read` / `tasks_list`：只查询，不自动顺延。`board_read` 返回完整快照与 30 分钟有效、绑定用户和客户端的压缩签名读票。
-- `board_apply`：最多 100 个领域操作一次 CAS 提交，可用 `$ref` 引用同批新对象；服务器只合并互不相关的实体修改，同实体或项目删除范围变化时整批拒绝。
+- `board_read` / `tasks_list`：只查询，不自动顺延。`tasks_list` 的 `weekKey` / `dateKey` 匹配跨度（`weekKey..endWeekKey`、`dateKey..endDateKey`）覆盖该周、该天的任务。`board_read` 返回完整快照与 30 分钟有效、绑定用户和客户端的压缩签名读票。
+- `board_apply`：`create_task` 可给周任务带 `endWeekKey`（最后一周，含，须晚于 `weekKey`），给日任务带 `endDateKey`（最后一天，含，须晚于 `dateKey` 且同在一个 ISO 周）；`move_task` 省略 `endWeekKey` / `endDateKey` 时整段平移、保持长度，给 `null` 收成单周/单天，给值则重设为 `target..end`。最多 100 个领域操作一次 CAS 提交，可用 `$ref` 引用同批新对象；服务器只合并互不相关的实体修改，同实体或项目删除范围变化时整批拒绝。
 - MCP 请求按授权用户 + OAuth 客户端在 Postgres 中原子限流，每分钟 120 次，超过返回 HTTP 429 与 `Retry-After`。它不依赖单个 Vercel 实例的内存，也不修改计划数据。
 - 超时重试须保持相同 `requestId` 和参数。`readToken` 是包含私有快照的签名数据，不应展示或记录；不是独立授权凭据。
 - `trash_list` / `audit_list` 分页读取。一次提交的删除集合为一个回收单位；恢复不会改写存活对象的关联或重新启动计时器，原项目缺失时可明确指定新项目与日期。

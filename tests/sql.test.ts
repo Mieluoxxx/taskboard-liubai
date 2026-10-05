@@ -8,7 +8,7 @@ const OWNER = '00000000-0000-0000-0000-000000000001'
 const OTHER = '00000000-0000-0000-0000-000000000002'
 const THIRD = '00000000-0000-0000-0000-000000000003'
 
-async function database(applyIndependentMigration = true, applyTextLimits = true, applyHistoryRemoval = true, applyProjectScope = true) {
+async function database(applyIndependentMigration = true, applyTextLimits = true, applyHistoryRemoval = true, applyProjectScope = true, applySpans = true) {
   const db = new PGlite()
   await db.waitReady
   await db.exec(`
@@ -27,9 +27,74 @@ async function database(applyIndependentMigration = true, applyTextLimits = true
   if (applyIndependentMigration && applyTextLimits) await db.exec(await readFile(new URL('../supabase/migrations/003_task_text_limits.sql', import.meta.url), 'utf8'))
   if (applyIndependentMigration && applyTextLimits && applyHistoryRemoval) await db.exec(await readFile(new URL('../supabase/migrations/004_remove_task_history.sql', import.meta.url), 'utf8'))
   if (applyIndependentMigration && applyTextLimits && applyHistoryRemoval && applyProjectScope) await db.exec(await readFile(new URL('../supabase/migrations/005_project_task_scope.sql', import.meta.url), 'utf8'))
+  if (applyIndependentMigration && applyTextLimits && applyHistoryRemoval && applyProjectScope && applySpans) {
+    await db.exec(await readFile(new URL('../supabase/migrations/009_weekly_span.sql', import.meta.url), 'utf8'))
+    await db.exec(await readFile(new URL('../supabase/migrations/010_daily_span.sql', import.meta.url), 'utf8'))
+  }
   await db.exec(`select set_config('request.jwt.claim.sub', '${OWNER}', false);`)
   return db
 }
+
+test('009 validates weekly spans exactly like the client', async () => {
+  const now = '2025-01-15T12:00:00.000Z'
+  const span = { ...createTask({ domain: 'weekly', title: 'Span', cycleId: 'A', weekKey: '2025-W02', endWeekKey: '2025-W04' }, now), id: 'span' }
+  const child = { ...createTask({ domain: 'weekly', title: 'Child', cycleId: 'A', weekKey: '2025-W02', endWeekKey: '2025-W04', parentId: 'span' }, now), id: 'child' }
+  const day = { ...createTask({ domain: 'daily', title: 'Day', cycleId: 'A', dateKey: '2025-01-15', upperTaskId: 'span' }, now), id: 'day' }
+  const snapshot = validateSnapshot({ ...emptySnapshot('UTC'), cycles: [{ id: 'A', name: 'A', startDate: '2025-01-01', endDate: '2025-03-31', createdAt: now }], tasks: [span, child, day] })
+  const db = await database()
+  try {
+    await db.query('select * from public.get_private_board()')
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(snapshot)])
+    const loaded = await db.query<{ snapshot: unknown }>('select * from public.get_private_board()')
+    assert.deepEqual(validateSnapshot(loaded.rows[0].snapshot), snapshot)
+    for (const [index, patch] of [
+      [0, { endWeekKey: '2025-W02' }], [0, { endWeekKey: '2025-W01' }], [0, { endWeekKey: '2025-W60' }], [0, { endWeekKey: 4 }],
+      [1, { endWeekKey: '2025-W03' }], [1, { endWeekKey: undefined }], [2, { endWeekKey: '2025-W04' }],
+    ] as const) {
+      const invalid = structuredClone(snapshot)
+      Object.assign(invalid.tasks[index], patch)
+      assert.throws(() => validateSnapshot(invalid), /invalid/i, JSON.stringify(patch))
+      await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(invalid)]), /invalid/i, JSON.stringify(patch))
+    }
+  } finally {
+    await db.close()
+  }
+})
+
+test('010 validates daily spans exactly like the client', async () => {
+  const now = '2025-01-15T12:00:00.000Z'
+  // 2025-01-13 是周一，2025-01-19 是周日。
+  const span = { ...createTask({ domain: 'daily', title: 'Span', cycleId: 'A', dateKey: '2025-01-13', endDateKey: '2025-01-15' }, now), id: 'span' }
+  const child = { ...createTask({ domain: 'daily', title: 'Child', cycleId: 'A', dateKey: '2025-01-13', endDateKey: '2025-01-15', parentId: 'span' }, now), id: 'child' }
+  const week = { ...createTask({ domain: 'weekly', title: 'Week', cycleId: 'A', weekKey: '2025-W03' }, now), id: 'week' }
+  const snapshot = validateSnapshot({ ...emptySnapshot('UTC'), cycles: [{ id: 'A', name: 'A', startDate: '2025-01-01', endDate: '2025-03-31', createdAt: now }], tasks: [span, child, week] })
+  const db = await database()
+  try {
+    await db.query('select * from public.get_private_board()')
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [0, JSON.stringify(snapshot)])
+    const loaded = await db.query<{ snapshot: unknown }>('select * from public.get_private_board()')
+    assert.deepEqual(validateSnapshot(loaded.rows[0].snapshot), snapshot)
+    for (const [index, patch] of [
+      [0, { endDateKey: '2025-01-13' }], [0, { endDateKey: '2025-01-12' }], [0, { endDateKey: '2025-01-20' }], [0, { endDateKey: '2025-02-30' }], [0, { endDateKey: 15 }],
+      [1, { endDateKey: '2025-01-14' }], [1, { endDateKey: undefined }], [2, { endDateKey: '2025-01-15' }],
+    ] as const) {
+      const invalid = structuredClone(snapshot)
+      Object.assign(invalid.tasks[index], patch)
+      assert.throws(() => validateSnapshot(invalid), /invalid/i, JSON.stringify(patch))
+      // 001 的 valid_date_key 对不存在的日期直接抛 out of range 而不是返回 false：同样是拒绝，只是报错不同。
+      const reason = 'endDateKey' in patch && patch.endDateKey === '2025-02-30' ? /out of range/i : /invalid/i
+      await assert.rejects(db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(invalid)]), reason, JSON.stringify(patch))
+    }
+    // 周日正好是同一个 ISO 周的最后一天，两侧都接受。
+    const sunday = structuredClone(snapshot)
+    Object.assign(sunday.tasks[0], { endDateKey: '2025-01-19' })
+    Object.assign(sunday.tasks[1], { endDateKey: '2025-01-19' })
+    validateSnapshot(sunday)
+    await db.query('select * from public.cas_save_private_board($1, $2::jsonb)', [1, JSON.stringify(sunday)])
+  } finally {
+    await db.close()
+  }
+})
 
 test('005 preserves legacy data and validates project ownership on both sides of CAS', async () => {
   const now = '2025-01-15T12:00:00.000Z'

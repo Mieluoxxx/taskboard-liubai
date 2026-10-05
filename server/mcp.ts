@@ -4,7 +4,7 @@ import { createMcpHandler, McpServer } from '@modelcontextprotocol/server'
 import type { BoardRpc } from './store.js'
 import { z } from 'zod'
 import { actionsSchema, applyActions, mergeAgentChanges, type TrashEntry } from '../src/agent-operations.js'
-import { validateStoredBoard } from '../src/domain.js'
+import { coversDate, coversWeek, validateStoredBoard } from '../src/domain.js'
 import type { StoredBoard } from '../src/types.js'
 
 export type Caller = { userId: string; clientId: string }
@@ -67,9 +67,9 @@ export function createTaskboardServer(client: BoardRpc, caller: Caller, secret: 
     const board = await loadBoard(client)
     return { ...board, readToken: issueReadTicket(board, caller, secret), readTokenExpiresInSeconds: 1800 }
   }))
-  server.registerTool('tasks_list', { description: 'Query tasks without changing their dates or triggering automatic carry-forward.', inputSchema: z.object({ domain: z.enum(['long', 'weekly', 'daily']).optional(), cycleId: z.string().optional(), dateKey: z.string().optional(), weekKey: z.string().optional(), includeArchived: z.boolean().default(false), checked: z.boolean().optional(), offset: z.number().int().min(0).max(2000).default(0), limit: z.number().int().min(1).max(100).default(50) }).strict(), annotations: { readOnlyHint: true } }, (input) => protect(async () => {
+  server.registerTool('tasks_list', { description: 'Query tasks without changing their dates or triggering automatic carry-forward. weekKey / dateKey match tasks whose span (weekKey..endWeekKey, dateKey..endDateKey) covers that week or day.', inputSchema: z.object({ domain: z.enum(['long', 'weekly', 'daily']).optional(), cycleId: z.string().optional(), dateKey: z.string().optional(), weekKey: z.string().optional(), includeArchived: z.boolean().default(false), checked: z.boolean().optional(), offset: z.number().int().min(0).max(2000).default(0), limit: z.number().int().min(1).max(100).default(50) }).strict(), annotations: { readOnlyHint: true } }, (input) => protect(async () => {
     const board = await loadBoard(client)
-    const tasks = board.snapshot.tasks.filter((task) => (input.includeArchived || !task.archivedAt) && (!input.domain || task.domain === input.domain) && (input.cycleId === undefined || task.cycleId === input.cycleId) && (!input.dateKey || task.dateKey === input.dateKey) && (!input.weekKey || task.weekKey === input.weekKey) && (input.checked === undefined || task.checked === input.checked))
+    const tasks = board.snapshot.tasks.filter((task) => (input.includeArchived || !task.archivedAt) && (!input.domain || task.domain === input.domain) && (input.cycleId === undefined || task.cycleId === input.cycleId) && (!input.dateKey || coversDate(task, input.dateKey)) && (!input.weekKey || coversWeek(task, input.weekKey)) && (input.checked === undefined || task.checked === input.checked))
     return { revision: board.revision, total: tasks.length, tasks: tasks.slice(input.offset, input.offset + input.limit) }
   }))
   server.registerTool('board_apply', { description: 'Atomically perform 1–100 actions against a board_read ticket. Supply a fresh UUID requestId per intended batch; retry the exact same ID and input after network uncertainty (deduplicated for 24 hours). A create action may name ref; subsequent IDs can use $ref. Restore is atomic with the other actions; restoring and deleting the same object in one batch is rejected. Unrelated remote edits merge; same-object conflicts or an expanded project-deletion scope abort the entire batch.', inputSchema: z.object({ readToken: z.string().min(1).max(1_500_000), requestId: z.uuid(), actions: actionsSchema }).strict(), annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true } }, (input) => protect(async () => {

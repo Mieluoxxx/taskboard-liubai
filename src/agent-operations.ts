@@ -1,10 +1,10 @@
 import { z } from 'zod'
 import {
-  addCycle, addFocusBlock, addTask, carryForwardTasks, cloneSnapshot, createFocusBlock,
-  createTask, deleteCycle, deleteFocusBlock, deleteTask, elapsedMsAt, MAX_ELAPSED_MS,
+  addCycle, addDays, addFocusBlock, addTask, carryForwardTasks, cloneSnapshot, createFocusBlock,
+  createTask, daySpan, daysBetween, deleteCycle, deleteFocusBlock, deleteTask, elapsedMsAt, MAX_ELAPSED_MS,
   mergeSnapshots, moveDailyTask, moveWeeklyTask, reorderCycleTo, reorderSiblingTo,
-  rescheduleDailyTask, rescheduleWeeklyTask, setFocusCommand, updateFocusBlock,
-  updateTask, validateSnapshot, weekKey,
+  rescheduleDailyTask, rescheduleWeeklyTask, setFocusCommand, sharesOrderScope, shiftWeek,
+  updateFocusBlock, updateTask, validateSnapshot, weekKey, weeksBetween, weekSpan,
 } from './domain.js'
 import type { BoardSnapshot, FocusBlock, Task } from './types.js'
 
@@ -24,10 +24,12 @@ export const actionSchema = z.discriminatedUnion('op', [
   z.object({ op: z.literal('update_project'), id, patch: z.object({ name: z.string().trim().min(1).max(160).optional(), startDate: date.optional(), endDate: date.optional() }).strict() }).strict(),
   z.object({ op: z.literal('delete_project'), id }).strict(),
   z.object({ op: z.literal('reorder_project'), id, targetId: id }).strict(),
-  z.object({ op: z.literal('create_task'), domain: z.enum(['long', 'weekly', 'daily']), title: z.string().trim().min(1).max(450), note: z.string().max(3000).optional(), color: color.optional(), cycleId: id.optional(), dateKey: date.optional(), weekKey: week.optional(), parentId: id.optional(), upperTaskId: id.optional(), ref }).strict(),
+  z.object({ op: z.literal('create_task'), domain: z.enum(['long', 'weekly', 'daily']), title: z.string().trim().min(1).max(450), note: z.string().max(3000).optional(), color: color.optional(), cycleId: id.optional(), dateKey: date.optional(), endDateKey: date.optional().describe('Daily tasks spanning several days: the last day, inclusive, later than dateKey and in the same ISO week.'), weekKey: week.optional(), endWeekKey: week.optional().describe('Weekly tasks spanning several ISO weeks: the last week, inclusive and later than weekKey.'), parentId: id.optional(), upperTaskId: id.optional(), ref }).strict(),
   z.object({ op: z.literal('update_task'), id, patch: taskPatch }).strict(),
   z.object({ op: z.literal('delete_task'), id }).strict(),
-  z.object({ op: z.literal('move_task'), id, target: z.string().min(1).max(10) }).strict(),
+  z.object({ op: z.literal('move_task'), id, target: z.string().min(1).max(10),
+    endDateKey: date.nullable().optional().describe('Daily only. Omit to shift the whole span to start at target, keeping its length; null makes it a single day; a date sets the span to target..endDateKey within one ISO week.'),
+    endWeekKey: week.nullable().optional().describe('Weekly only. Omit to shift the whole span to start at target, keeping its length; null makes it a single week; a week key sets the span to target..endWeekKey.') }).strict(),
   z.object({ op: z.literal('reschedule_task'), id, target: z.string().min(1).max(10) }).strict(),
   z.object({ op: z.literal('reorder_task'), id, targetId: id }).strict(),
   z.object({ op: z.literal('create_focus'), title: z.string().trim().min(1).max(300), dateKey: date, durationMinutes: z.number().min(0.1).max(1440).optional(), taskId: id.optional(), ref }).strict(),
@@ -46,10 +48,10 @@ function ensurePlacement(snapshot: BoardSnapshot, task: Task) {
   const cycle = snapshot.cycles.find((entry) => entry.id === task.cycleId)
   if (task.cycleId && !cycle) throw new Error('Project no longer exists')
   if (!cycle || task.domain === 'long') return
-  const target = task.domain === 'weekly' ? task.weekKey! : task.dateKey!
+  const target = task.domain === 'weekly' ? weekSpan(task) : daySpan(task)
   const start = task.domain === 'weekly' ? weekKey(cycle.startDate) : cycle.startDate
   const end = task.domain === 'weekly' ? weekKey(cycle.endDate) : cycle.endDate
-  if (target < start || target > end) throw new Error('Placement is outside the project; adjust its dates first')
+  if (target.start < start || target.end > end) throw new Error('Placement is outside the project; adjust its dates first')
 }
 
 /** 只恢复回收集合，不改仍存活对象；父项目缺失时必须明确提供新归属。 */
@@ -66,8 +68,15 @@ export function restoreTrash(snapshot: BoardSnapshot, entry: TrashEntry, target:
   if (target.cycleId && !next.cycles.some((cycle) => cycle.id === target.cycleId)) throw new Error('Target project does not exist')
   for (const task of payload.tasks) {
     if (target.cycleId) task.cycleId = target.cycleId
-    if (target.dateKey && task.domain === 'daily') task.dateKey = target.dateKey
-    if (target.weekKey && task.domain === 'weekly') task.weekKey = target.weekKey
+    if (target.dateKey && task.domain === 'daily') {
+      if (task.endDateKey && task.dateKey) task.endDateKey = addDays(task.endDateKey, daysBetween(task.dateKey, target.dateKey))
+      task.dateKey = target.dateKey
+    }
+    if (target.weekKey && task.domain === 'weekly') {
+      // 恢复到别的周时整段平移，否则跨度的终点可能落到起点之前。
+      if (task.endWeekKey && task.weekKey) task.endWeekKey = shiftWeek(task.endWeekKey, weeksBetween(task.weekKey, target.weekKey))
+      task.weekKey = target.weekKey
+    }
     if (task.cycleId && !next.cycles.some((cycle) => cycle.id === task.cycleId)) throw new Error('Original project is missing; choose another project and placement')
     if (target.cycleId || target.dateKey || target.weekKey) ensurePlacement(next, task)
     task.updatedAt = now
@@ -76,7 +85,7 @@ export function restoreTrash(snapshot: BoardSnapshot, entry: TrashEntry, target:
   const byId = new Map(next.tasks.map((task) => [task.id, task]))
   for (const task of payload.tasks) {
     const parent = byId.get(task.parentId || '')
-    if (!parent || parent.parentId || parent.domain !== task.domain || parent.cycleId !== task.cycleId || parent.dateKey !== task.dateKey || parent.weekKey !== task.weekKey) delete task.parentId
+    if (!parent || parent.parentId || parent.domain !== task.domain || parent.cycleId !== task.cycleId || parent.dateKey !== task.dateKey || parent.endDateKey !== task.endDateKey || parent.weekKey !== task.weekKey || parent.endWeekKey !== task.endWeekKey) delete task.parentId
     const upper = byId.get(task.upperTaskId || '')
     if (task.parentId || !upper || upper.parentId || upper.cycleId !== task.cycleId || upper.domain !== (task.domain === 'daily' ? 'weekly' : task.domain === 'weekly' ? 'long' : '')) delete task.upperTaskId
     if (task.rescheduledTo && !byId.has(task.rescheduledTo)) delete task.rescheduledTo
@@ -141,7 +150,7 @@ export function applyActions(snapshot: BoardSnapshot, input: unknown, trash: Tra
         if (created.parentId) {
           const parent = next.tasks.find((item) => item.id === created.parentId && !item.archivedAt && !item.parentId)
           if (!parent || parent.domain !== created.domain || created.upperTaskId) throw new Error('Invalid parent task')
-          Object.assign(created, { cycleId: parent.cycleId, dateKey: parent.dateKey, weekKey: parent.weekKey })
+          Object.assign(created, { cycleId: parent.cycleId, dateKey: parent.dateKey, endDateKey: parent.endDateKey, weekKey: parent.weekKey, endWeekKey: parent.endWeekKey })
         }
         ensurePlacement(next, created)
         next = addTask(next, created)
@@ -155,7 +164,10 @@ export function applyActions(snapshot: BoardSnapshot, input: unknown, trash: Tra
       case 'move_task': {
         const current = task()
         if (current.parentId || current.domain === 'long') throw new Error('Only top-level weekly/daily tasks can move')
-        next = current.domain === 'daily' ? moveDailyTask(next, objectId, action.target, now) : moveWeeklyTask(next, objectId, action.target, now)
+        if ((current.domain === 'daily' && action.endWeekKey !== undefined) || (current.domain === 'weekly' && action.endDateKey !== undefined)) throw new Error('endDateKey is for daily tasks and endWeekKey for weekly tasks')
+        const end = current.domain === 'daily' ? action.endDateKey : action.endWeekKey
+        const target = end === undefined ? action.target : { start: action.target, end: end ?? action.target }
+        next = current.domain === 'daily' ? moveDailyTask(next, objectId, target, now) : moveWeeklyTask(next, objectId, target, now)
         break
       }
       case 'reschedule_task': {
@@ -167,7 +179,7 @@ export function applyActions(snapshot: BoardSnapshot, input: unknown, trash: Tra
       case 'reorder_task': {
         const current = task()
         const target = next.tasks.find((item) => item.id === resolve(action.targetId) && !item.archivedAt)
-        if (!target || ['domain', 'cycleId', 'parentId', 'dateKey', 'weekKey'].some((key) => current[key as keyof Task] !== target[key as keyof Task])) throw new Error('Only siblings can be reordered')
+        if (!target || !sharesOrderScope(current, target)) throw new Error('Only siblings can be reordered')
         next = reorderSiblingTo(next, objectId, target.id)
         break
       }

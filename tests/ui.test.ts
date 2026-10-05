@@ -10,20 +10,53 @@ const viewsSource = () => read('src/BoardViews.tsx')
 const accountSource = () => read('src/AccountPage.tsx')
 const cssSource = () => read('src/styles.css')
 
-test('the whole site is one shell: a prompt instead of dialogs, a scrollback instead of panels', async () => {
-  const [app, account, views] = await Promise.all([appSource(), accountSource(), viewsSource()])
+test('the whole site is one shell: a prompt instead of dialogs, one scene instead of a scrollback', async () => {
+  const [app, account, shell, css] = await Promise.all([appSource(), accountSource(), shellSource(), cssSource()])
   for (const [name, source] of [['App.tsx', app], ['AccountPage.tsx', account]] as const) {
     assert.match(source, /<ShellFrame /, `${name} must render inside the terminal frame`)
     assert.match(source, /<Prompt /, `${name} must take input through the prompt`)
+    assert.match(source, /<OutputStrip output=\{output\}/, `${name} shows only the last output above the prompt`)
     assert.doesNotMatch(source, /window\.confirm|<form className="dialog-form"|className="dialog-backdrop"/, `${name} must not fall back to modal forms or browser confirms`)
+    // 每条命令都是「先 clear 再执行」：没有回滚，也没有冻结的旧视图。
+    assert.doesNotMatch(source, /scrollback|useStickToBottom|frozen|setEntries/, `${name} must not keep a scrollback`)
   }
-  // 四列面板、连接线与拖拽都被滚动区与关联树取代。
   assert.doesNotMatch(app, /TaskPanel|ConnectorLayer|DndContext|workspace-stage/, 'the old four-panel board must be gone')
   const pkg = JSON.parse(await read('package.json'))
   assert.ok(!Object.keys(pkg.dependencies).some((name) => name.startsWith('@dnd-kit')), 'drag and drop is replaced by /mv and J/K')
-  // 只有最新的视图是活的；旧视图冻结成当时的快照，不可再点。
-  assert.match(app, /if \(entry\.body\?\.kind !== 'view' \|\| entry\.body\.frozen\) return \[entry\]/, 'superseded views must freeze')
-  assert.match(views, /inert=\{!live \|\| undefined\}/, 'frozen views must not be interactive')
+  // 结果只保留最后一条：替换而不是追加；长输出换成整页，下一条命令或 esc 收起。
+  assert.match(shell, /setOutput\(\(current\) => \(\{ id, echo: echo \?\? current\?\.echo, lines \}\)\)/)
+  assert.match(shell, /if \(lines\.length > 3 \|\| lines\.some\(\(line\) => line\.cmd \|\| line\.key !== undefined\)\)/)
+  assert.match(app, /if \(page\) \{ closePage\(\); setHelpMenu\(null\); return \}/, 'esc closes a page before it enters navigation mode')
+  // 一屏固定：文档不滚，只有场景区滚，提示符始终在原位。
+  assert.match(css, /body \{ min-width: 320px; overflow: hidden;/)
+  assert.match(css, /\.scene \{[^}]*overflow: auto;/)
+  assert.match(app, /<SceneHead view=\{view\}/)
+  assert.match(app, /<Scene view=\{view\}/)
+  // 账户页的整页输出只是盖住内容：卸载会重跑授权确认、丢掉已读取的列表。
+  assert.match(account, /<div hidden=\{Boolean\(page\)\}>/)
+})
+
+test('relations are drawn as a tree, with guides that never break', async () => {
+  const [views, css, app] = await Promise.all([viewsSource(), cssSource(), appSource()])
+  assert.match(views, /view === 'goals' \? goalsTree\(index\) : view === 'week' \? weekTree\(index\) : dayTree\(index\)/)
+  // 框线字符高 1.52em：行高超过 1.5 或行间留白，竖线就会断成虚线。
+  assert.match(css, /\.row \{[^}]*margin: 0 -12px; padding: 0 12px; line-height: 1\.5;/)
+  assert.match(css, /\.lead \{ align-self: stretch; overflow: hidden; contain: size;/, 'the guide column fills wrapped lines without growing the row')
+  assert.match(views, /\{`\\n\$\{rest\}`\.repeat\(LEAD_REPEAT\)\}/)
+  // 改动的行重画后闪一下；排序不改内容，单独标记。
+  assert.match(app, /touch\(changedIds\(current\.snapshot, next\)\)/)
+  assert.match(app, /reorderInScene\(current, task\.id, direction, selectionRef\.current\)[\s\S]{0,120}touch\(\[task\.id\]\)/)
+  // /mv 与冲突重放都只在组内换位，和画出来的树一致；跨周、跨天任务按正在看的那一周、那一天找邻居。
+  assert.match(app, /const next = reorderInScene\(board, origin\.taskId, origin\.direction, selectionRef\.current\)/)
+})
+
+test('the scene lives in the address bar, so back and refresh keep your place', async () => {
+  const app = await appSource()
+  assert.match(app, /const next = sceneHash\(view, \{ cycleId: selectedCycleId, week: selectedWeek, date: selectedDate \}\)/)
+  assert.match(app, /if \(historyViewRef\.current && historyViewRef\.current !== view\) window\.history\.pushState\(null, '', url\)\n\s+else window\.history\.replaceState\(null, '', url\)/, 'only view changes add history entries')
+  assert.match(app, /window\.addEventListener\('popstate', onPop\)/)
+  assert.match(app, /if \(screen !== 'workspace' \|\| !routeToken \|\| routeToken !== boardLoadToken\) return/, 'the hash is not overwritten before the loaded board applies it')
+  assert.match(app, /const location = parseSceneHash\(window\.location\.hash\)/)
 })
 
 test('signing in is a terminal login: login, then a password that is never echoed or remembered', async () => {
@@ -58,12 +91,31 @@ test('every click has a command behind it, so the mouse teaches the keyboard', a
 test('navigation mode mirrors the sidebar hotkeys and keeps typing in the prompt', async () => {
   const app = await appSource()
   const keys = app.slice(app.indexOf('const keys: Record<string, () => void> = {'), app.indexOf('const handler = keys[event.key]'))
-  for (const [key, command] of [['g', '/goals'], ['w', '/week'], ['d', '/day'], ['f', '/focus'], ['t', '/tree']]) {
+  for (const [key, command] of [['g', '/goals'], ['w', '/week'], ['d', '/day'], ['f', '/focus']]) {
     assert.match(keys, new RegExp(`${key}: \\(\\) => execute\\('${command}'\\)`), `${key} must open ${command}`)
   }
+  assert.doesNotMatch(app, /\/tree/, 'every view is already a tree; there is no separate tree view')
   assert.match(keys, /J: \(\) => \{ if \(task && ref\) execute\(`\/mv \$\{ref\} down`\) \}/, 'J/K replace drag and drop')
   assert.match(app, /if \(navMode && typing\) setNavMode\(false\)/, 'focusing the prompt always returns to command mode')
   assert.match(app, /if \(\(event\.metaKey \|\| event\.ctrlKey\) && event\.key\.toLowerCase\(\) === 'k'\)/, '⌘K / Ctrl+K opens the finder')
+  // 标签上写的键就是导航模式里按的键：p 开始/暂停专注，S 结束（小写 s 是子任务）。
+  assert.match(keys, /p: \(\) => \{[\s\S]{0,260}execute\('\/pause'\)[\s\S]{0,80}execute\(ref \? `\/start \$\{ref\}` : '\/start'\)/, 'p pauses the running block and starts anything else')
+  assert.match(keys, /S: \(\) => execute\(ref && \(block \|\| task\?\.domain === 'daily'\) \? `\/stop \$\{ref\}` : '\/stop'\)/, 'S finishes')
+  assert.match(keys, /s: \(\) => \{ if \(task && !task\.parentId && ref\) execute\(`\/sub \$\{ref\}`\) \}/, 's stays the subtask key')
+})
+
+test('focus: tasks on the left, one clock on the right that follows the only timer', async () => {
+  const [app, views, css] = await Promise.all([appSource(), viewsSource(), cssSource()])
+  const buttons = views.slice(views.indexOf('function FocusButtons'), views.indexOf('const DIAL_ROWS'))
+  assert.match(buttons, /<Act k="p" label=\{t\('pause'\)\} onClick=\{\(\) => actions\.run\('\/pause'\)\} \/>/, 'clicks run the same commands as the keys they show')
+  assert.match(buttons, /<Act k="S" label=\{t\('finish'\)\}/)
+  assert.doesNotMatch(views, /k="f"|k="↵"|k="s" label=\{t\('stop'\)\}/, 'no button advertises a key that does something else')
+  assert.match(views, /const running = snapshot\.focusBlocks\.find\(\(block\) => block\.status === 'running'\)\n  const day = index\.f/, 'the clock follows the running timer on any date, not the cursor')
+  assert.match(views, /running && view !== 'focus' \? <button type="button" className="head-running"/, 'the focus view does not repeat the timer in the scene head')
+  assert.match(css, /\.view-focus\.is-split \{ display: grid; grid-template-columns: minmax\(0, 1fr\) clamp\(26ch, 36%, 38ch\);/)
+  assert.match(css, /\.face \{[^}]*line-height: 1\.2;[^}]*font-size: min\(15px, calc\(round\(down, 100cqi \/ var\(--chars\), 1px\) \/ 0\.6\)\);/, 'the face scales with its column, on whole-pixel cells so blocks stay seamless')
+  assert.match(app, /const tabTitle = runningBlock \? `\$\{focusDisplayStatus\(runningBlock, now\) === 'complete' \? '⏰' : '◉'\} \$\{clockLeft\(runningBlock, now\)\}/, 'the tab title carries the countdown and flags time up')
+  assert.match(app, /localStorage\.getItem\(CLOCK_KEY\) === 'digital' \? 'digital' : 'analog'/, '/clock is a local preference like the theme')
 })
 
 test('task text wraps with bounded previews and the editor enforces the shared limits', async () => {
@@ -78,8 +130,8 @@ test('task text wraps with bounded previews and the editor enforces the shared l
 test('today and the selected period stay distinct, and calendars are scoped by the project', async () => {
   const [app, views, css] = await Promise.all([appSource(), viewsSource(), cssSource()])
   assert.match(app, /const todayKey = todayInTimeZone\(currentZone\)/, 'today comes from the board time zone')
-  assert.match(views, /className=\{`tab \$\{active \? 'active' : ''\} \$\{current \? 'is-current' : ''\}`\}/, 'today must not reuse the selected class')
-  assert.match(css, /\.tab\.is-current|\.current-mark \{/, 'the current marker needs its own style')
+  assert.match(views, /className=\{`cell \$\{active \? 'is-active' : ''\} \$\{current \? 'is-current' : ''\}`\}/, 'today must not reuse the selected class')
+  assert.match(css, /\.cell\.is-current \.cell-label \{/, 'the current marker needs its own style')
   assert.match(views, /weekKeysInRange\(navigation\.startDate, navigation\.endDate\)/, 'week tabs come from the project range')
   assert.match(views, /disabled=\{!inCycle\(date\)\}/, 'days outside the project cannot be selected')
   assert.match(app, /const selection = selectionForSnapshot\(nextSnapshot, preferredCycleId, preferredDate\)/)
@@ -92,7 +144,7 @@ test('unfinished plans are carried forward on load and the source stays visible'
   assert.match(app, /if \(carried !== loadedSnapshot\) commitRef\.current\?\.\(carried, null\)/)
   assert.match(app, /const commitRef = useRef<\(\(next: BoardSnapshot, draft: string \| null\) => boolean\) \| null>\(null\)/)
   assert.match(views, /const carried = useMemo\(\(\) => carriedFromLabels\(snapshot\), \[snapshot\]\)/, 'the lookup is built once per snapshot')
-  assert.match(views, /className="meta-carry" title=\{`\$\{t\('carriedFrom'\)\} \$\{from\}`\}>←\{from\.slice\(5\)\}/)
+  assert.match(views, /className="meta-carry" title=\{`\$\{t\('carriedFrom'\)\} \$\{from\}`\}>←\{from\.includes\('-W'\) \? formatWeek\(from, today\) : formatDate\(from, today\)\}/, 'the carry tag uses the same date and week format as everywhere else')
   assert.match(app, /task\.domain === 'weekly' \? rescheduleWeeklyTask\(current, task\.id, target\) : rescheduleDailyTask\(current, task\.id, target\)/, '/defer dispatches by domain')
   assert.match(app, /task\.domain === 'weekly'\) return \{ value: weekKey\(addDays\(weekRange[\s\S]{0,80}kind: 'week'/, 'weekly carry defaults to the following week')
 })
@@ -124,9 +176,13 @@ test('the task editor only lets top-level plans change their date or week', asyn
   const editor = app.slice(app.indexOf('const openTaskWizard = '), app.indexOf('const openCycleWizard = '))
   assert.match(editor, /const canEditDate = domain === 'daily' && !parent/)
   assert.match(editor, /const canEditWeek = domain === 'weekly' && !parent/)
-  assert.match(editor, /candidate\.cycleId === ownCycle && \(candidate\.id === keptUpper \|\| keyOf\(candidate\) === keyOf\(target\)\)/, 'link candidates follow the chosen placement and keep the stored link')
-  assert.match(app, /next = moveDailyTask\(next, existing\.id, input\.dateKey, now\)/)
-  assert.match(app, /next = moveWeeklyTask\(next, existing\.id, input\.weekKey, now\)/)
+  assert.match(editor, /candidate\.cycleId === ownCycle && \(candidate\.id === keptUpper \|\| fits\(candidate\)\)/, 'link candidates follow the chosen placement and keep the stored link')
+  assert.match(editor, /coversWeek\(candidate, targetWeek\)/, 'a multi-week plan is a candidate in every week it covers')
+  assert.match(editor, /parseWeekSpanArg\(values\.week, baseWeek, todayKey\)/, 'the week field accepts a span')
+  assert.match(editor, /spanText\(showDate, task\?\.dateKey, task\?\.endDateKey\)/, 'the editor starts from the displayed format, which parses back against the task itself')
+  assert.match(editor, /parseDateSpanArg\(value, baseDate, todayKey\)[\s\S]{0,160}t\('noticeDaySpanWeek'\)/, 'the date field accepts a span inside one week')
+  assert.match(app, /next = moveDailyTask\(next, existing\.id, \{ start: input\.dateKey, end: input\.endDateKey \|\| input\.dateKey \}, now\)/)
+  assert.match(app, /next = moveWeeklyTask\(next, existing\.id, \{ start: input\.weekKey, end: input\.endWeekKey \|\| input\.weekKey \}, now\)/)
 })
 
 test('the OAuth consent page asks one y/N question and keeps the redirect guard', async () => {

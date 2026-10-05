@@ -58,6 +58,37 @@ test('atomic actions, conservative recovery, concurrent edits and signed read ti
   assert.throws(() => readTicket(ticket, caller, secret, 2_000_000), /expired/)
 })
 
+test('agents can create, shift, stretch and collapse multi-week plans', () => {
+  const run = (actions: unknown[], board: ReturnType<typeof sample>) => applyActions(board, actions, [], now).snapshot
+  const board = sample()
+  const cycleId = board.cycles[0].id
+  const base = run([
+    { op: 'create_task', domain: 'weekly', title: 'Span', cycleId, weekKey: '2026-W03', endWeekKey: '2026-W05', ref: 'span' },
+    { op: 'create_task', domain: 'weekly', title: 'Child', parentId: '$span' },
+    { op: 'create_task', domain: 'weekly', title: 'Later', cycleId, weekKey: '2026-W05' },
+  ], board)
+  const [span, child, later] = base.tasks.filter((task) => task.domain === 'weekly')
+  assert.deepEqual([child.weekKey, child.endWeekKey], ['2026-W03', '2026-W05'], 'a subtask inherits the whole span')
+  const placement = (board: typeof base) => { const task = board.tasks.find((entry) => entry.id === span.id)!; return [task.weekKey, task.endWeekKey] }
+  assert.deepEqual(placement(run([{ op: 'move_task', id: span.id, target: '2026-W10' }], base)), ['2026-W10', '2026-W12'])
+  assert.deepEqual(placement(run([{ op: 'move_task', id: span.id, target: '2026-W03', endWeekKey: '2026-W08' }], base)), ['2026-W03', '2026-W08'])
+  assert.deepEqual(placement(run([{ op: 'move_task', id: span.id, target: '2026-W04', endWeekKey: null }], base)), ['2026-W04', undefined])
+  assert.throws(() => run([{ op: 'move_task', id: span.id, target: '2026-W52', endWeekKey: '2027-W02' }], base), /outside/)
+  assert.throws(() => run([{ op: 'create_task', domain: 'weekly', title: 'Bad', cycleId: base.cycles[0].id, weekKey: '2026-W05', endWeekKey: '2026-W04' }], base), /placement is invalid/i)
+  // 日任务同理，但跨度不能出周；字段只能用在各自的域上。
+  const days = run([{ op: 'create_task', domain: 'daily', title: 'Days', cycleId, dateKey: '2026-01-12', endDateKey: '2026-01-14', ref: 'days' }], base)
+  const daily = days.tasks.find((task) => task.title === 'Days')!
+  const dayPlacement = (board: typeof base) => { const task = board.tasks.find((entry) => entry.id === daily.id)!; return [task.dateKey, task.endDateKey] }
+  assert.deepEqual(dayPlacement(run([{ op: 'move_task', id: daily.id, target: '2026-01-15' }], days)), ['2026-01-15', '2026-01-17'])
+  assert.deepEqual(dayPlacement(run([{ op: 'move_task', id: daily.id, target: '2026-01-12', endDateKey: '2026-01-18' }], days)), ['2026-01-12', '2026-01-18'])
+  assert.deepEqual(dayPlacement(run([{ op: 'move_task', id: daily.id, target: '2026-01-13', endDateKey: null }], days)), ['2026-01-13', undefined])
+  assert.throws(() => run([{ op: 'move_task', id: daily.id, target: '2026-01-17' }], days), /one ISO week/)
+  assert.throws(() => run([{ op: 'move_task', id: daily.id, target: '2026-01-12', endWeekKey: '2026-W04' }], days), /endDateKey is for daily/)
+  assert.throws(() => run([{ op: 'create_task', domain: 'daily', title: 'Bad', cycleId, dateKey: '2026-01-17', endDateKey: '2026-01-19' }], base), /placement is invalid/i)
+  // 跨度相交的周任务在同一周里同时出现，因此可以互相排序。
+  assert.equal(run([{ op: 'reorder_task', id: later.id, targetId: span.id }], base).tasks.filter((task) => task.domain === 'weekly' && !task.parentId)[0].id, later.id)
+})
+
 test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audience, revocation and human-only purge', async () => {
   const db = new PGlite()
   await db.waitReady
@@ -72,7 +103,7 @@ test('Postgres: owner isolation, CAS, trash, audit, restore, idempotency, audien
       insert into auth.users values ('${owner}'), ('${other}');
       insert into auth.sessions values ('${session}', '${owner}', null, null), ('${oauthSession}', '${owner}', '${clientId}', null);
     `)
-    for (const migration of ['001_private_board', '002_independent_boards', '003_task_text_limits', '004_remove_task_history', '005_project_task_scope', '006_agent_access', '007_mcp_rate_limit', '008_mcp_database_gateway']) {
+    for (const migration of ['001_private_board', '002_independent_boards', '003_task_text_limits', '004_remove_task_history', '005_project_task_scope', '006_agent_access', '007_mcp_rate_limit', '008_mcp_database_gateway', '009_weekly_span', '010_daily_span']) {
       await db.exec(await readFile(new URL(`../supabase/migrations/${migration}.sql`, import.meta.url), 'utf8'))
     }
     await db.exec("update private.agent_config set oauth_issuer = 'https://example.supabase.co/auth/v1'")

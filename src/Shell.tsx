@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { fuzzyScore, renderBanner, type MenuItem } from './terminal'
 
 export type FieldType = 'text' | 'email' | 'password' | 'note'
@@ -153,8 +153,6 @@ interface PromptProps {
   inputRef: React.MutableRefObject<HTMLInputElement | HTMLTextAreaElement | null>
   /** 外部把一段文字放进提示符（帮助菜单里选了需要参数的命令）；nonce 变化才生效。 */
   prefill?: { text: string; nonce: number } | null
-  /** 提示区长高（换题、报错、弹出菜单）后通知外层，让页面继续贴住底部。 */
-  onGrow?: () => void
   onSubmit: (line: string) => void
   onNav?: () => void
   onClear?: () => void
@@ -164,7 +162,7 @@ interface PromptProps {
  * 唯一的输入面：命令、登录、编辑表单都在这一行里一步一步问。
  * 密码字段不回显、不进历史，也不留在组件状态里（每次提问结束都清空）。
  */
-export function Prompt({ user, ask, busy, placeholder, history, copy, complete, menu, inputRef, prefill, onGrow, onSubmit, onNav, onClear }: PromptProps) {
+export function Prompt({ user, ask, busy, placeholder, history, copy, complete, menu, inputRef, prefill, onSubmit, onNav, onClear }: PromptProps) {
   const [value, setValue] = useState('')
   const [step, setStep] = useState(0)
   const [values, setValues] = useState<Record<string, string>>({})
@@ -212,7 +210,6 @@ export function Prompt({ user, ask, busy, placeholder, history, copy, complete, 
   const listId = choice ? 'prompt-choices' : 'prompt-completions'
 
   useEffect(() => { setMenuIndex((index) => Math.min(index, Math.max(0, activeItems.length - 1))) }, [activeItems.length])
-  useLayoutEffect(() => { onGrow?.() }, [ask, step, error, activeItems.length, Boolean(busy), onGrow])
 
   const finishField = (raw: string) => {
     if (!ask || !field) return
@@ -399,22 +396,73 @@ export function useTheme(): { pref: ThemePref; resolved: 'dark' | 'light'; setPr
   return { pref, resolved, setPref }
 }
 
-/** 滚动区新增输出后滚到文档底部：像真终端一样，最新一行总在提示符上方。
- * 提示符是 sticky 的，对它 scrollIntoView 不会移动页面，所以直接滚整个文档。
- * 返回的 follow 供提示区长高时调用：用户本来停在底部才跟随，翻看旧输出时不打扰。 */
-export function useStickToBottom(dependency: unknown): () => void {
-  const pinned = useRef(true)
-  const follow = useCallback(() => {
-    if (pinned.current) window.scrollTo({ top: document.documentElement.scrollHeight })
+export interface Output { id: number; echo?: string; lines: OutLine[] }
+export type Page = { id: number; echo?: string } & ({ kind: 'help' } | { kind: 'lines'; lines: OutLine[] })
+
+/**
+ * 没有滚动区：屏幕上只有当前场景和「上一条命令」。短结果留在提示符上方；长输出（多于 3 行，
+ * 或带可点的命令行、键值行）换成整页盖住场景，下一条命令或 esc 收起。
+ * 不带回显的结果（提问答完、保存提示）沿用上一条回显，和触发它的命令待在一起。
+ */
+export function useOutput() {
+  const [output, setOutput] = useState<Output | null>(null)
+  const [page, setPage] = useState<Page | null>(null)
+  const sequence = useRef(0)
+  const print = useCallback((lines: OutLine[], echo?: string) => {
+    const id = ++sequence.current
+    if (lines.length > 3 || lines.some((line) => line.cmd || line.key !== undefined)) {
+      setPage({ id, echo, kind: 'lines', lines })
+      setOutput(null)
+      return
+    }
+    setPage(null)
+    setOutput((current) => ({ id, echo: echo ?? current?.echo, lines }))
   }, [])
+  const showHelp = useCallback((echo?: string) => {
+    setPage({ id: ++sequence.current, echo, kind: 'help' })
+    setOutput(null)
+  }, [])
+  const closePage = useCallback(() => setPage(null), [])
+  const clear = useCallback(() => { setOutput(null); setPage(null) }, [])
+  return { output, page, print, showHelp, closePage, clear }
+}
+
+/** 提示符上方的一条输出：只有一行短结果时与回显同排（`> /done d1  [x] d1 …`）。 */
+export function OutputStrip({ output, onCommand }: { output: Output | null; onCommand: (command: string) => void }) {
+  if (!output || (output.echo === undefined && !output.lines.length)) return null
+  const only = output.lines.length === 1 ? output.lines[0] : undefined
+  const inline = output.echo !== undefined && only && only.text.length <= 72
+  return <div className="output" role="status" aria-live="polite">
+    {output.echo !== undefined ? <Echo text={output.echo}>{inline ? <span className={`tone-${only.tone || 'plain'}`}>{only.text}</span> : null}</Echo> : null}
+    {!inline && output.lines.length ? <Lines lines={output.lines} onCommand={onCommand} /> : null}
+  </div>
+}
+
+export function PageHead({ echo, hint }: { echo?: string; hint: string }) {
+  return <div className="page-head">{echo !== undefined ? <Echo text={echo} /> : <span />}<span className="page-hint">{hint}</span></div>
+}
+
+/** 场景按字符格排版：像终端的 $COLUMNS，量出容器一行放得下多少个半角字符。 */
+export function useColumns(ref: RefObject<HTMLElement | null>): number {
+  const [columns, setColumns] = useState(80)
   useLayoutEffect(() => {
-    pinned.current = true
-    window.scrollTo({ top: document.documentElement.scrollHeight })
-  }, [dependency])
-  useEffect(() => {
-    const onScroll = () => { pinned.current = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80 }
-    window.addEventListener('scroll', onScroll, { passive: true })
-    return () => window.removeEventListener('scroll', onScroll)
-  }, [])
-  return follow
+    const element = ref.current
+    if (!element) return
+    const probe = document.createElement('span')
+    probe.textContent = '0'.repeat(100)
+    probe.setAttribute('aria-hidden', 'true')
+    probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;letter-spacing:0'
+    element.appendChild(probe)
+    const measure = () => {
+      const cell = probe.getBoundingClientRect().width / 100
+      if (cell) setColumns(Math.max(20, Math.floor(element.clientWidth / cell)))
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    // 自托管字体晚于首帧到达，换字体后字宽会变。
+    void document.fonts?.ready.then(measure)
+    return () => { observer.disconnect(); probe.remove() }
+  }, [ref])
+  return columns
 }

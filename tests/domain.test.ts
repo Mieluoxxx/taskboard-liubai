@@ -12,6 +12,7 @@ import {
   MAX_ELAPSED_MS,
   focusDisplayStatus,
   cloneSnapshot,
+  cycleForNavigation,
   mergeSnapshots,
   moveDailyTask,
   moveWeeklyTask,
@@ -24,6 +25,8 @@ import {
   rescheduleWeeklyTask,
   safeTimeZone,
   setFocusCommand,
+  sharesOrderScope,
+  tasksForPlacement,
   validateSnapshot,
   weekKey,
   weekRange,
@@ -182,6 +185,96 @@ test('changing a weekly task week in the editor moves its subtasks and never lea
   )
 })
 
+test('a weekly task can span several ISO weeks, and every placement rule reads the whole span', () => {
+  const base = withCycle(board())
+  const cycle = base.cycles[0]
+  const span = createTask({ domain: 'weekly', title: 'Span', weekKey: '2025-W02', endWeekKey: '2025-W04', cycleId: cycle.id }, NOW)
+  const child = createTask({ domain: 'weekly', title: 'Child', weekKey: '2025-W02', endWeekKey: '2025-W04', cycleId: cycle.id, parentId: span.id }, NOW)
+  const single = createTask({ domain: 'weekly', title: 'Single', weekKey: '2025-W04', cycleId: cycle.id }, NOW)
+  const snapshot = addTask(addTask(addTask(base, span), child), single)
+
+  assert.deepEqual(['2025-W01', '2025-W02', '2025-W03', '2025-W04', '2025-W05'].map((week) => tasksForPlacement(snapshot, 'weekly', { cycleId: cycle.id, weekKey: week }).length), [0, 2, 2, 3, 0])
+  // 一个跨度只有一种写法：终点必须晚于起点，只有周任务能带，子任务必须与父任务一致。
+  for (const patch of [{ endWeekKey: '2025-W02' }, { endWeekKey: '2025-W01' }, { endWeekKey: '2025-W60' }]) {
+    assert.throws(() => validateSnapshot({ ...snapshot, tasks: snapshot.tasks.map((task) => task.id === single.id ? { ...task, ...patch } : task) }), /placement is invalid/i)
+  }
+  assert.throws(() => validateSnapshot(addTask(snapshot, { ...createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-15', cycleId: cycle.id }, NOW), endWeekKey: '2025-W04' })), /placement is invalid/i)
+  assert.throws(() => validateSnapshot({ ...snapshot, tasks: snapshot.tasks.map((task) => task.id === child.id ? { ...task, endWeekKey: '2025-W03' } : task) }), /subtask graph/i)
+
+  // 换周默认整段平移、保持周数；给区间就按区间重设，首尾相同时收成单周。
+  const shifted = moveWeeklyTask(snapshot, span.id, '2025-W06', NOW)
+  assert.deepEqual(shifted.tasks.filter((task) => task.id !== single.id).map((task) => [task.weekKey, task.endWeekKey]), [['2025-W06', '2025-W08'], ['2025-W06', '2025-W08']])
+  const stretched = moveWeeklyTask(snapshot, single.id, { start: '2025-W04', end: '2025-W07' }, NOW)
+  assert.equal(stretched.tasks.find((task) => task.id === single.id)?.endWeekKey, '2025-W07')
+  const collapsed = moveWeeklyTask(snapshot, span.id, { start: '2025-W03', end: '2025-W03' }, NOW)
+  assert.deepEqual(collapsed.tasks.filter((task) => task.id !== single.id).map((task) => [task.weekKey, task.endWeekKey]), [['2025-W03', undefined], ['2025-W03', undefined]])
+  assert.equal(moveWeeklyTask(snapshot, span.id, { start: '2025-W02', end: '2025-W04' }, NOW), snapshot, 'the same span is a no-op')
+  assert.throws(() => moveWeeklyTask(snapshot, span.id, { start: '2025-W04', end: '2025-W02' }, NOW), /invalid weekly placement/i)
+  assert.throws(
+    () => moveWeeklyTask(snapshot, span.id, '2025-W13', NOW),
+    (error: unknown) => error instanceof BoardError && error.code === 'noticeRescheduleOutsideCycle',
+    'the end of a shifted span must stay inside the project too',
+  )
+
+  // 手动顺延同样保持周数，原条目归档。
+  const deferred = rescheduleWeeklyTask(snapshot, span.id, '2025-W03', NOW)
+  const copy = deferred.tasks.find((task) => task.title === 'Span' && !task.archivedAt)!
+  assert.deepEqual([copy.weekKey, copy.endWeekKey], ['2025-W03', '2025-W05'])
+
+  // 整段落在项目外的旧数据：导航范围扩展到跨度的最后一周，而不只是起始周。
+  const outside = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === single.id ? { ...task, weekKey: '2025-W15', endWeekKey: '2025-W16' } : task) }
+  assert.equal(cycleForNavigation(outside, cycle)?.endDate, weekRange('2025-W16').end)
+})
+
+test('a daily task can span several days inside one ISO week', () => {
+  const base = withCycle(board())
+  const cycle = base.cycles[0]
+  // 2025-01-13 是周一，2025-01-19 是周日。
+  const span = createTask({ domain: 'daily', title: 'Span', dateKey: '2025-01-13', endDateKey: '2025-01-15', cycleId: cycle.id }, NOW)
+  const child = createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-13', endDateKey: '2025-01-15', cycleId: cycle.id, parentId: span.id }, NOW)
+  const single = createTask({ domain: 'daily', title: 'Single', dateKey: '2025-01-15', cycleId: cycle.id }, NOW)
+  const snapshot = [span, child, single].reduce(addTask, base)
+
+  assert.deepEqual(['2025-01-12', '2025-01-13', '2025-01-14', '2025-01-15', '2025-01-16'].map((date) => tasksForPlacement(snapshot, 'daily', { cycleId: cycle.id, dateKey: date }).length), [0, 2, 2, 3, 0])
+  // 终点必须晚于起点、不能出周；只有日任务能带；子任务必须与父任务一致。
+  for (const patch of [{ endDateKey: '2025-01-15' }, { endDateKey: '2025-01-14' }, { endDateKey: '2025-01-20' }, { endDateKey: '2025-02-30' }]) {
+    assert.throws(() => validateSnapshot({ ...snapshot, tasks: snapshot.tasks.map((task) => task.id === single.id ? { ...task, ...patch } : task) }), /invalid/i, JSON.stringify(patch))
+  }
+  assert.throws(() => validateSnapshot(addTask(snapshot, { ...createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W03', cycleId: cycle.id }, NOW), endDateKey: '2025-01-15' })), /placement is invalid/i)
+  assert.throws(() => validateSnapshot({ ...snapshot, tasks: snapshot.tasks.map((task) => task.id === child.id ? { ...task, endDateKey: '2025-01-14' } : task) }), /subtask graph/i)
+
+  // 改日期默认整段平移、保持天数；给区间就按区间重设，首尾相同时收成单天；出周则明确拒绝。
+  const shifted = moveDailyTask(snapshot, span.id, '2025-01-16', NOW)
+  assert.deepEqual(shifted.tasks.filter((task) => task.id !== single.id).map((task) => [task.dateKey, task.endDateKey]), [['2025-01-16', '2025-01-18'], ['2025-01-16', '2025-01-18']])
+  assert.equal(moveDailyTask(snapshot, single.id, { start: '2025-01-15', end: '2025-01-19' }, NOW).tasks.find((task) => task.id === single.id)?.endDateKey, '2025-01-19')
+  assert.deepEqual(moveDailyTask(snapshot, span.id, { start: '2025-01-14', end: '2025-01-14' }, NOW).tasks.find((task) => task.id === span.id)?.endDateKey, undefined)
+  for (const target of ['2025-01-18', { start: '2025-01-17', end: '2025-01-20' }]) {
+    assert.throws(() => moveDailyTask(snapshot, span.id, target, NOW), (error: unknown) => error instanceof BoardError && error.code === 'noticeDaySpanWeek', JSON.stringify(target))
+  }
+  assert.throws(() => moveDailyTask(snapshot, span.id, { start: '2025-01-15', end: '2025-01-13' }, NOW), /invalid daily placement/i)
+
+  // 手动顺延同样保持天数，原条目归档。
+  const deferred = rescheduleDailyTask(snapshot, span.id, '2025-01-14', NOW)
+  const copy = deferred.tasks.find((task) => task.title === 'Span' && !task.archivedAt)!
+  assert.deepEqual([copy.dateKey, copy.endDateKey], ['2025-01-14', '2025-01-16'])
+  assert.throws(() => rescheduleDailyTask(snapshot, span.id, '2025-01-18', NOW), (error: unknown) => error instanceof BoardError && error.code === 'noticeDaySpanWeek')
+
+  // 同一天里同时出现的日任务可以互相排序。
+  assert.equal(sharesOrderScope(span, single), true)
+  assert.equal(sharesOrderScope(span, { ...single, dateKey: '2025-01-17' }), false)
+})
+
+test('overlapping weekly spans can be reordered against each other', () => {
+  const span = createTask({ domain: 'weekly', title: 'Span', weekKey: '2025-W02', endWeekKey: '2025-W04' }, NOW)
+  const later = createTask({ domain: 'weekly', title: 'Later', weekKey: '2025-W04' }, NOW)
+  const apart = createTask({ domain: 'weekly', title: 'Apart', weekKey: '2025-W06' }, NOW)
+  const snapshot = addTask(addTask(addTask(board(), span), later), apart)
+  assert.equal(sharesOrderScope(span, later), true, 'both show up in W04')
+  assert.equal(sharesOrderScope(span, apart), false)
+  assert.deepEqual(reorderSiblingTo(snapshot, later.id, span.id).tasks.map((task) => task.title), ['Later', 'Span', 'Apart'])
+  assert.equal(reorderSiblingTo(snapshot, apart.id, span.id), snapshot)
+})
+
 test('the carry tag follows the reschedule chain back to the original placement', () => {
   const base = withCycle(board())
   const cycle = base.cycles[0]
@@ -205,7 +298,7 @@ test('the carry tag follows the reschedule chain back to the original placement'
   assert.equal(labels.has('plain'), false, 'a task with no archive pointer gets no tag')
 })
 
-test('carryForwardTasks moves every unfinished past week into the current week once', () => {
+test('carryForwardTasks stretches every unfinished past week up to the current week once', () => {
   let snapshot = board()
   const root = createTask({ domain: 'weekly', title: 'Carry me', weekKey: '2025-W01' }, NOW)
   const child = createTask({ domain: 'weekly', title: 'Child', weekKey: '2025-W01', parentId: root.id }, NOW)
@@ -214,48 +307,68 @@ test('carryForwardTasks moves every unfinished past week into the current week o
   snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === done.id ? { ...task, checked: true } : task) }
   const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
 
-  const active = carried.tasks.filter((task) => !task.archivedAt)
-  // 副本追加在列表末尾，数组顺序不稳定，所以按标题而不是位置比较。
-  const placement = (task: Task) => [task.title, task.weekKey]
-  assert.deepEqual(active.map(placement).sort(), [['Carry me', '2025-W03'], ['Child', '2025-W03'], ['Done', '2025-W01']])
-  // 只有未完成的才搬：已完成留在原处，搬走的旧条目归档并留下可追溯的来源指针。
-  const archived = carried.tasks.filter((task) => task.archivedReason === 'rescheduled')
-  assert.deepEqual(archived.map((task) => task.title), ['Carry me', 'Child'])
+  // 延长而不是复制：同一条任务覆盖 W01..W03，子任务跟着父任务；已完成的留在原处。
+  const span = (task: Task) => [task.title, task.weekKey, task.endWeekKey]
+  assert.deepEqual(carried.tasks.map(span), [['Carry me', '2025-W01', '2025-W03'], ['Child', '2025-W01', '2025-W03'], ['Done', '2025-W01', undefined]])
+  assert.equal(carried.tasks.some((task) => task.archivedAt), false, 'nothing is archived, so the earlier weeks keep showing it')
+  for (const week of ['2025-W01', '2025-W02', '2025-W03']) {
+    assert.ok(tasksForPlacement(carried, 'weekly', { weekKey: week }).some((task) => task.id === root.id), `still visible in ${week}`)
+  }
   validateSnapshot(carried)
 
-  // 幂等：再跑一次不应该产生新的副本。
+  // 幂等：再跑一次不应该再改动；下一周载入时从原起点继续延长。
   assert.equal(carryForwardTasks(carried, '2025-01-15', NOW), carried)
+  assert.equal(carryForwardTasks(carried, '2025-01-22', NOW).tasks.find((task) => task.id === root.id)?.endWeekKey, '2025-W04')
 })
 
-test('carryForwardTasks also carries unfinished past daily tasks to today, and follows the weekly move', () => {
+test('carryForwardTasks leaves a span alone until its last week has passed, and never stretches past the project', () => {
+  const base = withCycle(board())
+  const cycle = base.cycles[0]
+  const running = createTask({ domain: 'weekly', title: 'Running', weekKey: '2025-W02', endWeekKey: '2025-W04', cycleId: cycle.id }, NOW)
+  const ended = createTask({ domain: 'weekly', title: 'Ended', weekKey: '2025-W12', cycleId: cycle.id }, NOW)
+  const snapshot = addTask(addTask(base, running), ended)
+  assert.equal(carryForwardTasks(snapshot, '2025-01-15', NOW), snapshot, 'a span that still covers this week is not overdue')
+  // 3 月 31 日之后本周已在项目外：未完成的计划留在原位，不被延长到可导航范围之外。
+  const late = carryForwardTasks(snapshot, '2025-04-15', NOW)
+  assert.equal(late.tasks.find((task) => task.id === ended.id)?.endWeekKey, undefined)
+  assert.equal(late.tasks.find((task) => task.id === running.id)?.endWeekKey, '2025-W04')
+})
+
+test('carryForwardTasks stretches unfinished daily tasks of this week to today and copies those of last week', () => {
   let snapshot = board()
   const weekly = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W01' }, NOW)
-  const root = createTask({ domain: 'daily', title: 'Carry me', dateKey: '2025-01-13', upperTaskId: weekly.id }, NOW)
-  const child = createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-13', parentId: root.id }, NOW)
+  // 上周五的事跨不过周一（日跨度不出周），只能归档后复制到今天；本周一的事原地延长到今天。
+  const root = createTask({ domain: 'daily', title: 'Carry me', dateKey: '2025-01-10', upperTaskId: weekly.id }, NOW)
+  const child = createTask({ domain: 'daily', title: 'Child', dateKey: '2025-01-10', parentId: root.id }, NOW)
+  const stretch = createTask({ domain: 'daily', title: 'Stretch me', dateKey: '2025-01-13', upperTaskId: weekly.id }, NOW)
+  const stretchChild = createTask({ domain: 'daily', title: 'Stretch child', dateKey: '2025-01-13', parentId: stretch.id }, NOW)
   const done = createTask({ domain: 'daily', title: 'Done', dateKey: '2025-01-13' }, NOW)
-  // 今天这条不会被搬，但它挂的周任务本轮搬走了，关联同样要跟着改。
   const today = createTask({ domain: 'daily', title: 'Today', dateKey: '2025-01-15', upperTaskId: weekly.id }, NOW)
-  snapshot = addTask(addTask(addTask(addTask(addTask(snapshot, weekly), root), child), done), today)
+  snapshot = [weekly, root, child, stretch, stretchChild, done, today].reduce(addTask, snapshot)
   snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === done.id ? { ...task, checked: true } : task) }
   const carried = carryForwardTasks(snapshot, '2025-01-15', NOW)
 
   // 副本追加在列表末尾，数组顺序不稳定，所以按标题取用而不是比数组顺序。
   const byTitle = new Map(carried.tasks.filter((task) => !task.archivedAt).map((task) => [task.title, task]))
-  assert.deepEqual([...byTitle.keys()].sort(), ['Carry me', 'Child', 'Done', 'Today', 'Week'])
-  assert.equal(byTitle.get('Carry me')?.dateKey, '2025-01-15')
-  assert.equal(byTitle.get('Child')?.dateKey, '2025-01-15')
+  const span = (title: string) => [byTitle.get(title)?.dateKey, byTitle.get(title)?.endDateKey]
+  assert.deepEqual([...byTitle.keys()].sort(), ['Carry me', 'Child', 'Done', 'Stretch child', 'Stretch me', 'Today', 'Week'])
+  assert.deepEqual(span('Carry me'), ['2025-01-15', undefined])
+  assert.deepEqual(span('Child'), ['2025-01-15', undefined])
   assert.equal(byTitle.get('Child')?.parentId, byTitle.get('Carry me')?.id, 'subtasks ride along with the parent')
-  assert.equal(byTitle.get('Done')?.dateKey, '2025-01-13', 'a checked task stays where it was')
-  assert.equal(byTitle.get('Today')?.dateKey, '2025-01-15')
-  assert.equal(byTitle.get('Week')?.weekKey, '2025-W03')
-
-  // 关联改指周任务现有的副本，而不是停在已归档的旧周上（旧周已不在行内，会断线）。
-  assert.equal(byTitle.get('Carry me')?.upperTaskId, byTitle.get('Week')?.id)
-  assert.equal(byTitle.get('Today')?.upperTaskId, byTitle.get('Week')?.id, 'an untouched daily task needs the same repair')
+  assert.equal(byTitle.get('Stretch me')?.id, stretch.id, 'stretching keeps the same task, so Monday still shows it')
+  assert.deepEqual(span('Stretch me'), ['2025-01-13', '2025-01-15'])
+  assert.deepEqual(span('Stretch child'), ['2025-01-13', '2025-01-15'])
+  assert.deepEqual(span('Done'), ['2025-01-13', undefined], 'a checked task stays where it was')
+  assert.deepEqual(span('Today'), ['2025-01-15', undefined])
+  // 周任务原地延长到本周：还是同一条，所以日任务的关联不用改，旧周里的执行轨迹也还在。
+  assert.equal(byTitle.get('Week')?.id, weekly.id)
+  assert.deepEqual([byTitle.get('Week')?.weekKey, byTitle.get('Week')?.endWeekKey], ['2025-W01', '2025-W03'])
+  for (const title of ['Carry me', 'Stretch me', 'Today']) assert.equal(byTitle.get(title)?.upperTaskId, weekly.id)
   // 归档的旧日任务保留当时的历史关联，否则会丢掉「它原本挂在哪个周」这条线索。
   const archivedDaily = carried.tasks.find((task) => task.title === 'Carry me' && task.archivedAt)
   assert.equal(archivedDaily?.upperTaskId, weekly.id)
   assert.ok(archivedDaily?.rescheduledTo)
+  assert.equal(carried.tasks.filter((task) => task.archivedAt).length, 2, 'only last week\'s task and its subtask are archived')
   validateSnapshot(carried)
 
   assert.equal(carryForwardTasks(carried, '2025-01-15', NOW), carried, 'carrying must be idempotent')
@@ -265,7 +378,7 @@ test('a daily task carried later still finds the weekly copy moved in an earlier
   let snapshot = board()
   const oldWeek = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W01' }, NOW)
   const newWeek = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W03' }, NOW)
-  const daily = createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-13', upperTaskId: oldWeek.id }, NOW)
+  const daily = createTask({ domain: 'daily', title: 'Day', dateKey: '2025-01-10', upperTaskId: oldWeek.id }, NOW)
   snapshot = addTask(addTask(addTask(snapshot, oldWeek), newWeek), daily)
   // 上一次载入已经把周任务搬到了 W03，只留下归档指针；本次调用不会再看到那条周任务。
   snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === oldWeek.id ? { ...task, archivedAt: NOW, archivedReason: 'rescheduled' as const, rescheduledTo: newWeek.id } : task) }
@@ -296,7 +409,7 @@ test('carryForwardTasks survives a reschedule chain that ends somewhere illegal'
   let snapshot = board()
   const weekly = createTask({ domain: 'weekly', title: 'Week', weekKey: '2025-W01' }, NOW)
   const stray = createTask({ domain: 'daily', title: 'Stray', dateKey: '2025-01-10' }, NOW)
-  const past = createTask({ domain: 'daily', title: 'Past', dateKey: '2025-01-13', upperTaskId: weekly.id }, NOW)
+  const past = createTask({ domain: 'daily', title: 'Past', dateKey: '2025-01-10', upperTaskId: weekly.id }, NOW)
   snapshot = addTask(addTask(addTask(snapshot, weekly), stray), past)
   // 快照校验只要求 rescheduledTo 指向存在的 id，不限定域：链尾完全可能是一条日任务。
   snapshot = { ...snapshot, tasks: snapshot.tasks.map((task) => task.id === weekly.id ? { ...task, archivedAt: NOW, archivedReason: 'rescheduled' as const, rescheduledTo: stray.id } : task) }
